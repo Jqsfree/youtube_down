@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pyside6 yt-dlp pyinstaller
+          pip install pyside6 yt-dlp yt-dlp-ejs pyinstaller
 
       - name: Download ffmpeg
         run: |
@@ -36,11 +36,10 @@ jobs:
             --name "YouTubeDownloader" `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
+            --collect-all yt_dlp `
+            --collect-all yt_dlp_ejs `
             --hidden-import PySide6.QtCore `
             --hidden-import PySide6.QtWidgets `
-            --hidden-import yt_dlp `
-            --hidden-import yt_dlp.extractor `
-            --hidden-import yt_dlp.downloader `
             main.py
 
       - name: Upload EXE

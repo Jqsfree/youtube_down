@@ -13,12 +13,23 @@ from __future__ import annotations
 import csv
 import os
 import re
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import yt_dlp
+
+
+def _find_tool(name: str) -> str:
+    """PyInstaller 打包后优先找内嵌的二进制，否则回退 PATH。"""
+    if getattr(sys, "frozen", False):
+        bundled = os.path.join(sys._MEIPASS, name)  # noqa: SLF001
+        if os.path.exists(bundled):
+            return bundled
+    return name
 
 # 匹配 ANSI 转义序列（颜色码等），用于清理错误消息
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -74,8 +85,7 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
             "未安装: pip install yt-dlp-ejs（Cookie 模式下必需）"))
 
     # ffmpeg
-    import shutil
-    ffmpeg_path = shutil.which("ffmpeg")
+    ffmpeg_path = shutil.which(_find_tool("ffmpeg"))
     if ffmpeg_path:
         try:
             r = subprocess.run(
@@ -89,13 +99,13 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
         items.append(EnvItem("ffmpeg", "error", "", "未找到 ffmpeg"))
 
     # ffprobe
-    if shutil.which("ffprobe"):
+    if shutil.which(_find_tool("ffprobe")):
         items.append(EnvItem("ffprobe", "ok", "", ""))
     else:
         items.append(EnvItem("ffprobe", "warning", "", "未找到 ffprobe，无法校验下载文件"))
 
     # deno
-    deno_path = shutil.which("deno")
+    deno_path = shutil.which(_find_tool("deno"))
     if deno_path:
         try:
             r = subprocess.run(
@@ -459,7 +469,7 @@ class YoutubeDownloader:
 
             # 校验文件是有效媒体（ffprobe 能解析则文件完整）
             ffprobe_result = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries",
+                [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
                  "format=duration", "-of", "csv=p=0", str(path)],
                 capture_output=True, text=True, timeout=30,
             )
@@ -517,21 +527,29 @@ class YoutubeDownloader:
         if not filepath.exists():
             raise FileNotFoundError(f"文件不存在: {filepath}")
 
-        with open(filepath, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames or []
-            if column not in fieldnames:
-                raise ValueError(
-                    f"CSV 中没有 '{column}' 列，可用列: {fieldnames}"
-                )
-            ids: list[str] = []
-            seen: set[str] = set()
-            for row in reader:
-                vid = row[column].strip()
-                if vid and vid not in seen:
-                    seen.add(vid)
-                    ids.append(vid)
-        return ids
+        last_err: Exception | None = None
+        for encoding in ("utf-8-sig", "utf-8", "utf-16", "gbk", "latin-1"):
+            try:
+                with open(filepath, "r", encoding=encoding) as f:
+                    reader = csv.DictReader(f)
+                    fieldnames = reader.fieldnames or []
+                    if column not in fieldnames:
+                        raise ValueError(
+                            f"CSV 中没有 '{column}' 列，可用列: {fieldnames}"
+                        )
+                    ids: list[str] = []
+                    seen: set[str] = set()
+                    for row in reader:
+                        vid = row[column].strip()
+                        if vid and vid not in seen:
+                            seen.add(vid)
+                            ids.append(vid)
+                    return ids
+            except (UnicodeDecodeError, UnicodeError) as exc:
+                last_err = exc
+                continue
+
+        raise ValueError(f"无法识别 CSV 文件编码: {filepath}") from last_err
 
     # ------------------------------------------------------------------
     # 内部辅助
