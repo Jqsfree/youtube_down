@@ -72,7 +72,7 @@ class MainWindow(QMainWindow):
         if spec:
             title += f"  |  🍪 {spec}（已检测到）"
         self.setWindowTitle(title)
-        self.resize(900, 720)
+        self.resize(900, 820)
         self._build_ui()
         self._connect_signals()
 
@@ -190,12 +190,13 @@ class MainWindow(QMainWindow):
 
         # ---- 日志区 ----
         log_group = QGroupBox("日志")
+        log_group.setCheckable(False)
         log_layout = QVBoxLayout(log_group)
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(500)
-        self._log_view.setFont(Qt.font(Qt.FontRole.SystemFont))
-        self._log_view.setStyleSheet("QPlainTextEdit { font-family: monospace; }")
+        self._log_view.setMinimumHeight(80)
+        self._log_view.setPlaceholderText("下载日志将显示在此处...")
         log_layout.addWidget(self._log_view)
         root.addWidget(log_group)
 
