@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.spec
+dist/
+build/
+*.exe
+*.part
+*.ytdl
+*.mp4
+*.webm
+*.mkv
+*.m4a
+batch_results_*.csv
+test_*.csv
+.DS_Store

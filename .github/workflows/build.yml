@@ -1,0 +1,50 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pyside6 yt-dlp pyinstaller
+
+      - name: Download ffmpeg
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath .
+          $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
+          Move-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
+          Move-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --windowed `
+            --name "YouTubeDownloader" `
+            --add-binary "ffmpeg.exe;." `
+            --add-binary "ffprobe.exe;." `
+            --hidden-import PySide6.QtCore `
+            --hidden-import PySide6.QtWidgets `
+            --hidden-import yt_dlp `
+            --hidden-import yt_dlp.extractor `
+            --hidden-import yt_dlp.downloader `
+            main.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTubeDownloader
+          path: dist/YouTubeDownloader.exe
