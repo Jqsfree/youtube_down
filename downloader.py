@@ -89,7 +89,7 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
     if ffmpeg_path:
         try:
             r = subprocess.run(
-                ["ffmpeg", "-version"], capture_output=True, text=True, timeout=5
+                [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5
             )
             ver_line = r.stdout.split("\n")[0] if r.stdout else "?"
             items.append(EnvItem("ffmpeg", "ok", ver_line, ""))
@@ -109,7 +109,7 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
     if deno_path:
         try:
             r = subprocess.run(
-                ["deno", "--version"], capture_output=True, text=True, timeout=5
+                [deno_path, "--version"], capture_output=True, text=True, timeout=5
             )
             ver_line = r.stdout.split("\n")[0] if r.stdout else "?"
             items.append(EnvItem("deno", "ok", ver_line, ""))
@@ -252,9 +252,37 @@ class YoutubeDownloader:
         Returns:
             (browser_name, profile_name) 或 None。
         """
+        if os.name == "nt":
+            localappdata = os.environ.get("LOCALAPPDATA", "")
+            appdata = os.environ.get("APPDATA", "")
+
+            # Chrome — 多 Profile
+            chrome_dir = os.path.join(localappdata, "Google", "Chrome", "User Data")
+            if os.path.isdir(chrome_dir):
+                profiles = ["Default"] + sorted(
+                    d for d in os.listdir(chrome_dir)
+                    if d.startswith("Profile ") and os.path.isdir(os.path.join(chrome_dir, d))
+                )
+                for profile in profiles:
+                    if os.path.isfile(os.path.join(chrome_dir, profile, "Cookies")):
+                        return ("chrome", profile)
+
+            # Firefox
+            firefox_dir = os.path.join(appdata, "Mozilla", "Firefox", "Profiles")
+            if os.path.isdir(firefox_dir):
+                return ("firefox", "default")
+
+            # Edge
+            edge_dir = os.path.join(localappdata, "Microsoft", "Edge", "User Data")
+            if os.path.isdir(edge_dir):
+                return ("edge", "Default")
+
+            return None
+
+        # Linux / macOS
         home = os.path.expanduser("~")
 
-        # Chrome — 多 Profile 检测
+        # Chrome
         chrome_dir = os.path.join(home, ".config/google-chrome")
         if os.path.isdir(chrome_dir):
             profiles = ["Default"] + sorted(
@@ -548,6 +576,9 @@ class YoutubeDownloader:
             except (UnicodeDecodeError, UnicodeError) as exc:
                 last_err = exc
                 continue
+            # 列名不匹配等非编码错误直接抛出，不重试其他编码
+            except ValueError:
+                raise
 
         raise ValueError(f"无法识别 CSV 文件编码: {filepath}") from last_err
 

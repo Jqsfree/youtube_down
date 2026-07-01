@@ -171,7 +171,7 @@ class FormatAnalyzer(QThread):
             try:
                 info = self._downloader.get_info(vid, use_cookies=False)
                 if first_info is None:
-                    first_info = info
+                    first_info = info  # 只在第一个成功时赋值
                 fmt_set = {
                     f["format_id"]
                     for f in self._downloader.list_formats(info=info)
@@ -257,7 +257,7 @@ class BatchDownloadWorker(QThread):
 
             # ── Stage 1: 无 Cookie ──────────────────────────
             status, cookie_used, category, error_msg = self._try_download(
-                vid, use_cookies=False
+                vid, i, total, use_cookies=False
             )
 
             if status == "success":
@@ -274,7 +274,7 @@ class BatchDownloadWorker(QThread):
             # ── Stage 2: Cookie 重试 ──────────────────────
             if category.retry_cookie:
                 status, cookie_used, category, error_msg = self._try_download(
-                    vid, use_cookies=True
+                    vid, i, total, use_cookies=True
                 )
 
                 # 仅 auth 相关失败才重检浏览器再试（Profile 可能变了）
@@ -284,7 +284,7 @@ class BatchDownloadWorker(QThread):
                     and self._downloader.redetect_browser()
                 ):
                     status, cookie_used, category, error_msg = self._try_download(
-                        vid, use_cookies=True
+                        vid, i, total, use_cookies=True
                     )
 
             if status == "success":
@@ -355,15 +355,13 @@ class BatchDownloadWorker(QThread):
         return "best"
 
     def _try_download(
-        self, video_id: str, use_cookies: bool
+        self, video_id: str, index: int, total: int, use_cookies: bool
     ) -> tuple[str, bool, ErrorCategory, str]:
         """尝试获取信息 + 下载。
 
         Returns:
             (status, cookie_used, category, error_or_path)
         """
-        index = self._video_ids.index(video_id)
-        total = len(self._video_ids)
         self.video_started.emit(index, total, video_id, use_cookies)
 
         try:
@@ -429,14 +427,30 @@ class BatchDownloadWorker(QThread):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = str(self._output_dir / f"batch_results_{timestamp}.csv")
 
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv_module.DictWriter(
-                f, fieldnames=[
-                    "video_id", "status", "error_category",
-                    "error_message", "cookie_used",
-                ]
-            )
-            writer.writeheader()
-            writer.writerows(results)
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv_module.DictWriter(
+                    f, fieldnames=[
+                        "video_id", "status", "error_category",
+                        "error_message", "cookie_used",
+                    ]
+                )
+                writer.writeheader()
+                writer.writerows(results)
+        except OSError:
+            try:
+                fallback = str(Path.home() / f"batch_results_{timestamp}.csv")
+                with open(fallback, "w", newline="", encoding="utf-8") as f:
+                    writer = csv_module.DictWriter(
+                        f, fieldnames=[
+                            "video_id", "status", "error_category",
+                            "error_message", "cookie_used",
+                        ]
+                    )
+                    writer.writeheader()
+                    writer.writerows(results)
+                csv_path = fallback
+            except OSError:
+                csv_path = "（写入失败）"
 
         return csv_path
