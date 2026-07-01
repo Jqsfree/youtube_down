@@ -10,6 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from datetime import datetime
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -19,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QTreeWidget,
@@ -52,6 +55,8 @@ class MainWindow(QMainWindow):
             for i in env_items
         )
         print(f"[env] {versions}")
+        # 日志在 _build_ui 之后添加，所以先存起来
+        self._env_report = env_items
 
         self._downloader = YoutubeDownloader()
         self._worker: DownloadWorker | BatchDownloadWorker | None = None
@@ -70,6 +75,20 @@ class MainWindow(QMainWindow):
         self.resize(900, 720)
         self._build_ui()
         self._connect_signals()
+
+        # 环境日志
+        for i in env_items:
+            icon = "✗" if i.status == "error" else ("⚠" if i.status == "warning" else "✓")
+            self._log(f"  {icon} {i.name} {i.version}")
+
+    # ------------------------------------------------------------------
+    # 日志
+    # ------------------------------------------------------------------
+
+    def _log(self, text: str) -> None:
+        """追加一行带时间戳的日志。"""
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log_view.appendPlainText(f"[{ts}] {text}")
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -169,6 +188,17 @@ class MainWindow(QMainWindow):
         prog_layout.addWidget(self._status_label)
         root.addWidget(prog_group)
 
+        # ---- 日志区 ----
+        log_group = QGroupBox("日志")
+        log_layout = QVBoxLayout(log_group)
+        self._log_view = QPlainTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.setMaximumBlockCount(500)
+        self._log_view.setFont(Qt.font(Qt.FontRole.SystemFont))
+        self._log_view.setStyleSheet("QPlainTextEdit { font-family: monospace; }")
+        log_layout.addWidget(self._log_view)
+        root.addWidget(log_group)
+
         # ---- 操作按钮 ----
         btn_layout = QHBoxLayout()
         self._download_btn = QPushButton("下载")
@@ -218,6 +248,7 @@ class MainWindow(QMainWindow):
 
         self._csv_ids = ids
         self._csv_label.setText(f"已加载 {len(ids)} 个 Video ID")
+        self._log(f"加载 CSV: {len(ids)} 个 Video ID")
 
         # 后台线程分析共有格式（避免主线程网络请求卡 GUI）
         self._id_input.setText(ids[0])
@@ -440,6 +471,7 @@ class MainWindow(QMainWindow):
         self._batch_progress_bar.setVisible(False)
         self._batch_progress_label.setVisible(False)
         self._status_label.setText("已取消")
+        self._log("用户取消下载")
 
     def _set_downloading_ui(self, downloading: bool) -> None:
         """切换 UI 状态：闲置 / 下载中。"""
@@ -506,6 +538,7 @@ class MainWindow(QMainWindow):
         self._size_label.setText("— / —")
         tag = " 🍪" if cookie else ""
         self._status_label.setText(f"[{index + 1}/{total}] 下载: {video_id}{tag}")
+        self._log(f"[{index + 1}/{total}] 开始: {video_id}{tag}")
 
     def _on_batch_video_finished(
         self, index: int, path: str, cookie_used: bool
@@ -514,6 +547,8 @@ class MainWindow(QMainWindow):
         self._batch_progress_label.setText(
             f"总进度 — {self._batch_done} / {len(self._csv_ids)}"
         )
+        tag = " [🍪]" if cookie_used else ""
+        self._log(f"[{index + 1}/{len(self._csv_ids)}] 完成{tag}: {path}")
 
     def _on_batch_video_error(
         self, index: int, msg: str, cookie_used: bool
@@ -531,6 +566,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText(
             f"[{index + 1}/{len(self._csv_ids)}] 失败: {vid}"
         )
+        self._log(f"[{index + 1}/{len(self._csv_ids)}] 失败: {vid} — {msg[:120]}")
 
     def _on_batch_all_finished(
         self, success: int, fail: int, csv_path: str
@@ -549,6 +585,7 @@ class MainWindow(QMainWindow):
             f"详细结果 CSV:\n{csv_path}"
         )
         QMessageBox.information(self, "批量下载完成", msg)
+        self._log(f"批量完成: 成功 {success}, 失败 {fail}, CSV: {csv_path}")
         self._batch_errors.clear()
 
     # ------------------------------------------------------------------
