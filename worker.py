@@ -22,6 +22,26 @@ from downloader import ErrorCategory, YoutubeDownloader, _find_tool, classify_er
 from logger_utils import AppLogger
 
 
+def _check_existing(video_id: str, output_dir: Path) -> Path | None:
+    """检查输出目录是否已有此视频的有效文件（用于去重）。"""
+    import subprocess as _sp
+    for ext in (".mp4", ".webm", ".mkv", ".m4a"):
+        candidate = output_dir / f"{video_id}{ext}"
+        if not candidate.is_file() or candidate.stat().st_size <= 1024:
+            continue
+        try:
+            r = _sp.run(
+                [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
+                 "format=duration", "-of", "csv=p=0", str(candidate)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return candidate
+        except Exception:
+            pass
+    return None
+
+
 class DownloadWorker(QThread):
     """后台下载线程（单视频）。
 
@@ -63,6 +83,12 @@ class DownloadWorker(QThread):
 
     def run(self) -> None:
         """在后台线程中执行下载。"""
+        # 去重检查
+        existing = _check_existing(self._video_id, self._output_dir)
+        if existing:
+            self.finished.emit(str(existing))
+            return
+
         try:
 
             def on_progress(d: dict[str, Any]) -> None:
@@ -278,7 +304,6 @@ class BatchDownloadWorker(QThread):
         self._video_ids = video_ids
         self._format_id = format_id
         self._output_dir = output_dir
-        self._retry_output_dir = output_dir
         self._results_dir = results_dir or output_dir
         self._min_height = min_height
         self._last_results_csv = ""
@@ -415,26 +440,6 @@ class BatchDownloadWorker(QThread):
         self.video_finished.emit(index, "续传跳过（已完成）", False)
         self.status_changed.emit(f"[{index + 1}/{total}] 续传跳过: {video_id}")
 
-    @staticmethod
-    def _check_existing(video_id: str, output_dir: Path) -> Path | None:
-        """检查输出目录是否已有此视频的有效文件（用于去重）。"""
-        import subprocess as _sp
-        for ext in (".mp4", ".webm", ".mkv", ".m4a"):
-            candidate = output_dir / f"{video_id}{ext}"
-            if not candidate.is_file() or candidate.stat().st_size <= 1024:
-                continue
-            try:
-                r = _sp.run(
-                    [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
-                     "format=duration", "-of", "csv=p=0", str(candidate)],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    return candidate
-            except Exception:
-                pass
-        return None
-
     def _resolve_format(self, info: dict[str, Any]) -> tuple[str | None, bool]:
         """为当前视频匹配最佳 format_id + 是否需要合并音频。
 
@@ -510,7 +515,7 @@ class BatchDownloadWorker(QThread):
         on_progress = self._make_progress_cb(index, total)
 
         try:
-            existing = self._check_existing(video_id, self._output_dir)
+            existing = _check_existing(video_id, self._output_dir)
             if existing:
                 self.video_finished.emit(index, str(existing), use_cookies)
                 return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing))
@@ -528,7 +533,7 @@ class BatchDownloadWorker(QThread):
 
             path = self._downloader.download(
                 video_id=video_id, format_id=fmt,
-                output_dir=self._retry_output_dir,
+                output_dir=self._output_dir,
                 progress_callback=on_progress, use_cookies=use_cookies,
                 needs_audio_merge=merge,
             )
@@ -550,7 +555,7 @@ class BatchDownloadWorker(QThread):
                             return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "")
                         path = self._downloader.download(
                             video_id=video_id, format_id=fmt,
-                            output_dir=self._retry_output_dir,
+                            output_dir=self._output_dir,
                             progress_callback=on_progress, use_cookies=False,
                             needs_audio_merge=merge,
                         )
@@ -612,7 +617,7 @@ class BatchDownloadWorker(QThread):
         from datetime import datetime
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = str(self._output_dir / f"skipped_videos_{timestamp}.csv")
+        path = str(self._results_dir / f"skipped_videos_{timestamp}.csv")
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv_module.DictWriter(f, fieldnames=["video_id", "reason"])
@@ -635,7 +640,7 @@ class BatchDownloadWorker(QThread):
         from datetime import datetime
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = str(self._output_dir / f"failed_videos_{timestamp}.csv")
+        path = str(self._results_dir / f"failed_videos_{timestamp}.csv")
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv_module.DictWriter(f, fieldnames=["video_id", "reason"])

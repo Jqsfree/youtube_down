@@ -497,7 +497,9 @@ class YoutubeDownloader:
         def _progress_hook(d: dict[str, Any]) -> None:
             if progress_callback:
                 progress_callback(d)
-            if self._cancelled:
+            with self._cancel_lock:
+                cancelled = self._cancelled
+            if cancelled:
                 raise yt_dlp.utils.DownloadError("下载已取消")
 
         if format_id == "best":
@@ -518,12 +520,6 @@ class YoutubeDownloader:
             fragment_retries=5,
             keep_fragments=False,
             prefer_ffmpeg=True,
-            postprocessors=[
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                }
-            ],
         )
 
         with yt_dlp.YoutubeDL(opts) as ydl:
