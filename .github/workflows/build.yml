@@ -36,6 +36,11 @@ jobs:
           Move-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
           Move-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
 
+      - name: Smoke test (Windows env check + get_info)
+        run: |
+          python -c "from downloader import YoutubeDownloader, check_environment; ok, items = check_environment(); [print(f'  {i.status} {i.name}') for i in items]; assert ok, 'Env check failed'"
+          python -c "from downloader import YoutubeDownloader; dl = YoutubeDownloader(); info = dl.get_info('dQw4w9WgXcQ'); print(f'OK: {info[\"title\"][:40]}')"
+
       - name: Build EXE
         run: |
           pyinstaller --onefile --windowed `
