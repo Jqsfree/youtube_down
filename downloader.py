@@ -465,7 +465,8 @@ class YoutubeDownloader:
                 "note": self._format_note(fmt),
             })
 
-        return results
+        # 每档分辨率只保留最优版本：Video Only > Video+Audio，大文件 > 小文件
+        return self._dedup_formats(results)
 
     def download(
         self,
@@ -765,6 +766,31 @@ class YoutubeDownloader:
             return fallback[0].get("format_id", None)
 
         return None
+
+    @staticmethod
+    def _dedup_formats(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """每档分辨率只保留最优版本：Video Only 优先（画质更高），再按文件大小。"""
+        best: dict[str, dict[str, Any]] = {}
+        for f in formats:
+            key = f["resolution"]
+            if key not in best:
+                best[key] = f
+                continue
+            # Video Only > Video+Audio
+            cur_type = 0 if f["type"] == "Video Only" else 1
+            old_type = 0 if best[key]["type"] == "Video Only" else 1
+            if cur_type < old_type or (
+                cur_type == old_type
+                and (f["filesize"] or 0) > (best[key]["filesize"] or 0)
+            ):
+                best[key] = f
+        def _sort_key(f: dict[str, Any]) -> int:
+            res = f.get("resolution", "")
+            try:
+                return int(res.split("x")[-1])
+            except (ValueError, IndexError):
+                return 0
+        return sorted(best.values(), key=_sort_key, reverse=True)
 
     @staticmethod
     def _format_note(fmt: dict[str, Any]) -> str:
