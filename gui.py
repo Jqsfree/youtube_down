@@ -63,7 +63,8 @@ class MainWindow(QMainWindow):
         self._env_report = env_items
 
         self._downloader = YoutubeDownloader()
-        self._log_path = Path.home() / "Downloads" / "youtube_downloader.log"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._log_path = Path.home() / "Downloads" / f"youtube_downloader_{ts}.log"
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         AppLogger.attach_file(self._log_path)
         self._worker: DownloadWorker | BatchDownloadWorker | None = None
@@ -77,7 +78,8 @@ class MainWindow(QMainWindow):
         self._last_fmt_id: str = ""
         self._last_min_height: int = 720
         self._batch_total: int = 0
-        self._batch_video_ids: list[str] = []  # 当前批次视频总数，避免用 _csv_ids 长度
+        self._batch_video_ids: list[str] = []
+        self._queue_results: list[tuple[int, int, str]] = []  # 队列累计结果  # 当前批次视频总数，避免用 _csv_ids 长度
 
         spec = self._downloader._cookies_spec  # noqa: SLF001
         title = "YouTube Downloader"
@@ -85,6 +87,7 @@ class MainWindow(QMainWindow):
             title += f"  |  🍪 {spec}（已检测到）"
         self.setWindowTitle(title)
         self.resize(900, 720)
+        self.setAcceptDrops(True)
         self._build_ui()
         self._connect_signals()
 
@@ -95,6 +98,22 @@ class MainWindow(QMainWindow):
         for i in env_items:
             icon = "✗" if i.status == "error" else ("⚠" if i.status == "warning" else "✓")
             self._log(f"  {icon} {i.name} {i.version}")
+
+    # ------------------------------------------------------------------
+    # 拖拽导入
+    # ------------------------------------------------------------------
+
+    def dragEnterEvent(self, event: Any) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: Any) -> None:
+        filepaths = [
+            url.toLocalFile() for url in event.mimeData().urls()
+            if url.toLocalFile().lower().endswith((".csv", ".tsv", ".txt"))
+        ]
+        if filepaths:
+            self._process_imported_files(filepaths)
 
     # ------------------------------------------------------------------
     # 日志
@@ -254,7 +273,7 @@ class MainWindow(QMainWindow):
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(2000)
         self._log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self._log_view.setPlaceholderText("下载周期信息会显示在这里；错误日志可通过“显示错误”切换")
+        self._log_view.setPlaceholderText("下载日志将显示在此处...")
         self._log_view.setMinimumHeight(80)
         self._log_view.setPlaceholderText("下载日志将显示在此处...")
         log_layout.addWidget(self._log_view)
@@ -299,16 +318,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_load_csv(self) -> None:
-        """加载一个或多个 CSV 文件，合并 video_id 列表。"""
+        """文件选择对话框加载 CSV。"""
         filepaths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择导入文件（可多选）",
             "",
             "支持文件 (*.csv *.tsv *.txt);;所有文件 (*)",
         )
-        if not filepaths:
-            return
+        if filepaths:
+            self._process_imported_files(filepaths)
 
+    def _process_imported_files(self, filepaths: list[str]) -> None:
+        """处理导入文件列表（文件对话框或拖拽共用）。"""
         import_column = self._csv_column_input.text().strip() or "video_id"
         all_ids: list[str] = []
         errors: list[str] = []
@@ -339,17 +360,11 @@ class MainWindow(QMainWindow):
         if errors:
             QMessageBox.critical(self, "文件错误", "\n".join(errors))
 
-        if not all_ids:
-            QMessageBox.warning(self, "提示", "CSV 中未找到有效的 video_id")
-            return
-
         if not self._csv_queue:
             QMessageBox.warning(self, "提示", "CSV 中未找到有效的 video_id")
             return
 
-        # 合并用于格式分析
         self._csv_ids = list(dict.fromkeys(all_ids))
-
         total = sum(len(ids) for _, ids, _ in self._csv_queue)
         parts = " → ".join(f"{name}({len(ids)})" for name, ids, _ in self._csv_queue)
         self._csv_label.setText(
@@ -359,10 +374,20 @@ class MainWindow(QMainWindow):
         self._log(f"加载队列: {parts}")
 
         self._id_input.setText(self._csv_ids[0])
-        self._fetch_btn.setEnabled(True)
-        self._fetch_btn.setText("获取信息")
         self._download_btn.setEnabled(False)
-        self._status_label.setText("已加载队列，点击“获取信息”查看格式")
+        # 自动后台分析格式（不卡 GUI）
+        self._fetch_btn.setEnabled(False)
+        self._fetch_btn.setText("分析中...")
+        self._status_label.setText("正在分析共有格式...")
+        self._format_analyzer = FormatAnalyzer(
+            downloader=self._downloader,
+            video_ids=self._csv_ids,
+            sample_size=5,
+        )
+        self._format_analyzer.progress.connect(self._status_label.setText)
+        self._format_analyzer.finished.connect(self._on_formats_ready)
+        self._format_analyzer.error.connect(self._on_formats_error)
+        self._format_analyzer.start()
 
     def _refresh_imported_files_list(self, queue: list[tuple[str, list[str], Path | None]]) -> None:
         """刷新已导入文件列表，显示每个源文件名、视频数和目标目录。"""
@@ -755,36 +780,56 @@ class MainWindow(QMainWindow):
         self._batch_progress_label.setText(f"完成 — 成功 {success}，失败 {fail}")
         self._status_label.setText(f"批量下载完成：成功 {success}，失败 {fail}")
 
-        total = success + fail
-        extra = []
-        if self._worker is not None:
-            skipped_path = getattr(self._worker, "_last_skipped_csv", "")
-            failed_path = getattr(self._worker, "_last_failed_csv", "")
-            if skipped_path:
-                extra.append(f"跳过列表 CSV:\n{skipped_path}")
-            if failed_path:
-                extra.append(f"失败重试 CSV:\n{failed_path}")
-        msg = (
-            f"批量下载完成\n\n"
-            f"总数: {total}\n"
-            f"成功: {success}\n"
-            f"失败: {fail}\n\n"
-            f"详细结果 CSV:\n{csv_path}"
-        )
-        if extra:
-            msg = f"{msg}\n\n" + "\n\n".join(extra)
-        QMessageBox.information(self, "批量下载完成", msg)
-        self._log(f"批量完成: 成功 {success}, 失败 {fail}, CSV: {csv_path}")
-        AppLogger.get_logger().info("批量完成: 成功 %s, 失败 %s, CSV: %s", success, fail, csv_path)
         self._batch_errors.clear()
 
-        # 队列剩余 → 继续下一个
+        # 队列模式：累积结果，最后一个弹窗
         if self._csv_queue:
+            self._queue_results.append((success, fail, csv_path))
             fmt_id = self._worker._format_id if self._worker else self._last_fmt_id  # noqa: SLF001
             min_height = self._last_min_height
             self._start_queue(fmt_id, self._output_dir, min_height)
+            return
+
+        # 队列全部完成（或单批次）→ 汇总弹窗
+        if self._queue_results:
+            self._queue_results.append((success, fail, csv_path))
+            total_ok = sum(s for s, _, _ in self._queue_results)
+            total_fail = sum(f for _, f, _ in self._queue_results)
+            csv_list = "\n".join(f"  {p}" for _, _, p in self._queue_results)
+            msg = (
+                f"队列全部完成\n\n"
+                f"总数: {total_ok + total_fail}\n"
+                f"成功: {total_ok}\n"
+                f"失败: {total_fail}\n\n"
+                f"结果 CSV:\n{csv_list}"
+            )
+            QMessageBox.information(self, "队列下载完成", msg)
+            self._log(f"队列全部完成: 成功 {total_ok}, 失败 {total_fail}")
+            self._queue_results.clear()
         else:
-            self._set_downloading_ui(False)
+            total = success + fail
+            extra = []
+            if self._worker is not None:
+                skipped_path = getattr(self._worker, "_last_skipped_csv", "")
+                failed_path = getattr(self._worker, "_last_failed_csv", "")
+                if skipped_path:
+                    extra.append(f"跳过列表 CSV:\n{skipped_path}")
+                if failed_path:
+                    extra.append(f"失败重试 CSV:\n{failed_path}")
+            msg = (
+                f"批量下载完成\n\n"
+                f"总数: {total}\n"
+                f"成功: {success}\n"
+                f"失败: {fail}\n\n"
+                f"详细结果 CSV:\n{csv_path}"
+            )
+            if extra:
+                msg = f"{msg}\n\n" + "\n\n".join(extra)
+            QMessageBox.information(self, "批量下载完成", msg)
+            self._log(f"批量完成: 成功 {success}, 失败 {fail}, CSV: {csv_path}")
+            AppLogger.get_logger().info("批量完成: 成功 %s, 失败 %s, CSV: %s", success, fail, csv_path)
+
+        self._set_downloading_ui(False)
 
     # ------------------------------------------------------------------
     # 槽：打开目录
