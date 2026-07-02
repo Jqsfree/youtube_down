@@ -11,7 +11,9 @@ Worker 在后台线程中运行下载逻辑，通过 Qt Signals 向 GUI 报告
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import time
 
 import yt_dlp
 from PySide6.QtCore import QThread, Signal
@@ -449,6 +451,38 @@ class BatchDownloadWorker(QThread):
 
         return self._downloader.resolve_format_id(formats, min_height=max(720, self._min_height))
 
+    def _make_progress_cb(self, index: int, total: int) -> Callable[[dict[str, Any]], None]:
+        """创建进度回调（闭包捕获 index/total）。"""
+        def on_progress(d: dict[str, Any]) -> None:
+            status = d.get("status", "")
+            if status == "downloading":
+                total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes", 0)
+                if total_b > 0:
+                    cur_pct = int(downloaded / total_b * 100)
+                    self.progress_changed.emit(cur_pct)
+                    all_pct = int((index + cur_pct / 100) / total * 100)
+                    self.all_progress_changed.emit(all_pct)
+
+                speed = d.get("speed") or ""
+                if speed and isinstance(speed, (int, float)):
+                    speed = DownloadWorker._format_speed(speed)
+                self.speed_changed.emit(str(speed) if speed else "—")
+
+                eta = d.get("eta") or ""
+                if eta and isinstance(eta, (int, float)):
+                    eta = DownloadWorker._format_eta(int(eta))
+                self.eta_changed.emit(str(eta) if eta else "—")
+
+                size_text = (
+                    f"{DownloadWorker._format_size(downloaded)}"
+                    f" / {DownloadWorker._format_size(total_b)}"
+                )
+                self.size_changed.emit(size_text)
+            elif status == "finished":
+                self.status_changed.emit("处理中...")
+        return on_progress
+
     def _try_download(
         self, video_id: str, index: int, total: int, use_cookies: bool
     ) -> tuple[str, bool, ErrorCategory, str]:
@@ -458,72 +492,54 @@ class BatchDownloadWorker(QThread):
             (status, cookie_used, category, error_or_path)
         """
         self.video_started.emit(index, total, video_id, use_cookies)
+        on_progress = self._make_progress_cb(index, total)
 
         try:
-            # 去重：检查是否已有有效文件
             existing = self._check_existing(video_id, self._output_dir)
             if existing:
                 self.video_finished.emit(index, str(existing), use_cookies)
                 return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing))
 
-            # 获取信息
             info = self._downloader.get_info(video_id, use_cookies=use_cookies)
-
-            # 确定实际使用的 format_id
-            if use_cookies:
-                fmt = "best"
-            else:
-                fmt = self._resolve_format(info)
+            fmt = "best" if use_cookies else self._resolve_format(info)
 
             if fmt is None:
                 msg = f"低于 {self._min_height}p，跳过下载: {video_id}"
                 self.video_error.emit(index, msg, use_cookies)
                 return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, msg), msg)
 
-            # 下载
-            def on_progress(d: dict[str, Any]) -> None:
-                status = d.get("status", "")
-                if status == "downloading":
-                    total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    downloaded = d.get("downloaded_bytes", 0)
-                    if total_b > 0:
-                        cur_pct = int(downloaded / total_b * 100)
-                        self.progress_changed.emit(cur_pct)
-                        all_pct = int((index + cur_pct / 100) / total * 100)
-                        self.all_progress_changed.emit(all_pct)
-
-                    speed = d.get("speed") or ""
-                    if speed and isinstance(speed, (int, float)):
-                        speed = DownloadWorker._format_speed(speed)
-                    self.speed_changed.emit(str(speed) if speed else "—")
-
-                    eta = d.get("eta") or ""
-                    if eta and isinstance(eta, (int, float)):
-                        eta = DownloadWorker._format_eta(int(eta))
-                    self.eta_changed.emit(str(eta) if eta else "—")
-
-                    size_text = (
-                        f"{DownloadWorker._format_size(downloaded)}"
-                        f" / {DownloadWorker._format_size(total_b)}"
-                    )
-                    self.size_changed.emit(size_text)
-                elif status == "finished":
-                    self.status_changed.emit("处理中...")
-
             path = self._downloader.download(
-                video_id=video_id,
-                format_id=fmt,
+                video_id=video_id, format_id=fmt,
                 output_dir=self._retry_output_dir,
-                progress_callback=on_progress,
-                use_cookies=use_cookies,
+                progress_callback=on_progress, use_cookies=use_cookies,
             )
             self.video_finished.emit(index, str(path), use_cookies)
             return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path))
 
         except Exception as exc:
+            cat = classify_error(exc)
+            if cat.code == "RATE_LIMIT" and not use_cookies:
+                for attempt in range(2):
+                    wait = 2 ** (attempt + 2)  # 4s, 8s
+                    self.status_changed.emit(f"限流，{wait}s 后重试...")
+                    time.sleep(wait)
+                    try:
+                        info = self._downloader.get_info(video_id, use_cookies=False)
+                        fmt = self._resolve_format(info)
+                        if fmt is None:
+                            return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "")
+                        path = self._downloader.download(
+                            video_id=video_id, format_id=fmt,
+                            output_dir=self._retry_output_dir,
+                            progress_callback=on_progress, use_cookies=False,
+                        )
+                        self.video_finished.emit(index, str(path), use_cookies)
+                        return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path))
+                    except Exception:
+                        continue
+
             AppLogger.log_exception(exc, f"批量下载失败: {video_id}")
             self.video_error.emit(index, clean_error(exc), use_cookies)
-            cat = classify_error(exc)
             return ("failed", use_cookies, cat, str(exc))
 
     def _write_results(self, results: list[dict[str, str]]) -> str:

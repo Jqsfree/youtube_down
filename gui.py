@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -48,10 +49,7 @@ class MainWindow(QMainWindow):
         all_ok, env_items = check_environment()
         errors = [i for i in env_items if i.status == "error"]
         if errors:
-            lines = ["以下依赖缺失，程序可能无法正常工作：\n"]
-            for i in errors:
-                lines.append(f"  ✗ {i.name}: {i.message}")
-            QMessageBox.critical(self, "环境检测", "\n".join(lines))
+            self._show_env_wizard(errors)
 
         # 控制台打印版本
         versions = "  ".join(
@@ -102,6 +100,19 @@ class MainWindow(QMainWindow):
             self._log(f"  {icon} {i.name} {i.version}")
 
     # ------------------------------------------------------------------
+    # 退出清理
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event: Any) -> None:
+        """关闭窗口时确保 worker 线程终止。"""
+        if self._worker is not None and self._worker.isRunning():
+            self._downloader.cancel()
+            self._worker.quit()
+            self._worker.wait(3000)
+        AppLogger.get_logger().info("应用退出")
+        event.accept()
+
+    # ------------------------------------------------------------------
     # 拖拽导入
     # ------------------------------------------------------------------
 
@@ -116,6 +127,38 @@ class MainWindow(QMainWindow):
         ]
         if filepaths:
             self._process_imported_files(filepaths)
+
+    # ------------------------------------------------------------------
+    # 启动向导
+    # ------------------------------------------------------------------
+
+    def _show_env_wizard(self, errors: list) -> None:
+        """启动时检测到缺失依赖，引导安装。"""
+        lines = ["检测到以下依赖缺失：\n"]
+        cmds: list[str] = []
+        for i in errors:
+            lines.append(f"  ✗ {i.name}")
+            if "pip install" in i.message:
+                cmds.append(i.message.split("pip install ")[-1].split("）")[0].rstrip(")"))
+
+        lines.append("\n是否自动安装？")
+        reply = QMessageBox.question(
+            self, "环境检测", "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._status_label.setText("正在安装依赖...")
+            for pkg in cmds:
+                self._log(f"pip install {pkg}")
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "install"] + pkg.split(),
+                        capture_output=True, timeout=120,
+                    )
+                    self._log(f"  ✓ {pkg} 安装完成")
+                except Exception as exc:
+                    self._log(f"  ✗ {pkg} 安装失败: {exc}")
+            self._status_label.setText("依赖安装完成，请重启应用")
 
     # ------------------------------------------------------------------
     # 日志
