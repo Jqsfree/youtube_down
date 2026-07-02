@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QListWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -31,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from downloader import YoutubeDownloader, check_environment
+from logger_utils import AppLogger
 from worker import BatchDownloadWorker, DownloadWorker, FormatAnalyzer
 
 
@@ -59,22 +63,33 @@ class MainWindow(QMainWindow):
         self._env_report = env_items
 
         self._downloader = YoutubeDownloader()
+        self._log_path = Path.home() / "Downloads" / "youtube_downloader.log"
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        AppLogger.attach_file(self._log_path)
         self._worker: DownloadWorker | BatchDownloadWorker | None = None
         self._video_id: str = ""
         self._info: dict[str, Any] | None = None
         self._output_dir: Path = Path.home() / "Downloads"
         self._csv_ids: list[str] = []
+        self._csv_queue: list[tuple[str, list[str], Path | None]] = []
         self._batch_done: int = 0
         self._batch_errors: list[tuple[int, str]] = []
+        self._last_fmt_id: str = ""
+        self._last_min_height: int = 720
+        self._batch_total: int = 0
+        self._batch_video_ids: list[str] = []  # 当前批次视频总数，避免用 _csv_ids 长度
 
         spec = self._downloader._cookies_spec  # noqa: SLF001
         title = "YouTube Downloader"
         if spec:
             title += f"  |  🍪 {spec}（已检测到）"
         self.setWindowTitle(title)
-        self.resize(900, 820)
+        self.resize(900, 720)
         self._build_ui()
         self._connect_signals()
+
+        AppLogger.attach_gui(self._append_log_line)
+        AppLogger.get_logger().info("应用启动")
 
         # 环境日志
         for i in env_items:
@@ -85,10 +100,31 @@ class MainWindow(QMainWindow):
     # 日志
     # ------------------------------------------------------------------
 
+    def _append_log_line(self, text: str) -> None:
+        if not hasattr(self, "_log_view"):
+            return
+        self._log_view.appendPlainText(text)
+        self._log_view.ensureCursorVisible()
+
     def _log(self, text: str) -> None:
         """追加一行带时间戳的日志。"""
         ts = datetime.now().strftime("%H:%M:%S")
-        self._log_view.appendPlainText(f"[{ts}] {text}")
+        self._append_log_line(f"[{ts}] {text}")
+
+    def _on_toggle_error_logs(self, checked: bool) -> None:
+        AppLogger.set_gui_show_errors(checked)
+        if checked:
+            self._log("已显示错误日志")
+        else:
+            self._log("已隐藏错误日志")
+
+    def _on_copy_log(self) -> None:
+        text = self._log_view.toPlainText()
+        if not text:
+            return
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        self._log("日志已复制到剪贴板")
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -108,17 +144,39 @@ class MainWindow(QMainWindow):
         id_layout.addWidget(self._id_input)
         self._fetch_btn = QPushButton("获取信息")
         id_layout.addWidget(self._fetch_btn)
+        self._refresh_btn = QPushButton("刷新页面")
+        self._refresh_btn.setToolTip("重新获取当前输入的视频信息和格式")
+        id_layout.addWidget(self._refresh_btn)
         root.addLayout(id_layout)
 
         # ---- CSV 批量导入 ----
         csv_layout = QHBoxLayout()
         self._load_csv_btn = QPushButton("Load CSV")
-        self._load_csv_btn.setToolTip("从 CSV 文件的 video_id 列加载批量下载列表")
+        self._load_csv_btn.setToolTip("支持 CSV/TSV/TXT，并可按自定义字段名导入")
         csv_layout.addWidget(self._load_csv_btn)
+        csv_layout.addWidget(QLabel("字段:"))
+        self._csv_column_input = QLineEdit()
+        self._csv_column_input.setPlaceholderText("如 video_id / id / url")
+        self._csv_column_input.setText("video_id")
+        self._csv_column_input.setMaximumWidth(180)
+        csv_layout.addWidget(self._csv_column_input)
+        csv_layout.addWidget(QLabel("最小分辨率:"))
+        self._min_height_input = QLineEdit()
+        self._min_height_input.setPlaceholderText("如 720 / 1080")
+        self._min_height_input.setText("720")
+        self._min_height_input.setMaximumWidth(90)
+        csv_layout.addWidget(self._min_height_input)
         self._csv_label = QLabel("")
         csv_layout.addWidget(self._csv_label)
         csv_layout.addStretch()
         root.addLayout(csv_layout)
+
+        self._imported_files_group = QGroupBox("已导入文件")
+        imported_files_layout = QVBoxLayout(self._imported_files_group)
+        self._imported_files_list = QListWidget()
+        self._imported_files_list.setMaximumHeight(140)
+        imported_files_layout.addWidget(self._imported_files_list)
+        root.addWidget(self._imported_files_group)
 
         # ---- 视频信息区 ----
         info_group = QGroupBox("视频信息")
@@ -188,17 +246,19 @@ class MainWindow(QMainWindow):
         prog_layout.addWidget(self._status_label)
         root.addWidget(prog_group)
 
-        # ---- 日志区 ----
-        log_group = QGroupBox("日志")
-        log_group.setCheckable(False)
-        log_layout = QVBoxLayout(log_group)
+        # ---- 日志区（默认隐藏） ----
+        self._log_group = QGroupBox("日志")
+        self._log_group.setVisible(False)
+        log_layout = QVBoxLayout(self._log_group)
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setMaximumBlockCount(500)
+        self._log_view.setMaximumBlockCount(2000)
+        self._log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._log_view.setPlaceholderText("下载周期信息会显示在这里；错误日志可通过“显示错误”切换")
         self._log_view.setMinimumHeight(80)
         self._log_view.setPlaceholderText("下载日志将显示在此处...")
         log_layout.addWidget(self._log_view)
-        root.addWidget(log_group)
+        root.addWidget(self._log_group)
 
         # ---- 操作按钮 ----
         btn_layout = QHBoxLayout()
@@ -210,62 +270,108 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self._cancel_btn)
         self._open_dir_btn = QPushButton("打开目录")
         btn_layout.addWidget(self._open_dir_btn)
+        self._log_toggle_btn = QPushButton("日志")
+        self._log_toggle_btn.setCheckable(True)
+        btn_layout.addWidget(self._log_toggle_btn)
+        self._show_errors_btn = QPushButton("显示错误")
+        self._show_errors_btn.setCheckable(True)
+        self._show_errors_btn.toggled.connect(self._on_toggle_error_logs)
+        btn_layout.addWidget(self._show_errors_btn)
+        self._copy_log_btn = QPushButton("复制日志")
+        self._copy_log_btn.clicked.connect(self._on_copy_log)
+        btn_layout.addWidget(self._copy_log_btn)
         btn_layout.addStretch()
         root.addLayout(btn_layout)
 
     def _connect_signals(self) -> None:
         """连接控件信号到处理槽。"""
         self._fetch_btn.clicked.connect(self._on_fetch)
+        self._refresh_btn.clicked.connect(self._on_refresh)
         self._load_csv_btn.clicked.connect(self._on_load_csv)
         self._browse_btn.clicked.connect(self._on_browse)
         self._download_btn.clicked.connect(self._on_download)
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._open_dir_btn.clicked.connect(self._on_open_dir)
+        self._log_toggle_btn.toggled.connect(self._log_group.setVisible)
 
     # ------------------------------------------------------------------
     # 槽：加载 CSV
     # ------------------------------------------------------------------
 
     def _on_load_csv(self) -> None:
-        """加载 CSV 文件中的 video_id 列表。"""
-        filepath, _ = QFileDialog.getOpenFileName(
-            self, "选择 CSV 文件", "", "CSV 文件 (*.csv);;所有文件 (*)"
+        """加载一个或多个 CSV 文件，合并 video_id 列表。"""
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择导入文件（可多选）",
+            "",
+            "支持文件 (*.csv *.tsv *.txt);;所有文件 (*)",
         )
-        if not filepath:
+        if not filepaths:
             return
 
-        try:
-            ids = YoutubeDownloader.load_csv(Path(filepath))
-        except FileNotFoundError as exc:
-            QMessageBox.critical(self, "文件错误", str(exc))
-            return
-        except ValueError as exc:
-            QMessageBox.critical(self, "格式错误", str(exc))
-            return
+        import_column = self._csv_column_input.text().strip() or "video_id"
+        all_ids: list[str] = []
+        errors: list[str] = []
+        self._csv_queue = []
+        seen_names: set[str] = set()
 
-        if not ids:
+        for fp in filepaths:
+            path = Path(fp)
+            try:
+                rows = YoutubeDownloader.load_csv_rows(path, column=import_column)
+            except FileNotFoundError as exc:
+                errors.append(f"{path.name}: {exc}")
+                continue
+            except ValueError as exc:
+                errors.append(f"{path.name}: {exc}")
+                continue
+
+            if not rows:
+                continue
+
+            ids = [row["video_id"] for row in rows]
+            all_ids.extend(ids)
+            name = self._build_queue_name(path.stem, seen_names)
+            seen_names.add(name)
+            output_dir = self._resolve_import_output_dir(rows)
+            self._csv_queue.append((name, list(dict.fromkeys(ids)), output_dir))
+
+        if errors:
+            QMessageBox.critical(self, "文件错误", "\n".join(errors))
+
+        if not all_ids:
             QMessageBox.warning(self, "提示", "CSV 中未找到有效的 video_id")
             return
 
-        self._csv_ids = ids
-        self._csv_label.setText(f"已加载 {len(ids)} 个 Video ID")
-        self._log(f"加载 CSV: {len(ids)} 个 Video ID")
+        if not self._csv_queue:
+            QMessageBox.warning(self, "提示", "CSV 中未找到有效的 video_id")
+            return
 
-        # 后台线程分析共有格式（避免主线程网络请求卡 GUI）
-        self._id_input.setText(ids[0])
-        self._fetch_btn.setEnabled(False)
-        self._fetch_btn.setText("分析中...")
-        self._download_btn.setEnabled(False)
+        # 合并用于格式分析
+        self._csv_ids = list(dict.fromkeys(all_ids))
 
-        self._format_analyzer = FormatAnalyzer(
-            downloader=self._downloader,
-            video_ids=ids,
-            sample_size=5,
+        total = sum(len(ids) for _, ids, _ in self._csv_queue)
+        parts = " → ".join(f"{name}({len(ids)})" for name, ids, _ in self._csv_queue)
+        self._csv_label.setText(
+            f"队列 {len(self._csv_queue)} 组 / 共 {total} 个 Video ID（依据列: {import_column}）"
         )
-        self._format_analyzer.progress.connect(self._status_label.setText)
-        self._format_analyzer.finished.connect(self._on_formats_ready)
-        self._format_analyzer.error.connect(self._on_formats_error)
-        self._format_analyzer.start()
+        self._refresh_imported_files_list(self._csv_queue)
+        self._log(f"加载队列: {parts}")
+
+        self._id_input.setText(self._csv_ids[0])
+        self._fetch_btn.setEnabled(True)
+        self._fetch_btn.setText("获取信息")
+        self._download_btn.setEnabled(False)
+        self._status_label.setText("已加载队列，点击“获取信息”查看格式")
+
+    def _refresh_imported_files_list(self, queue: list[tuple[str, list[str], Path | None]]) -> None:
+        """刷新已导入文件列表，显示每个源文件名、视频数和目标目录。"""
+        self._imported_files_list.clear()
+        for name, ids, output_dir in queue:
+            target = str(output_dir) if output_dir else "默认目录"
+            self._imported_files_list.addItem(f"{name} — {len(ids)} 个视频 → {target}")
+        if not queue:
+            self._imported_files_list.addItem("暂无导入文件")
 
     def _on_formats_ready(self, first_info: dict, common_formats: list) -> None:
         """后台分析完成，填充格式列表。"""
@@ -302,6 +408,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 槽：获取视频信息
     # ------------------------------------------------------------------
+
+    def _on_refresh(self) -> None:
+        """刷新当前输入的视频信息。"""
+        if self._id_input.text().strip():
+            self._on_fetch()
+        else:
+            QMessageBox.information(self, "提示", "先输入 Video ID 再刷新")
 
     def _on_fetch(self) -> None:
         """获取按钮点击：获取视频信息并填充 UI。"""
@@ -345,7 +458,8 @@ class MainWindow(QMainWindow):
         """填充格式列表 QTreeWidget。"""
         self._format_tree.clear()
         try:
-            formats = self._downloader.list_formats(video_id=video_id, info=info)
+            min_height = self._parse_min_height(self._min_height_input.text())
+            formats = self._downloader.list_formats(video_id=video_id, info=info, min_height=max(720, min_height))
         except Exception:
             QMessageBox.warning(self, "错误", "获取格式列表失败")
             return
@@ -393,12 +507,14 @@ class MainWindow(QMainWindow):
 
         row = self._format_tree.indexOfTopLevelItem(selected[0])
         try:
-            formats = self._downloader.list_formats(info=self._info)
+            min_height = self._parse_min_height(self._min_height_input.text())
+            formats = self._downloader.list_formats(info=self._info, min_height=max(720, min_height))
             chosen = formats[row]
         except Exception as exc:
             QMessageBox.critical(self, "错误", f"获取格式信息失败: {exc}")
             return
 
+        min_height = self._parse_min_height(self._min_height_input.text())
         output_dir = Path(self._output_input.text())
         if not output_dir.exists():
             try:
@@ -407,19 +523,24 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "目录错误", f"无法创建输出目录: {exc}")
                 return
 
-        # 判断模式：CSV 批量 vs 单视频
-        if self._csv_ids:
-            self._start_batch_download(chosen["format_id"], output_dir)
+        # 判断模式：CSV 队列 vs 单视频
+        self._last_fmt_id = chosen["format_id"]
+        self._last_min_height = min_height
+        if self._csv_queue:
+            self._start_queue(chosen["format_id"], output_dir, min_height)
+        elif self._csv_ids:
+            self._start_batch_download(chosen["format_id"], output_dir, self._csv_ids, min_height)
         else:
-            self._start_single_download(chosen["format_id"], output_dir)
+            self._start_single_download(chosen["format_id"], output_dir, min_height)
 
-    def _start_single_download(self, format_id: str, output_dir: Path) -> None:
+    def _start_single_download(self, format_id: str, output_dir: Path, min_height: int) -> None:
         """启动单个视频下载。"""
         self._worker = DownloadWorker(
             downloader=self._downloader,
             video_id=self._video_id,
             format_id=format_id,
             output_dir=output_dir,
+            min_height=min_height,
         )
         self._worker.progress_changed.connect(self._on_progress)
         self._worker.status_changed.connect(self._on_status)
@@ -432,15 +553,35 @@ class MainWindow(QMainWindow):
         self._set_downloading_ui(True)
         self._worker.start()
 
-    def _start_batch_download(self, format_id: str, output_dir: Path) -> None:
-        """启动批量队列下载。"""
+    def _start_queue(self, format_id: str, base_dir: Path, min_height: int) -> None:
+        """启动队列下载：逐个 CSV 依次处理。"""
+        if not self._csv_queue:
+            return
+        name, ids, explicit_dir = self._csv_queue.pop(0)
+        output_dir = explicit_dir or self._build_queue_output_dir(base_dir, name)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._output_input.setText(str(output_dir))
+        self._log(f"队列开始: {name} ({len(ids)} 个)")
+        self._start_batch_download(format_id, output_dir, ids, min_height)
+
+    def _start_batch_download(
+        self,
+        format_id: str,
+        output_dir: Path,
+        video_ids: list[str],
+        min_height: int,
+    ) -> None:
+        """启动单组批量下载。"""
         self._batch_errors.clear()
         self._batch_done = 0
+        self._batch_total = len(video_ids)
+        self._batch_video_ids = list(video_ids)
         self._worker = BatchDownloadWorker(
             downloader=self._downloader,
-            video_ids=list(self._csv_ids),
+            video_ids=video_ids,
             format_id=format_id,
             output_dir=output_dir,
+            min_height=min_height,
         )
         w: BatchDownloadWorker = self._worker  # type narrowing
         w.all_progress_changed.connect(self._on_batch_progress)
@@ -457,10 +598,46 @@ class MainWindow(QMainWindow):
         self._batch_progress_bar.setVisible(True)
         self._batch_progress_bar.setValue(0)
         self._batch_progress_label.setVisible(True)
-        self._batch_progress_label.setText(f"0 / {len(self._csv_ids)}")
+        self._batch_progress_label.setText(f"0 / {self._batch_total}")
 
         self._set_downloading_ui(True)
         self._worker.start()
+
+    @staticmethod
+    def _parse_min_height(value: str) -> int:
+        """解析最小分辨率阈值，非法时回退到 720。"""
+        text = (value or "").strip().lower().replace("p", "")
+        try:
+            return max(0, int(text)) if text else 720
+        except ValueError:
+            return 720
+
+    @staticmethod
+    def _resolve_import_output_dir(rows: list[dict[str, str]]) -> Path | None:
+        """从导入记录里解析 output_dir，若存在则优先使用。"""
+        for row in rows:
+            candidate = row.get("output_dir") or row.get("output_folder") or row.get("folder")
+            if candidate:
+                return Path(candidate)
+        return None
+
+    @staticmethod
+    def _build_queue_name(stem: str, seen_names: set[str]) -> str:
+        """生成队列名称，避免重复且保持可读。"""
+        safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5._ -]+", "_", stem).strip(" .")
+        if not safe_name:
+            safe_name = "source"
+        candidate = safe_name
+        suffix = 2
+        while candidate in seen_names:
+            candidate = f"{safe_name}_{suffix}"
+            suffix += 1
+        return candidate
+
+    @staticmethod
+    def _build_queue_output_dir(base_dir: Path, queue_name: str) -> Path:
+        """根据源文件名构造输出目录。"""
+        return base_dir / queue_name
 
     def _on_cancel(self) -> None:
         """取消按钮：停止当前下载。"""
@@ -512,10 +689,12 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(100)
         self._progress_label.setText("100%")
         self._status_label.setText(f"下载完成 — {path}")
+        AppLogger.get_logger().info("下载完成: %s", path)
         QMessageBox.information(self, "下载完成", f"文件已保存至:\n{path}")
 
     def _on_error(self, msg: str) -> None:
         self._set_downloading_ui(False)
+        AppLogger.log_exception(Exception(msg), "下载失败")
         QMessageBox.critical(self, "下载失败", msg)
         self._status_label.setText("下载失败")
 
@@ -526,7 +705,7 @@ class MainWindow(QMainWindow):
     def _on_batch_progress(self, pct: int) -> None:
         self._batch_progress_bar.setValue(pct)
         self._batch_progress_label.setText(
-            f"总进度 {pct}% — {self._batch_done} / {len(self._csv_ids)}"
+            f"总进度 {pct}% — {self._batch_done} / {self._batch_total}"
         )
 
     def _on_batch_video_started(
@@ -546,15 +725,15 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._batch_done = index + 1
         self._batch_progress_label.setText(
-            f"总进度 — {self._batch_done} / {len(self._csv_ids)}"
+            f"总进度 — {self._batch_done} / {self._batch_total}"
         )
         tag = " [🍪]" if cookie_used else ""
-        self._log(f"[{index + 1}/{len(self._csv_ids)}] 完成{tag}: {path}")
+        self._log(f"[{index + 1}/{self._batch_total}] 完成{tag}: {path}")
 
     def _on_batch_video_error(
         self, index: int, msg: str, cookie_used: bool
     ) -> None:
-        vid = self._csv_ids[index]
+        vid = self._batch_video_ids[index] if index < len(self._batch_video_ids) else "?"
         # 覆盖同 index 的旧记录（Stage 1 → Stage 2 重试时只保留最终错误）
         self._batch_errors = [
             (i, v, m) for i, v, m in self._batch_errors if i != index
@@ -562,22 +741,29 @@ class MainWindow(QMainWindow):
         self._batch_errors.append((index, vid, msg))
         tag = " [🍪]" if cookie_used else ""
         self._batch_progress_label.setText(
-            f"总进度 — {self._batch_done + 1} / {len(self._csv_ids)}  ⚠{tag}"
+            f"总进度 — {self._batch_done + 1} / {self._batch_total}  ⚠{tag}"
         )
         self._status_label.setText(
-            f"[{index + 1}/{len(self._csv_ids)}] 失败: {vid}"
+            f"[{index + 1}/{self._batch_total}] 失败: {vid}"
         )
-        self._log(f"[{index + 1}/{len(self._csv_ids)}] 失败: {vid} — {msg[:120]}")
+        self._log(f"[{index + 1}/{self._batch_total}] 失败: {vid} — {msg[:120]}")
 
     def _on_batch_all_finished(
         self, success: int, fail: int, csv_path: str
     ) -> None:
-        self._set_downloading_ui(False)
         self._batch_progress_bar.setValue(100)
         self._batch_progress_label.setText(f"完成 — 成功 {success}，失败 {fail}")
         self._status_label.setText(f"批量下载完成：成功 {success}，失败 {fail}")
 
         total = success + fail
+        extra = []
+        if self._worker is not None:
+            skipped_path = getattr(self._worker, "_last_skipped_csv", "")
+            failed_path = getattr(self._worker, "_last_failed_csv", "")
+            if skipped_path:
+                extra.append(f"跳过列表 CSV:\n{skipped_path}")
+            if failed_path:
+                extra.append(f"失败重试 CSV:\n{failed_path}")
         msg = (
             f"批量下载完成\n\n"
             f"总数: {total}\n"
@@ -585,9 +771,20 @@ class MainWindow(QMainWindow):
             f"失败: {fail}\n\n"
             f"详细结果 CSV:\n{csv_path}"
         )
+        if extra:
+            msg = f"{msg}\n\n" + "\n\n".join(extra)
         QMessageBox.information(self, "批量下载完成", msg)
         self._log(f"批量完成: 成功 {success}, 失败 {fail}, CSV: {csv_path}")
+        AppLogger.get_logger().info("批量完成: 成功 %s, 失败 %s, CSV: %s", success, fail, csv_path)
         self._batch_errors.clear()
+
+        # 队列剩余 → 继续下一个
+        if self._csv_queue:
+            fmt_id = self._worker._format_id if self._worker else self._last_fmt_id  # noqa: SLF001
+            min_height = self._last_min_height
+            self._start_queue(fmt_id, self._output_dir, min_height)
+        else:
+            self._set_downloading_ui(False)
 
     # ------------------------------------------------------------------
     # 槽：打开目录

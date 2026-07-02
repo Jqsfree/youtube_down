@@ -22,6 +22,8 @@ from typing import Any, Callable
 
 import yt_dlp
 
+from logger_utils import AppLogger
+
 
 def _find_tool(name: str) -> str:
     """PyInstaller 打包后优先找内嵌的二进制，否则回退 PATH。"""
@@ -335,9 +337,17 @@ class YoutubeDownloader:
             "quiet": True,
             "no_warnings": True,
             "logger": _QuietLogger(),
-            # 网络韧性：瞬时故障自动重试
-            "extractor_retries": 3,
-            "retries": 3,
+            "extractor_retries": 5,
+            "retries": 5,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
+            "nocheckcertificate": False,
+            "socket_timeout": 20,
+            "source_address": "0.0.0.0",
+            "hls_prefer_native": True,
+            "http_chunk_size": 10485760,
+            "enable_file_urls": False,
         }
         if use_cookies and self._cookies_spec:
             # self._cookies_spec 格式: "chrome:Default" 或 "chrome"
@@ -376,7 +386,10 @@ class YoutubeDownloader:
             return info
 
     def list_formats(
-        self, video_id: str = "", info: dict[str, Any] | None = None
+        self,
+        video_id: str = "",
+        info: dict[str, Any] | None = None,
+        min_height: int | None = None,
     ) -> list[dict[str, Any]]:
         """获取所有可用格式（过滤后）。
 
@@ -395,6 +408,12 @@ class YoutubeDownloader:
 
         raw_formats: list[dict[str, Any]] = info.get("formats", [])
 
+        def _height(resolution: str) -> int:
+            try:
+                return int(resolution.split("x")[-1].replace("p", ""))
+            except (ValueError, IndexError):
+                return 0
+
         results: list[dict[str, Any]] = []
         for fmt in raw_formats:
             if fmt.get("ext") not in ("mp4", "m4a"):
@@ -404,6 +423,10 @@ class YoutubeDownloader:
                 resolution = "Audio"
             elif not resolution:
                 continue
+
+            if min_height is not None and resolution != "Audio":
+                if _height(resolution) < min_height:
+                    continue
 
             results.append({
                 "format_id": fmt.get("format_id", ""),
@@ -444,6 +467,7 @@ class YoutubeDownloader:
         """
         self._cancelled = False
         output_dir.mkdir(parents=True, exist_ok=True)
+        self.cleanup_partial_files(output_dir)
 
         output_template = str(output_dir / "%(title)s.%(ext)s")
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -462,15 +486,26 @@ class YoutubeDownloader:
             outtmpl=output_template,
             progress_hooks=[_progress_hook],
             merge_output_format="mp4",
-            # 速度优化
-            concurrent_fragment_downloads=8,  # DASH 片段并行下载
-            buffersize=2 * 1024 * 1024,       # 2MB 缓冲区
-            file_access_retries=3,            # 文件写入重试
-            fragment_retries=3,               # 片段下载重试
+            concurrent_fragment_downloads=8,
+            buffersize=4 * 1024 * 1024,
+            file_access_retries=5,
+            fragment_retries=5,
+            keep_fragments=False,
+            prefer_ffmpeg=True,
+            postprocessors=[
+                {
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": "mp4",
+                }
+            ],
         )
 
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception as exc:
+                AppLogger.log_exception(exc, f"下载失败: {video_id}")
+                raise
             if info is None:
                 raise yt_dlp.utils.DownloadError("下载失败：无法获取视频信息")
             filename: str = ydl.prepare_filename(info)
@@ -507,6 +542,19 @@ class YoutubeDownloader:
                 )
 
             return path
+
+    @staticmethod
+    def cleanup_partial_files(output_dir: Path) -> None:
+        """清理下载中残留的分片/临时文件，避免占满磁盘。"""
+        if not output_dir.exists():
+            return
+        fragment_pattern = re.compile(r".*\.f\d+\..+")
+        for path in output_dir.iterdir():
+            if not path.is_file():
+                continue
+            name = path.name.lower()
+            if name.endswith(".part") or fragment_pattern.match(name):
+                path.unlink(missing_ok=True)
 
     def cancel(self) -> None:
         """取消当前下载。"""
@@ -551,40 +599,147 @@ class YoutubeDownloader:
 
     @staticmethod
     def load_csv(filepath: Path, column: str = "video_id") -> list[str]:
-        """从 CSV 读取 video ID 列表（UTF-8/BOM，自动去重跳过空行）。"""
+        """从 CSV/TSV/TXT 读取 video ID 列表（自动去重、支持 URL 提取）。"""
+        rows = YoutubeDownloader.load_csv_rows(filepath, column=column)
+        return [row["video_id"] for row in rows]
+
+    @staticmethod
+    def load_csv_rows(filepath: Path, column: str = "video_id") -> list[dict[str, str]]:
+        """从 CSV/TSV/TXT 读取带原始字段的记录，保留 output_dir 等信息。"""
         if not filepath.exists():
             raise FileNotFoundError(f"文件不存在: {filepath}")
+
+        ext = filepath.suffix.lower()
+        delimiter: str | None = None
+        if ext == ".tsv":
+            delimiter = "\t"
+        elif ext == ".txt":
+            delimiter = None
+        else:
+            delimiter = ","
 
         last_err: Exception | None = None
         for encoding in ("utf-8-sig", "utf-8", "utf-16", "gbk", "latin-1"):
             try:
-                with open(filepath, "r", encoding=encoding) as f:
-                    reader = csv.DictReader(f)
-                    fieldnames = reader.fieldnames or []
-                    if column not in fieldnames:
+                with open(filepath, "r", encoding=encoding, newline="") as f:
+                    sample = f.read(4096)
+                    f.seek(0)
+                    if delimiter is None:
+                        try:
+                            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                            delimiter = dialect.delimiter
+                        except csv.Error:
+                            delimiter = ","
+
+                    reader = csv.DictReader(f, delimiter=delimiter)
+                    fieldnames = [name.strip() if name else "" for name in (reader.fieldnames or [])]
+                    if not fieldnames:
+                        raise ValueError("文件中没有可解析的表头")
+
+                    target_column = YoutubeDownloader._resolve_column(fieldnames, column)
+                    if target_column is None:
                         raise ValueError(
-                            f"CSV 中没有 '{column}' 列，可用列: {fieldnames}"
+                            f"文件中没有 '{column}' 列，可用列: {fieldnames}"
                         )
-                    ids: list[str] = []
+
+                    rows: list[dict[str, str]] = []
                     seen: set[str] = set()
                     for row in reader:
-                        vid = row[column].strip()
-                        if vid and vid not in seen:
-                            seen.add(vid)
-                            ids.append(vid)
-                    return ids
+                        raw_value = row.get(target_column, "") or ""
+                        vid = YoutubeDownloader._normalize_video_id(raw_value)
+                        if not vid or vid in seen:
+                            continue
+                        seen.add(vid)
+                        record = {key: (value or "") for key, value in row.items() if value is not None}
+                        record["video_id"] = vid
+                        for key in ("output_dir", "output_folder", "folder"):
+                            if key in record and record[key]:
+                                break
+                        else:
+                            for key in ("output_dir", "output_folder", "folder"):
+                                if key in row and (row.get(key) or ""):
+                                    record[key] = row.get(key, "") or ""
+                                    break
+                        rows.append(record)
+                    return rows
             except (UnicodeDecodeError, UnicodeError) as exc:
                 last_err = exc
                 continue
-            # 列名不匹配等非编码错误直接抛出，不重试其他编码
             except ValueError:
                 raise
 
-        raise ValueError(f"无法识别 CSV 文件编码: {filepath}") from last_err
+        raise ValueError(f"无法识别文件编码或格式: {filepath}") from last_err
+
+    @staticmethod
+    def _resolve_column(fieldnames: list[str], preferred: str) -> str | None:
+        """在表头中匹配用户指定字段，支持大小写和空格差异。"""
+        normalized = {name.strip().lower().replace(" ", "_").replace("-", "_"): name for name in fieldnames}
+        if preferred:
+            key = preferred.strip().lower().replace(" ", "_").replace("-", "_")
+            if key in normalized:
+                return normalized[key]
+
+        for key in ("video_id", "videoid", "id", "youtube_id", "youtubeid", "url", "video_url"):
+            if key in normalized:
+                return normalized[key]
+        return None
+
+    @staticmethod
+    def _normalize_video_id(value: str) -> str:
+        """从原始单元格内容中提取 11 位 YouTube video ID。"""
+        text = (value or "").strip()
+        if not text:
+            return ""
+        text = text.replace("\\", "/")
+        patterns = [
+            r"(?:v=|vi=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})",
+            r"^([A-Za-z0-9_-]{11})$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+        return text
 
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def resolve_format_id(formats: list[dict[str, Any]], min_height: int = 720) -> str | None:
+        """按目标清晰度选择格式：低于 720p 直接排除；低于 1080p 可回退到 720p；1080p 及以上优先选更高。"""
+        def _height(resolution: str) -> int:
+            try:
+                return int(resolution.split("x")[-1].replace("p", ""))
+            except (ValueError, IndexError):
+                return 0
+
+        video_formats = [
+            fmt for fmt in formats
+            if fmt.get("container") == "mp4"
+            and fmt.get("type") in {"Video+Audio", "Video Only"}
+        ]
+        if not video_formats:
+            return None
+
+        if min_height <= 720:
+            candidates = [fmt for fmt in video_formats if _height(fmt.get("resolution", "")) >= 720]
+            if candidates:
+                candidates.sort(key=lambda fmt: _height(fmt.get("resolution", "")), reverse=True)
+                return candidates[0].get("format_id", None)
+            return None
+
+        candidates = [fmt for fmt in video_formats if _height(fmt.get("resolution", "")) >= min_height]
+        if candidates:
+            candidates.sort(key=lambda fmt: _height(fmt.get("resolution", "")), reverse=True)
+            return candidates[0].get("format_id", None)
+
+        fallback = [fmt for fmt in video_formats if _height(fmt.get("resolution", "")) >= 720]
+        if fallback:
+            fallback.sort(key=lambda fmt: _height(fmt.get("resolution", "")), reverse=True)
+            return fallback[0].get("format_id", None)
+
+        return None
 
     @staticmethod
     def _format_note(fmt: dict[str, Any]) -> str:

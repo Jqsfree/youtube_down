@@ -15,3 +15,5 @@ build/
 batch_results_*.csv
 test_*.csv
 .DS_Store
+.serena/
+.vscode/

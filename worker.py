@@ -17,6 +17,7 @@ import yt_dlp
 from PySide6.QtCore import QThread, Signal
 
 from downloader import ErrorCategory, YoutubeDownloader, classify_error, clean_error
+from logger_utils import AppLogger
 
 
 class DownloadWorker(QThread):
@@ -46,6 +47,7 @@ class DownloadWorker(QThread):
         video_id: str,
         format_id: str,
         output_dir: Path,
+        min_height: int = 720,
         parent: QThread | None = None,
     ) -> None:
         super().__init__(parent)
@@ -53,6 +55,7 @@ class DownloadWorker(QThread):
         self._video_id = video_id
         self._format_id = format_id
         self._output_dir = output_dir
+        self._min_height = min_height
 
     def run(self) -> None:
         """在后台线程中执行下载。"""
@@ -95,6 +98,7 @@ class DownloadWorker(QThread):
             self.finished.emit(str(result_path))
 
         except Exception as exc:
+            AppLogger.log_exception(exc, f"单视频下载失败: {self._video_id}")
             self.error.emit(str(exc))
 
     @staticmethod
@@ -174,7 +178,7 @@ class FormatAnalyzer(QThread):
                     first_info = info  # 只在第一个成功时赋值
                 fmt_set = {
                     f["format_id"]
-                    for f in self._downloader.list_formats(info=info)
+                    for f in self._downloader.list_formats(info=info, min_height=720)
                 }
                 all_format_ids.append(fmt_set)
             except Exception:
@@ -192,7 +196,7 @@ class FormatAnalyzer(QThread):
         if not common_ids:
             common_ids = set().union(*all_format_ids)
 
-        all_formats = self._downloader.list_formats(info=first_info)
+        all_formats = self._downloader.list_formats(info=first_info, min_height=720)
         common_formats = [
             f for f in all_formats if f["format_id"] in common_ids
         ]
@@ -236,6 +240,7 @@ class BatchDownloadWorker(QThread):
         video_ids: list[str],
         format_id: str,
         output_dir: Path,
+        min_height: int = 720,
         parent: QThread | None = None,
     ) -> None:
         super().__init__(parent)
@@ -243,6 +248,11 @@ class BatchDownloadWorker(QThread):
         self._video_ids = video_ids
         self._format_id = format_id
         self._output_dir = output_dir
+        self._retry_output_dir = output_dir
+        self._min_height = min_height
+        self._last_results_csv = ""
+        self._last_skipped_csv = ""
+        self._last_failed_csv = ""
 
     def run(self) -> None:
         """按顺序下载所有 video_id，两阶段策略。"""
@@ -268,6 +278,18 @@ class BatchDownloadWorker(QThread):
                     "error_category": "SUCCESS",
                     "error_message": "",
                     "cookie_used": str(cookie_used).lower(),
+                    "output_dir": str(self._output_dir),
+                })
+                continue
+
+            if status == "skipped":
+                results.append({
+                    "video_id": vid,
+                    "status": "skipped",
+                    "error_category": "SKIPPED",
+                    "error_message": clean_error(Exception(error_msg)),
+                    "cookie_used": str(cookie_used).lower(),
+                    "output_dir": str(self._output_dir),
                 })
                 continue
 
@@ -289,7 +311,7 @@ class BatchDownloadWorker(QThread):
 
             if status == "success":
                 success_count += 1
-            else:
+            elif status != "skipped":
                 fail_count += 1
 
             results.append({
@@ -298,61 +320,39 @@ class BatchDownloadWorker(QThread):
                 "error_category": category.code,
                 "error_message": clean_error(Exception(error_msg)),
                 "cookie_used": str(cookie_used).lower(),
+                "output_dir": str(self._output_dir),
             })
 
         # 写出结果 CSV
         csv_path = self._write_results(results)
+        skipped_path = self._write_skipped_csv(results)
+        failed_path = self._write_failed_csv(results)
+        self._last_results_csv = csv_path
+        self._last_skipped_csv = skipped_path
+        self._last_failed_csv = failed_path
 
         self.all_progress_changed.emit(100)
         self.all_finished.emit(success_count, fail_count, csv_path)
+        self._log_summary(csv_path, skipped_path, failed_path)
 
-    def _resolve_format(self, info: dict[str, Any]) -> str:
-        """为当前视频匹配最佳 format_id。
-
-        优先使用用户选择的格式；如果不可用，找同容器、同类型、
-        最接近的较低分辨率；都没有则 fallback 到 "best"。
-        """
+    def _resolve_format(self, info: dict[str, Any]) -> str | None:
+        """为当前视频匹配一个满足最低分辨率阈值的最佳 format_id；低于阈值时返回 None。"""
         preferred = self._format_id
-        formats = self._downloader.list_formats(info=info)
+        formats = self._downloader.list_formats(
+            info=info,
+            min_height=max(720, self._min_height),
+        )
         available_ids = {f["format_id"] for f in formats}
 
         if preferred in available_ids:
-            return preferred  # 精确命中
-
-        # 查找首选格式的属性
-        preferred_attrs = next(
-            (f for f in formats if f["format_id"] == preferred), None
-        )
-        if preferred_attrs is None:
-            # 连属性都找不到（cookie 模式等）→ best
-            return "best"
-
-        target_type = preferred_attrs["type"]
-        target_container = preferred_attrs["container"]
-
-        # 解析首选格式的分辨率高度（如 "1280x720" → 720）
-        def _res_h(res: str) -> int:
             try:
-                return int(res.split("x")[-1])
-            except (ValueError, IndexError):
-                return 0
+                preferred_fmt = next(f for f in formats if f["format_id"] == preferred)
+                if preferred_fmt.get("container") == "mp4" and preferred_fmt.get("type") in {"Video+Audio", "Video Only"}:
+                    return preferred
+            except StopIteration:
+                pass
 
-        target_height = _res_h(preferred_attrs["resolution"])
-
-        # 候选：同类型、同容器、分辨率 ≤ 首选
-        candidates = [
-            f for f in formats
-            if f["type"] == target_type
-            and f["container"] == target_container
-            and _res_h(f["resolution"]) <= target_height
-        ]
-        # 按分辨率降序 → 最接近首选的在前面
-        candidates.sort(key=lambda f: _res_h(f["resolution"]), reverse=True)
-
-        if candidates:
-            return candidates[0]["format_id"]
-
-        return "best"
+        return self._downloader.resolve_format_id(formats, min_height=max(720, self._min_height))
 
     def _try_download(
         self, video_id: str, index: int, total: int, use_cookies: bool
@@ -373,6 +373,11 @@ class BatchDownloadWorker(QThread):
                 fmt = "best"
             else:
                 fmt = self._resolve_format(info)
+
+            if fmt is None:
+                msg = f"低于 {self._min_height}p，跳过下载: {video_id}"
+                self.video_error.emit(index, msg, use_cookies)
+                return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, msg), msg)
 
             # 下载
             def on_progress(d: dict[str, Any]) -> None:
@@ -407,7 +412,7 @@ class BatchDownloadWorker(QThread):
             path = self._downloader.download(
                 video_id=video_id,
                 format_id=fmt,
-                output_dir=self._output_dir,
+                output_dir=self._retry_output_dir,
                 progress_callback=on_progress,
                 use_cookies=use_cookies,
             )
@@ -415,6 +420,7 @@ class BatchDownloadWorker(QThread):
             return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path))
 
         except Exception as exc:
+            AppLogger.log_exception(exc, f"批量下载失败: {video_id}")
             self.video_error.emit(index, clean_error(exc), use_cookies)
             cat = classify_error(exc)
             return ("failed", use_cookies, cat, str(exc))
@@ -432,7 +438,7 @@ class BatchDownloadWorker(QThread):
                 writer = csv_module.DictWriter(
                     f, fieldnames=[
                         "video_id", "status", "error_category",
-                        "error_message", "cookie_used",
+                        "error_message", "cookie_used", "output_dir",
                     ]
                 )
                 writer.writeheader()
@@ -444,7 +450,7 @@ class BatchDownloadWorker(QThread):
                     writer = csv_module.DictWriter(
                         f, fieldnames=[
                             "video_id", "status", "error_category",
-                            "error_message", "cookie_used",
+                            "error_message", "cookie_used", "output_dir",
                         ]
                     )
                     writer.writeheader()
@@ -454,3 +460,57 @@ class BatchDownloadWorker(QThread):
                 csv_path = "（写入失败）"
 
         return csv_path
+
+    def _write_skipped_csv(self, results: list[dict[str, str]]) -> str:
+        """导出低于阈值被跳过的视频 ID。"""
+        skipped = [
+            {"video_id": item["video_id"], "reason": item["error_message"]}
+            for item in results if item.get("status") == "skipped"
+        ]
+        if not skipped:
+            return ""
+
+        import csv as csv_module
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = str(self._output_dir / f"skipped_videos_{timestamp}.csv")
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv_module.DictWriter(f, fieldnames=["video_id", "reason"])
+                writer.writeheader()
+                writer.writerows(skipped)
+        except OSError:
+            return ""
+        return path
+
+    def _write_failed_csv(self, results: list[dict[str, str]]) -> str:
+        """导出下载失败的视频 ID，便于重新下载。"""
+        failed = [
+            {"video_id": item["video_id"], "reason": item["error_message"]}
+            for item in results if item.get("status") == "failed"
+        ]
+        if not failed:
+            return ""
+
+        import csv as csv_module
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = str(self._output_dir / f"failed_videos_{timestamp}.csv")
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv_module.DictWriter(f, fieldnames=["video_id", "reason"])
+                writer.writeheader()
+                writer.writerows(failed)
+        except OSError:
+            return ""
+        return path
+
+    def _log_summary(self, results_path: str, skipped_path: str, failed_path: str) -> None:
+        """记录结果文件路径。"""
+        self.status_changed.emit("批量下载完成")
+        if skipped_path:
+            self.status_changed.emit(f"跳过列表: {skipped_path}")
+        if failed_path:
+            self.status_changed.emit(f"失败重试列表: {failed_path}")
