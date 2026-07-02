@@ -255,85 +255,134 @@ class BatchDownloadWorker(QThread):
         self._last_failed_csv = ""
 
     def run(self) -> None:
-        """按顺序下载所有 video_id，两阶段策略。"""
+        """按顺序下载所有 video_id，两阶段策略。增量写入 + 续传。"""
         total = len(self._video_ids)
         results: list[dict[str, str]] = []
         success_count = 0
         fail_count = 0
 
-        for i, vid in enumerate(self._video_ids):
-            if self._downloader._cancelled:  # noqa: SLF001
-                break
+        # ── 续传：读取上次结果中已完成的 ID ──
+        completed_ids = self._load_completed_ids()
 
-            # ── Stage 1: 无 Cookie ──────────────────────────
-            status, cookie_used, category, error_msg = self._try_download(
-                vid, i, total, use_cookies=False
-            )
+        # ── 打开增量写入的 CSV ──
+        import csv as _csv
+        from datetime import datetime as _dt
+        timestamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = str(self._output_dir / f"batch_results_{timestamp}.csv")
+        self._last_results_csv = csv_path
+        _csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+        _csv_writer = _csv.DictWriter(_csv_file, fieldnames=[
+            "video_id", "status", "error_category",
+            "error_message", "cookie_used", "output_dir",
+        ])
+        _csv_writer.writeheader()
 
-            if status == "success":
-                success_count += 1
-                results.append({
-                    "video_id": vid,
-                    "status": "success",
-                    "error_category": "SUCCESS",
-                    "error_message": "",
-                    "cookie_used": str(cookie_used).lower(),
-                    "output_dir": str(self._output_dir),
-                })
-                continue
+        try:
+            for i, vid in enumerate(self._video_ids):
+                if self._downloader._cancelled:  # noqa: SLF001
+                    break
 
-            if status == "skipped":
-                results.append({
-                    "video_id": vid,
-                    "status": "skipped",
-                    "error_category": "SKIPPED",
-                    "error_message": clean_error(Exception(error_msg)),
-                    "cookie_used": str(cookie_used).lower(),
-                    "output_dir": str(self._output_dir),
-                })
-                continue
+                # 续传：跳过已完成的视频
+                if vid in completed_ids:
+                    self._log_resume_skip(i, total, vid)
+                    success_count += 1
+                    continue
 
-            # ── Stage 2: Cookie 重试 ──────────────────────
-            if category.retry_cookie:
+                # ── Stage 1: 无 Cookie ──────────────────────────
                 status, cookie_used, category, error_msg = self._try_download(
-                    vid, i, total, use_cookies=True
+                    vid, i, total, use_cookies=False
                 )
 
-                # 仅 auth 相关失败才重检浏览器再试（Profile 可能变了）
-                if (
-                    status == "failed"
-                    and category.code in ("BOT_VERIFICATION", "AUTH_REQUIRED", "PRIVATE_VIDEO")
-                    and self._downloader.redetect_browser()
-                ):
+                if status == "success":
+                    success_count += 1
+                    self._append_csv(_csv_writer, _csv_file, vid, "success", "SUCCESS", "", cookie_used)
+                    continue
+
+                if status == "skipped":
+                    self._append_csv(_csv_writer, _csv_file, vid, "skipped", "SKIPPED",
+                                     clean_error(Exception(error_msg)), cookie_used)
+                    continue
+
+                # ── Stage 2: Cookie 重试 ──────────────────────
+                if category.retry_cookie:
                     status, cookie_used, category, error_msg = self._try_download(
                         vid, i, total, use_cookies=True
                     )
 
-            if status == "success":
-                success_count += 1
-            elif status != "skipped":
-                fail_count += 1
+                    if (
+                        status == "failed"
+                        and category.code in ("BOT_VERIFICATION", "AUTH_REQUIRED", "PRIVATE_VIDEO")
+                        and self._downloader.redetect_browser()
+                    ):
+                        status, cookie_used, category, error_msg = self._try_download(
+                            vid, i, total, use_cookies=True
+                        )
 
-            results.append({
-                "video_id": vid,
-                "status": status,
-                "error_category": category.code,
-                "error_message": clean_error(Exception(error_msg)),
-                "cookie_used": str(cookie_used).lower(),
-                "output_dir": str(self._output_dir),
-            })
+                if status == "success":
+                    success_count += 1
+                elif status != "skipped":
+                    fail_count += 1
 
-        # 写出结果 CSV
-        csv_path = self._write_results(results)
+                self._append_csv(_csv_writer, _csv_file, vid, status,
+                                 category.code, clean_error(Exception(error_msg)), cookie_used)
+
+                results.append({
+                    "video_id": vid, "status": status,
+                    "error_category": category.code,
+                    "error_message": clean_error(Exception(error_msg)),
+                    "cookie_used": str(cookie_used).lower(),
+                    "output_dir": str(self._output_dir),
+                })
+        finally:
+            _csv_file.close()
+
         skipped_path = self._write_skipped_csv(results)
         failed_path = self._write_failed_csv(results)
-        self._last_results_csv = csv_path
         self._last_skipped_csv = skipped_path
         self._last_failed_csv = failed_path
 
         self.all_progress_changed.emit(100)
         self.all_finished.emit(success_count, fail_count, csv_path)
         self._log_summary(csv_path, skipped_path, failed_path)
+
+    def _load_completed_ids(self) -> set[str]:
+        """从已有结果 CSV 中读取已完成的 video_id（支持续传）。"""
+        import csv as _csv
+        completed: set[str] = set()
+        # 找最新的结果 CSV
+        existing = sorted(
+            self._output_dir.glob("batch_results_*.csv"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if not existing:
+            return completed
+        try:
+            with open(existing[0], "r", encoding="utf-8") as f:
+                for row in _csv.DictReader(f):
+                    if row.get("status") == "success":
+                        completed.add(row["video_id"])
+        except Exception:
+            pass
+        return completed
+
+    def _append_csv(
+        self, writer: Any, f: Any, vid: str, status: str,
+        category: str, error_msg: str, cookie_used: bool,
+    ) -> None:
+        """增量写入一行结果到 CSV。"""
+        writer.writerow({
+            "video_id": vid, "status": status,
+            "error_category": category, "error_message": error_msg,
+            "cookie_used": str(cookie_used).lower(),
+            "output_dir": str(self._output_dir),
+        })
+        f.flush()
+
+    def _log_resume_skip(self, index: int, total: int, video_id: str) -> None:
+        """续传跳过日志。"""
+        self.video_started.emit(index, total, video_id, False)
+        self.video_finished.emit(index, "续传跳过（已完成）", False)
+        self.status_changed.emit(f"[{index + 1}/{total}] 续传跳过: {video_id}")
 
     @staticmethod
     def _check_existing(video_id: str, output_dir: Path) -> Path | None:

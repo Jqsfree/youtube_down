@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -236,6 +237,7 @@ class YoutubeDownloader:
                 None 时自动检测，'' 时不使用 cookie。
         """
         self._cancelled: bool = False
+        self._cancel_lock = threading.Lock()
         self._cookies_spec: str | None = cookies_from_browser
         if self._cookies_spec is None:
             info = self.detect_browser()
@@ -465,7 +467,8 @@ class YoutubeDownloader:
         Raises:
             yt_dlp.utils.DownloadError: 下载失败（由调用方分类处理）。
         """
-        self._cancelled = False
+        with self._cancel_lock:
+            self._cancelled = False
         output_dir.mkdir(parents=True, exist_ok=True)
         self.cleanup_partial_files(output_dir)
 
@@ -557,8 +560,9 @@ class YoutubeDownloader:
                 path.unlink(missing_ok=True)
 
     def cancel(self) -> None:
-        """取消当前下载。"""
-        self._cancelled = True
+        """取消当前下载（线程安全）。"""
+        with self._cancel_lock:
+            self._cancelled = True
 
     # ------------------------------------------------------------------
     # Cookie 管理
