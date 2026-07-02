@@ -15,6 +15,8 @@ from typing import Any
 from datetime import datetime
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QShortcut
+
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -387,6 +389,12 @@ class MainWindow(QMainWindow):
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._open_dir_btn.clicked.connect(self._on_open_dir)
         self._log_toggle_btn.toggled.connect(self._log_group.setVisible)
+        # 键盘快捷键
+        self._id_input.returnPressed.connect(self._on_fetch)
+        self._shortcut_download = QShortcut("Ctrl+D", self)
+        self._shortcut_download.activated.connect(self._on_download)
+        self._shortcut_cancel = QShortcut("Escape", self)
+        self._shortcut_cancel.activated.connect(self._on_cancel)
 
     # ------------------------------------------------------------------
     # 槽：加载 CSV
@@ -405,6 +413,15 @@ class MainWindow(QMainWindow):
 
     def _process_imported_files(self, filepaths: list[str]) -> None:
         """处理导入文件列表（文件对话框或拖拽共用）。"""
+        if self._csv_queue:
+            reply = QMessageBox.question(
+                self, "替换队列？",
+                f"当前有 {len(self._csv_queue)} 组任务，导入新文件将清空。继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         import_column = self._csv_column_input.text().strip() or "video_id"
         all_ids: list[str] = []
         errors: list[str] = []
@@ -488,10 +505,18 @@ class MainWindow(QMainWindow):
         self._fetch_btn.setText("获取信息")
         self._status_label.setText("获取失败")
 
+    def _sort_key(self, fmt: dict[str, Any]) -> int:
+        """按分辨率高度降序排列。"""
+        res = fmt.get("resolution", "")
+        try:
+            return int(res.split("x")[-1])
+        except (ValueError, IndexError):
+            return 0
+
     def _show_common_formats(self, formats: list[dict[str, Any]]) -> None:
-        """填充格式列表（仅共有格式）。"""
+        """填充格式列表（仅共有格式，按分辨率降序）。"""
         self._format_tree.clear()
-        for fmt in formats:
+        for fmt in sorted(formats, key=self._sort_key, reverse=True):
             item = QTreeWidgetItem([
                 fmt["resolution"],
                 fmt["codec"],
@@ -570,7 +595,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "错误", "获取格式列表失败")
             return
 
-        for fmt in formats:
+        for fmt in sorted(formats, key=self._sort_key, reverse=True):
             item = QTreeWidgetItem([
                 fmt["resolution"],
                 fmt["codec"],
@@ -581,8 +606,6 @@ class MainWindow(QMainWindow):
                 fmt.get("note", ""),
             ])
             self._format_tree.addTopLevelItem(item)
-
-        # 自动调整列宽
         for col in range(self._format_tree.columnCount()):
             self._format_tree.resizeColumnToContents(col)
 
