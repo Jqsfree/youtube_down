@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 
 from downloader import YoutubeDownloader, check_environment
 from logger_utils import AppLogger
-from worker import BatchDownloadWorker, DownloadWorker, FormatAnalyzer
+from worker import BatchDownloadWorker, DownloadWorker, FetchInfoWorker, FormatAnalyzer
 
 
 class MainWindow(QMainWindow):
@@ -442,7 +442,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "先输入 Video ID 再刷新")
 
     def _on_fetch(self) -> None:
-        """获取按钮点击：获取视频信息并填充 UI。"""
+        """后台获取视频信息（不卡 GUI）。"""
         video_id = self._id_input.text().strip()
         if not video_id:
             QMessageBox.warning(self, "提示", "请输入 Video ID")
@@ -454,19 +454,25 @@ class MainWindow(QMainWindow):
         self._fetch_btn.setText("获取中...")
         self._status_label.setText("正在获取视频信息...")
 
-        try:
-            info = self._downloader.get_info(video_id)
-            self._info = info
-            self._show_info(info)
-            self._show_formats(video_id, info)
-            self._download_btn.setEnabled(True)
-            self._status_label.setText("就绪 — 请选择格式后下载")
-        except Exception as exc:
-            QMessageBox.critical(self, "获取失败", str(exc))
-            self._status_label.setText("获取失败")
-        finally:
-            self._fetch_btn.setEnabled(True)
-            self._fetch_btn.setText("获取信息")
+        self._fetch_worker = FetchInfoWorker(self._downloader, video_id)
+        self._fetch_worker.finished.connect(self._on_fetch_ready)
+        self._fetch_worker.error.connect(self._on_fetch_error)
+        self._fetch_worker.start()
+
+    def _on_fetch_ready(self, info: dict) -> None:
+        self._info = info
+        self._show_info(info)
+        self._show_formats(self._video_id, info)
+        self._download_btn.setEnabled(True)
+        self._fetch_btn.setEnabled(True)
+        self._fetch_btn.setText("获取信息")
+        self._status_label.setText("就绪 — 请选择格式后下载")
+
+    def _on_fetch_error(self, msg: str) -> None:
+        QMessageBox.critical(self, "获取失败", msg)
+        self._fetch_btn.setEnabled(True)
+        self._fetch_btn.setText("获取信息")
+        self._status_label.setText("获取失败")
 
     def _show_info(self, info: dict[str, Any]) -> None:
         """从 info dict 更新视频信息显示。"""

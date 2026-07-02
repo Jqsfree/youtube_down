@@ -135,6 +135,30 @@ class DownloadWorker(QThread):
         return f"{size_bytes / (1024 * 1024 * 1024):.2f}GB"
 
 
+class FetchInfoWorker(QThread):
+    """后台获取视频信息（单视频），避免主线程阻塞 GUI。"""
+
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        downloader: YoutubeDownloader,
+        video_id: str,
+        parent: QThread | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._downloader = downloader
+        self._video_id = video_id
+
+    def run(self) -> None:
+        try:
+            info = self._downloader.get_info(self._video_id)
+            self.finished.emit(info)
+        except Exception as exc:
+            self.error.emit(clean_error(exc))
+
+
 class FormatAnalyzer(QThread):
     """后台分析线程 —— 取 N 个视频的共有格式交集。
 
