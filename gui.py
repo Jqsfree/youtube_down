@@ -82,7 +82,9 @@ class MainWindow(QMainWindow):
         self._queue_results: list[tuple[int, int, str]] = []  # 队列累计结果  # 当前批次视频总数，避免用 _csv_ids 长度
 
         spec = self._downloader._cookies_spec  # noqa: SLF001
-        title = "YouTube Downloader"
+        ver = Path(__file__).parent / "VERSION"
+        ver_str = ver.read_text().strip() if ver.exists() else "dev"
+        title = f"YouTube Downloader v{ver_str}"
         if spec:
             title += f"  |  🍪 {spec}（已检测到）"
         self.setWindowTitle(title)
@@ -593,7 +595,7 @@ class MainWindow(QMainWindow):
         output_dir.mkdir(parents=True, exist_ok=True)
         self._output_input.setText(str(output_dir))
         self._log(f"队列开始: {name} ({len(ids)} 个)")
-        self._start_batch_download(format_id, output_dir, ids, min_height)
+        self._start_batch_download(format_id, output_dir, ids, min_height, results_dir=base_dir)
 
     def _start_batch_download(
         self,
@@ -601,6 +603,7 @@ class MainWindow(QMainWindow):
         output_dir: Path,
         video_ids: list[str],
         min_height: int,
+        results_dir: Path | None = None,
     ) -> None:
         """启动单组批量下载。"""
         self._batch_errors.clear()
@@ -613,6 +616,7 @@ class MainWindow(QMainWindow):
             format_id=format_id,
             output_dir=output_dir,
             min_height=min_height,
+            results_dir=results_dir,
         )
         w: BatchDownloadWorker = self._worker  # type narrowing
         w.all_progress_changed.connect(self._on_batch_progress)

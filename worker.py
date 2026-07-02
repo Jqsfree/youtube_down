@@ -265,6 +265,7 @@ class BatchDownloadWorker(QThread):
         format_id: str,
         output_dir: Path,
         min_height: int = 720,
+        results_dir: Path | None = None,
         parent: QThread | None = None,
     ) -> None:
         super().__init__(parent)
@@ -273,6 +274,7 @@ class BatchDownloadWorker(QThread):
         self._format_id = format_id
         self._output_dir = output_dir
         self._retry_output_dir = output_dir
+        self._results_dir = results_dir or output_dir
         self._min_height = min_height
         self._last_results_csv = ""
         self._last_skipped_csv = ""
@@ -292,7 +294,7 @@ class BatchDownloadWorker(QThread):
         import csv as _csv
         from datetime import datetime as _dt
         timestamp = _dt.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = str(self._output_dir / f"batch_results_{timestamp}.csv")
+        csv_path = str(self._results_dir / f"batch_results_{timestamp}.csv")
         self._last_results_csv = csv_path
         _csv_file = open(csv_path, "w", newline="", encoding="utf-8")
         _csv_writer = _csv.DictWriter(_csv_file, fieldnames=[
@@ -375,7 +377,7 @@ class BatchDownloadWorker(QThread):
         completed: set[str] = set()
         # 找最新的结果 CSV
         existing = sorted(
-            self._output_dir.glob("batch_results_*.csv"),
+            self._results_dir.glob("batch_results_*.csv"),
             key=lambda p: p.stat().st_mtime, reverse=True,
         )
         if not existing:
@@ -530,7 +532,7 @@ class BatchDownloadWorker(QThread):
         from datetime import datetime
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = str(self._output_dir / f"batch_results_{timestamp}.csv")
+        csv_path = str(self._results_dir / f"batch_results_{timestamp}.csv")
 
         try:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
