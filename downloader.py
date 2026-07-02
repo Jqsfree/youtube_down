@@ -386,7 +386,7 @@ class YoutubeDownloader:
     # ------------------------------------------------------------------
 
     def get_info(
-        self, video_id: str, use_cookies: bool = False
+        self, video_id: str, use_cookies: bool = True
     ) -> dict[str, Any]:
         """获取视频元信息和可用格式列表。
 
@@ -473,7 +473,7 @@ class YoutubeDownloader:
         format_id: str,
         output_dir: Path,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
-        use_cookies: bool = False,
+        use_cookies: bool = True,
         needs_audio_merge: bool = True,
     ) -> Path:
         """下载指定格式的视频。
