@@ -261,7 +261,7 @@ class BatchDownloadWorker(QThread):
         self._last_results_csv = csv_path
         _csv_file = open(csv_path, "w", newline="", encoding="utf-8")
         _csv_writer = _csv.DictWriter(_csv_file, fieldnames=[
-            "video_id", "status", "error_category",
+            "video_id", "title", "status", "error_category",
             "error_message", "cookie_used", "output_dir",
         ])
         _csv_writer.writeheader()
@@ -278,21 +278,20 @@ class BatchDownloadWorker(QThread):
                     continue
 
                 # ── 下载（默认 Cookie）─────────────────────
-                status, cookie_used, category, error_msg = self._try_download(
+                status, cookie_used, category, error_msg, title = self._try_download(
                     vid, i, total
                 )
 
                 if status == "success":
                     downloaded += 1
-                    self._append_csv(_csv_writer, _csv_file, vid, "success", "SUCCESS", "", cookie_used)
+                    self._append_csv(_csv_writer, _csv_file, vid, title, "success", "SUCCESS", "", cookie_used)
                 elif status == "skipped":
                     skip_count += 1
-                    self._append_csv(_csv_writer, _csv_file, vid, "skipped", "SKIPPED",
+                    self._append_csv(_csv_writer, _csv_file, vid, title, "skipped", "SKIPPED",
                                      clean_error(Exception(error_msg)), cookie_used)
                 else:
-                    # 重试一次（重检浏览器）
                     if self._downloader.redetect_browser():
-                        status, cookie_used, category, error_msg = self._try_download(
+                        status, cookie_used, category, error_msg, title = self._try_download(
                             vid, i, total
                         )
                     if status == "success":
@@ -301,7 +300,7 @@ class BatchDownloadWorker(QThread):
                         skip_count += 1
                     else:
                         fail_count += 1
-                    self._append_csv(_csv_writer, _csv_file, vid, status,
+                    self._append_csv(_csv_writer, _csv_file, vid, title, status,
                                      category.code, clean_error(Exception(error_msg)), cookie_used)
 
                 results.append({
@@ -324,32 +323,26 @@ class BatchDownloadWorker(QThread):
         self._log_summary(csv_path, skipped_path, failed_path)
 
     def _load_completed_ids(self) -> set[str]:
-        """从已有结果 CSV 中读取已完成的 video_id（支持续传）。"""
+        """合并所有历史结果 CSV 中已成功的 video_id（跨批次去重）。"""
         import csv as _csv
         completed: set[str] = set()
-        # 找最新的结果 CSV
-        existing = sorted(
-            self._results_dir.glob("batch_results_*.csv"),
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
-        if not existing:
-            return completed
-        try:
-            with open(existing[0], "r", encoding="utf-8") as f:
-                for row in _csv.DictReader(f):
-                    if row.get("status") == "success":
-                        completed.add(row["video_id"])
-        except Exception:
-            pass
+        for csv_file in self._results_dir.glob("batch_results_*.csv"):
+            try:
+                with open(csv_file, "r", encoding="utf-8") as f:
+                    for row in _csv.DictReader(f):
+                        if row.get("status") == "success":
+                            completed.add(row["video_id"])
+            except Exception:
+                pass
         return completed
 
     def _append_csv(
-        self, writer: Any, f: Any, vid: str, status: str,
+        self, writer: Any, f: Any, vid: str, title: str, status: str,
         category: str, error_msg: str, cookie_used: bool,
     ) -> None:
         """增量写入一行结果到 CSV。"""
         writer.writerow({
-            "video_id": vid, "status": status,
+            "video_id": vid, "title": title, "status": status,
             "error_category": category, "error_message": error_msg,
             "cookie_used": str(cookie_used).lower(),
             "output_dir": str(self._output_dir),
@@ -427,22 +420,24 @@ class BatchDownloadWorker(QThread):
 
     def _try_download(
         self, video_id: str, index: int, total: int, use_cookies: bool = True
-    ) -> tuple[str, bool, ErrorCategory, str]:
+    ) -> tuple[str, bool, ErrorCategory, str, str]:
         """尝试获取信息 + 下载。默认使用 Cookie。
 
         Returns:
-            (status, cookie_used, category, error_or_path)
+            (status, cookie_used, category, error_or_path, title)
         """
         self.video_started.emit(index, total, video_id, use_cookies)
         on_progress = self._make_progress_cb(index, total)
 
+        title = ""
         try:
             existing = _check_existing(video_id, self._output_dir)
             if existing:
                 self.video_finished.emit(index, str(existing), use_cookies)
-                return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing))
+                return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing), "")
 
             info = self._downloader.get_info(video_id, use_cookies=use_cookies)
+            title = info.get("title", "") or ""
             if use_cookies:
                 fmt, merge = "best", False
             else:
@@ -451,7 +446,7 @@ class BatchDownloadWorker(QThread):
             if fmt is None:
                 msg = f"低于 {self._min_height}p，跳过下载: {video_id}"
                 self.video_error.emit(index, msg, use_cookies)
-                return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, msg), msg)
+                return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, msg), msg, title)
 
             path = self._downloader.download(
                 video_id=video_id, format_id=fmt,
@@ -460,7 +455,7 @@ class BatchDownloadWorker(QThread):
                 needs_audio_merge=merge,
             )
             self.video_finished.emit(index, str(path), use_cookies)
-            return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path))
+            return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)
 
         except Exception as exc:
             cat = classify_error(exc)
@@ -474,7 +469,7 @@ class BatchDownloadWorker(QThread):
                             self._downloader.get_info(video_id)
                         )
                         if fmt is None:
-                            return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "")
+                            return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "", "")
                         path = self._downloader.download(
                             video_id=video_id, format_id=fmt,
                             output_dir=self._output_dir,
@@ -482,13 +477,13 @@ class BatchDownloadWorker(QThread):
                             needs_audio_merge=merge,
                         )
                         self.video_finished.emit(index, str(path), use_cookies)
-                        return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path))
+                        return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)
                     except Exception:
                         continue
 
             AppLogger.log_exception(exc, f"批量下载失败: {video_id}")
             self.video_error.emit(index, clean_error(exc), use_cookies)
-            return ("failed", use_cookies, cat, str(exc))
+            return ("failed", use_cookies, cat, str(exc), title)
 
     def _write_results(self, results: list[dict[str, str]]) -> str:
         """将批量下载结果写入 CSV 文件。"""
@@ -502,7 +497,7 @@ class BatchDownloadWorker(QThread):
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv_module.DictWriter(
                     f, fieldnames=[
-                        "video_id", "status", "error_category",
+                        "video_id", "title", "status", "error_category",
                         "error_message", "cookie_used", "output_dir",
                     ]
                 )
