@@ -64,19 +64,20 @@ class EnvItem:
     status: str       # "ok" | "error" | "warning"
     version: str
     message: str
+    fatal: bool = False  # 致命缺失 → 不允许跳过
 
 
 def check_environment() -> tuple[bool, list[EnvItem]]:
     """启动时检查所有依赖。返回 (all_ok, items)。"""
     items: list[EnvItem] = []
 
-    # yt-dlp
+    # yt-dlp (致命)
     try:
         import yt_dlp as _ydl
         ver = str(_ydl.version.__version__) if hasattr(_ydl, 'version') else "?"
-        items.append(EnvItem("yt-dlp", "ok", ver, ""))
+        items.append(EnvItem("yt-dlp", "ok", ver, "", fatal=True))
     except ImportError:
-        items.append(EnvItem("yt-dlp", "error", "", "未安装: pip install yt-dlp"))
+        items.append(EnvItem("yt-dlp", "error", "", "未安装: pip install yt-dlp", fatal=True))
 
     # yt-dlp-ejs
     try:
@@ -87,7 +88,7 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
         items.append(EnvItem("yt-dlp-ejs", "error", "",
             "未安装: pip install yt-dlp-ejs（Cookie 模式下必需）"))
 
-    # ffmpeg
+    # ffmpeg (致命)
     ffmpeg_path = shutil.which(_find_tool("ffmpeg"))
     if ffmpeg_path:
         try:
@@ -95,11 +96,11 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
                 [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5
             )
             ver_line = r.stdout.split("\n")[0] if r.stdout else "?"
-            items.append(EnvItem("ffmpeg", "ok", ver_line, ""))
+            items.append(EnvItem("ffmpeg", "ok", ver_line, "", fatal=True))
         except Exception:
-            items.append(EnvItem("ffmpeg", "ok", "?", ""))
+            items.append(EnvItem("ffmpeg", "ok", "?", "", fatal=True))
     else:
-        items.append(EnvItem("ffmpeg", "error", "", "未找到 ffmpeg"))
+        items.append(EnvItem("ffmpeg", "error", "", "未找到 ffmpeg", fatal=True))
 
     # ffprobe
     if shutil.which(_find_tool("ffprobe")):

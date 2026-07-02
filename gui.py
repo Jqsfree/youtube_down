@@ -133,32 +133,62 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _show_env_wizard(self, errors: list) -> None:
-        """启动时检测到缺失依赖，引导安装。"""
-        lines = ["检测到以下依赖缺失：\n"]
-        cmds: list[str] = []
-        for i in errors:
-            lines.append(f"  ✗ {i.name}")
-            if "pip install" in i.message:
-                cmds.append(i.message.split("pip install ")[-1].split("）")[0].rstrip(")"))
+        """启动时检测到缺失依赖，致命项强制安装，非致命项可选跳过。"""
+        fatal = [i for i in errors if i.fatal]
+        non_fatal = [i for i in errors if not i.fatal]
 
-        lines.append("\n是否自动安装？")
-        reply = QMessageBox.question(
-            self, "环境检测", "\n".join(lines),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self._status_label.setText("正在安装依赖...")
-            for pkg in cmds:
-                self._log(f"pip install {pkg}")
-                try:
-                    subprocess.run(
-                        [sys.executable, "-m", "pip", "install"] + pkg.split(),
-                        capture_output=True, timeout=120,
-                    )
-                    self._log(f"  ✓ {pkg} 安装完成")
-                except Exception as exc:
-                    self._log(f"  ✗ {pkg} 安装失败: {exc}")
-            self._status_label.setText("依赖安装完成，请重启应用")
+        # 致命依赖：必须安装
+        if fatal:
+            lines = ["以下依赖缺失，程序无法正常运行：\n"]
+            cmds: list[str] = []
+            for i in fatal:
+                lines.append(f"  ✗ {i.name}（必需）")
+                if "pip install" in i.message:
+                    cmds.append(i.message.split("pip install ")[-1].split("）")[0].rstrip(")"))
+            lines.append("\n是否自动安装？")
+            reply = QMessageBox.question(
+                self, "致命依赖缺失", "\n".join(lines),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._status_label.setText("正在安装依赖...")
+                for pkg in cmds:
+                    self._log(f"pip install {pkg}")
+                    try:
+                        subprocess.run(
+                            [sys.executable, "-m", "pip", "install"] + pkg.split(),
+                            capture_output=True, timeout=120,
+                        )
+                        self._log(f"  ✓ {pkg}")
+                    except Exception as exc:
+                        self._log(f"  ✗ {pkg}: {exc}")
+                self._status_label.setText("依赖安装完成，请重启应用")
+
+        # 非致命依赖：可跳过
+        if non_fatal:
+            lines = ["以下依赖缺失，部分功能不可用：\n"]
+            cmds: list[str] = []
+            for i in non_fatal:
+                lines.append(f"  ⚠ {i.name}: {i.message.split('（')[0] if '（' in i.message else i.message}")
+                if "pip install" in i.message:
+                    cmds.append(i.message.split("pip install ")[-1].split("）")[0].rstrip(")"))
+            lines.append("\n安装以启用完整功能？\n（选 No 可跳过，不影响基本下载）")
+            reply = QMessageBox.question(
+                self, "可选依赖缺失", "\n".join(lines),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                for pkg in cmds:
+                    self._log(f"pip install {pkg}")
+                    try:
+                        subprocess.run(
+                            [sys.executable, "-m", "pip", "install"] + pkg.split(),
+                            capture_output=True, timeout=120,
+                        )
+                        self._log(f"  ✓ {pkg}")
+                    except Exception as exc:
+                        self._log(f"  ✗ {pkg}: {exc}")
+                self._status_label.setText("依赖安装完成，请重启应用")
 
     # ------------------------------------------------------------------
     # 日志
