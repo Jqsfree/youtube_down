@@ -253,6 +253,7 @@ class YoutubeDownloader:
             Path(cookiefile) if cookiefile else None
         )
         self._cookies_spec: str | None = cookies_from_browser
+        self._cookie_broken: bool = False  # Cookie 连续失败标记
         if self._cookies_spec is None and self._cookiefile_path is None:
             info = self.detect_browser()
             self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
@@ -401,6 +402,9 @@ class YoutubeDownloader:
             yt_dlp.utils.DownloadError: yt-dlp 内部错误（由调用方分类处理）。
         """
         url = f"https://www.youtube.com/watch?v={video_id}"
+        # Cookie 已标记不可用 → 跳过所有 Cookie 尝试
+        if self._cookie_broken:
+            use_cookies = False
         # Cookie 模式失败时自动回退无 Cookie（Chrome 锁定等场景）
         last_err = None
         tried_cookie = use_cookies and bool(self._cookies_spec)
@@ -410,8 +414,12 @@ class YoutubeDownloader:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     if info and len(info.get("formats", [])) > 0:
+                        if attempt != use_cookies:  # Cookie 回退成功 → 标记
+                            self._cookie_broken = True
                         return info
             except Exception as exc:
+                if "copy chrome cookie" in str(exc).lower():
+                    self._cookie_broken = True  # 锁库，后续全跳过 Cookie
                 last_err = exc
         raise yt_dlp.utils.DownloadError(
             f"No formats available for: {video_id}"
