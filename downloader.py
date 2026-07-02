@@ -29,9 +29,11 @@ from logger_utils import AppLogger
 def _find_tool(name: str) -> str:
     """PyInstaller 打包后优先找内嵌的二进制，否则回退 PATH。"""
     if getattr(sys, "frozen", False):
-        bundled = os.path.join(sys._MEIPASS, name)  # noqa: SLF001
-        if os.path.exists(bundled):
-            return bundled
+        candidates = [name, f"{name}.exe"] if os.name == "nt" else [name]
+        for n in candidates:
+            bundled = os.path.join(sys._MEIPASS, n)  # noqa: SLF001
+            if os.path.exists(bundled):
+                return bundled
     return name
 
 # 匹配 ANSI 转义序列（颜色码等），用于清理错误消息
@@ -155,7 +157,10 @@ _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
         "this video may be inappropriate",
     ]),
     ("PRIVATE_VIDEO",      True,  ["private video", "this video is private"]),
-    ("RATE_LIMIT",         False, ["http error 429", "too many requests"]),
+    ("RATE_LIMIT",         False, [
+        "http error 429", "too many requests",
+        "this content isn't available, try again later",
+    ]),
     ("VIDEO_UNAVAILABLE",  False, [
         "video unavailable",
         "copyright",
@@ -229,18 +234,26 @@ class YoutubeDownloader:
         dl.download("dQw4w9WgXcQ", "22", Path("./out"))
     """
 
-    def __init__(self, cookies_from_browser: str | None = None) -> None:
+    def __init__(
+        self,
+        cookies_from_browser: str | None = None,
+        cookiefile: str | Path | None = None,
+    ) -> None:
         """初始化下载器。
 
         Args:
-            cookies_from_browser: 浏览器名称:profile 格式，
-                如 'chrome:Default', 'firefox'。
+            cookies_from_browser: 浏览器名称:profile 格式。
                 None 时自动检测，'' 时不使用 cookie。
+            cookiefile: Netscape 格式 cookie 文件路径。
+                比 cookiesfrombrowser 更可靠，优先使用。
         """
         self._cancelled: bool = False
         self._cancel_lock = threading.Lock()
+        self._cookiefile_path: Path | None = (
+            Path(cookiefile) if cookiefile else None
+        )
         self._cookies_spec: str | None = cookies_from_browser
-        if self._cookies_spec is None:
+        if self._cookies_spec is None and self._cookiefile_path is None:
             info = self.detect_browser()
             self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
 
@@ -340,22 +353,31 @@ class YoutubeDownloader:
             "quiet": True,
             "no_warnings": True,
             "logger": _QuietLogger(),
+            # 网络韧性
             "extractor_retries": 5,
             "retries": 5,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            },
-            "nocheckcertificate": False,
             "socket_timeout": 20,
-            "source_address": "0.0.0.0",
-            "hls_prefer_native": True,
-            "http_chunk_size": 10485760,
-            "enable_file_urls": False,
+            # 请求节奏控制（yt-dlp 官方建议：访客 ~300/h，登录 ~2000/h）
+            "sleep_interval": 3,
+            "max_sleep_interval": 8,
+            "sleep_interval_requests": 1.5,
+            # 内部重试退避
+            "retry_sleep_functions": {
+                "http": lambda n: min(4 * (2 ** n), 60),
+                "fragment": lambda n: min(2 * (2 ** n), 30),
+                "extractor": lambda n: min(3 * (2 ** n), 30),
+            },
+            # 限速检测
+            "throttledratelimit": 100 * 1024,
+            # 版本提醒
+            "warn_when_outdated": True,
         }
-        if use_cookies and self._cookies_spec:
-            # self._cookies_spec 格式: "chrome:Default" 或 "chrome"
-            parts = self._cookies_spec.split(":")
-            opts["cookiesfrombrowser"] = tuple(parts)  # type: ignore[assignment]
+        if use_cookies and (self._cookies_spec or self._cookiefile_path):
+            if self._cookiefile_path:
+                opts["cookiefile"] = str(self._cookiefile_path)
+            elif self._cookies_spec:
+                parts = self._cookies_spec.split(":")
+                opts["cookiesfrombrowser"] = tuple(parts)  # type: ignore[assignment]
         opts.update(extra)  # extra 中的 extractor_args 会覆盖默认值
         return opts
 
@@ -452,6 +474,7 @@ class YoutubeDownloader:
         output_dir: Path,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         use_cookies: bool = False,
+        needs_audio_merge: bool = True,
     ) -> Path:
         """下载指定格式的视频。
 
@@ -460,13 +483,9 @@ class YoutubeDownloader:
             format_id: yt-dlp format ID。
             output_dir: 输出目录。
             progress_callback: 进度回调。
-            use_cookies: 是否使用浏览器 Cookie。默认 False。
-
-        Returns:
-            下载完成后的文件路径。
-
-        Raises:
-            yt_dlp.utils.DownloadError: 下载失败（由调用方分类处理）。
+            use_cookies: 是否使用浏览器 Cookie。
+            needs_audio_merge: Video Only 格式才需要合并音频，
+                Video+Audio 格式传 False 避免双音轨。
         """
         with self._cancel_lock:
             self._cancelled = False
@@ -482,8 +501,12 @@ class YoutubeDownloader:
             if self._cancelled:
                 raise yt_dlp.utils.DownloadError("下载已取消")
 
-        # "best" 不需要追加 bestaudio（已经是完整格式选择器）
-        fmt_str = format_id if format_id == "best" else f"{format_id}+bestaudio/best"
+        if format_id == "best":
+            fmt_str = "best"
+        elif needs_audio_merge:
+            fmt_str = f"{format_id}+bestaudio/best"
+        else:
+            fmt_str = format_id
         opts = self._make_opts(
             use_cookies=use_cookies,
             format=fmt_str,
@@ -534,7 +557,7 @@ class YoutubeDownloader:
                     f"下载文件过小 ({path.stat().st_size} bytes): {path}"
                 )
 
-            # 校验文件是有效媒体（ffprobe 能解析则文件完整）
+            # 校验文件是有效媒体（ffprobe 解析 + 时长比对）
             ffprobe_result = subprocess.run(
                 [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
                  "format=duration", "-of", "csv=p=0", str(path)],
@@ -543,6 +566,16 @@ class YoutubeDownloader:
             if ffprobe_result.returncode != 0 or not ffprobe_result.stdout.strip():
                 raise yt_dlp.utils.DownloadError(
                     f"下载文件无法解析为有效媒体: {path}"
+                )
+            actual_duration = float(ffprobe_result.stdout.strip())
+            expected_duration = float(info.get("duration") or 0)
+            if (
+                expected_duration > 0
+                and abs(actual_duration - expected_duration) / expected_duration > 0.05
+            ):
+                raise yt_dlp.utils.DownloadError(
+                    f"下载文件时长异常: 期望 {expected_duration:.0f}s,"
+                    f" 实际 {actual_duration:.0f}s (可能是合并中断)"
                 )
 
             return path
@@ -657,14 +690,6 @@ class YoutubeDownloader:
                         seen.add(vid)
                         record = {key: (value or "") for key, value in row.items() if value is not None}
                         record["video_id"] = vid
-                        for key in ("output_dir", "output_folder", "folder"):
-                            if key in record and record[key]:
-                                break
-                        else:
-                            for key in ("output_dir", "output_folder", "folder"):
-                                if key in row and (row.get(key) or ""):
-                                    record[key] = row.get(key, "") or ""
-                                    break
                         rows.append(record)
                     return rows
             except (UnicodeDecodeError, UnicodeError) as exc:

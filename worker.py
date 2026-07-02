@@ -432,8 +432,13 @@ class BatchDownloadWorker(QThread):
                 pass
         return None
 
-    def _resolve_format(self, info: dict[str, Any]) -> str | None:
-        """为当前视频匹配一个满足最低分辨率阈值的最佳 format_id；低于阈值时返回 None。"""
+    def _resolve_format(self, info: dict[str, Any]) -> tuple[str | None, bool]:
+        """为当前视频匹配最佳 format_id + 是否需要合并音频。
+
+        Returns:
+            (format_id, needs_audio_merge)
+            format_id 为 None 表示低于阈值应跳过。
+        """
         preferred = self._format_id
         formats = self._downloader.list_formats(
             info=info,
@@ -441,15 +446,22 @@ class BatchDownloadWorker(QThread):
         )
         available_ids = {f["format_id"] for f in formats}
 
+        def _needs_merge(fmt: dict) -> bool:
+            return fmt.get("type") == "Video Only"
+
         if preferred in available_ids:
             try:
                 preferred_fmt = next(f for f in formats if f["format_id"] == preferred)
                 if preferred_fmt.get("container") == "mp4" and preferred_fmt.get("type") in {"Video+Audio", "Video Only"}:
-                    return preferred
+                    return (preferred, _needs_merge(preferred_fmt))
             except StopIteration:
                 pass
 
-        return self._downloader.resolve_format_id(formats, min_height=max(720, self._min_height))
+        result = self._downloader.resolve_format_id(formats, min_height=max(720, self._min_height))
+        if result is None:
+            return (None, False)
+        result_fmt = next((f for f in formats if f["format_id"] == result), None)
+        return (result, _needs_merge(result_fmt) if result_fmt else False)
 
     def _make_progress_cb(self, index: int, total: int) -> Callable[[dict[str, Any]], None]:
         """创建进度回调（闭包捕获 index/total）。"""
@@ -501,7 +513,10 @@ class BatchDownloadWorker(QThread):
                 return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing))
 
             info = self._downloader.get_info(video_id, use_cookies=use_cookies)
-            fmt = "best" if use_cookies else self._resolve_format(info)
+            if use_cookies:
+                fmt, merge = "best", False
+            else:
+                fmt, merge = self._resolve_format(info)
 
             if fmt is None:
                 msg = f"低于 {self._min_height}p，跳过下载: {video_id}"
@@ -512,6 +527,7 @@ class BatchDownloadWorker(QThread):
                 video_id=video_id, format_id=fmt,
                 output_dir=self._retry_output_dir,
                 progress_callback=on_progress, use_cookies=use_cookies,
+                needs_audio_merge=merge,
             )
             self.video_finished.emit(index, str(path), use_cookies)
             return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path))
@@ -520,18 +536,19 @@ class BatchDownloadWorker(QThread):
             cat = classify_error(exc)
             if cat.code == "RATE_LIMIT" and not use_cookies:
                 for attempt in range(2):
-                    wait = 2 ** (attempt + 2)  # 4s, 8s
+                    wait = 2 ** (attempt + 2)
                     self.status_changed.emit(f"限流，{wait}s 后重试...")
                     time.sleep(wait)
                     try:
                         info = self._downloader.get_info(video_id, use_cookies=False)
-                        fmt = self._resolve_format(info)
+                        fmt, merge = self._resolve_format(info)
                         if fmt is None:
                             return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "")
                         path = self._downloader.download(
                             video_id=video_id, format_id=fmt,
                             output_dir=self._retry_output_dir,
                             progress_callback=on_progress, use_cookies=False,
+                            needs_audio_merge=merge,
                         )
                         self.video_finished.emit(index, str(path), use_cookies)
                         return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path))
