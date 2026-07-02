@@ -401,14 +401,21 @@ class YoutubeDownloader:
             yt_dlp.utils.DownloadError: yt-dlp 内部错误（由调用方分类处理）。
         """
         url = f"https://www.youtube.com/watch?v={video_id}"
-        opts = self._make_opts(use_cookies=use_cookies)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info is None or len(info.get("formats", [])) == 0:
-                raise yt_dlp.utils.DownloadError(
-                    f"No formats available for: {video_id}"
-                )
-            return info
+        # Cookie 模式失败时自动回退无 Cookie（Chrome 锁定等场景）
+        last_err = None
+        tried_cookie = use_cookies and bool(self._cookies_spec)
+        for attempt in ([True, False] if tried_cookie else [use_cookies]):
+            try:
+                opts = self._make_opts(use_cookies=attempt)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info and len(info.get("formats", [])) > 0:
+                        return info
+            except Exception as exc:
+                last_err = exc
+        raise yt_dlp.utils.DownloadError(
+            f"No formats available for: {video_id}"
+        ) from last_err
 
     def list_formats(
         self,
