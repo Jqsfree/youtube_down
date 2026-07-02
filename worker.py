@@ -16,7 +16,7 @@ from typing import Any
 import yt_dlp
 from PySide6.QtCore import QThread, Signal
 
-from downloader import ErrorCategory, YoutubeDownloader, classify_error, clean_error
+from downloader import ErrorCategory, YoutubeDownloader, _find_tool, classify_error, clean_error
 from logger_utils import AppLogger
 
 
@@ -335,6 +335,26 @@ class BatchDownloadWorker(QThread):
         self.all_finished.emit(success_count, fail_count, csv_path)
         self._log_summary(csv_path, skipped_path, failed_path)
 
+    @staticmethod
+    def _check_existing(video_id: str, output_dir: Path) -> Path | None:
+        """检查输出目录是否已有此视频的有效文件（用于去重）。"""
+        import subprocess as _sp
+        for ext in (".mp4", ".webm", ".mkv", ".m4a"):
+            candidate = output_dir / f"{video_id}{ext}"
+            if not candidate.is_file() or candidate.stat().st_size <= 1024:
+                continue
+            try:
+                r = _sp.run(
+                    [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
+                     "format=duration", "-of", "csv=p=0", str(candidate)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return candidate
+            except Exception:
+                pass
+        return None
+
     def _resolve_format(self, info: dict[str, Any]) -> str | None:
         """为当前视频匹配一个满足最低分辨率阈值的最佳 format_id；低于阈值时返回 None。"""
         preferred = self._format_id
@@ -365,6 +385,12 @@ class BatchDownloadWorker(QThread):
         self.video_started.emit(index, total, video_id, use_cookies)
 
         try:
+            # 去重：检查是否已有有效文件
+            existing = self._check_existing(video_id, self._output_dir)
+            if existing:
+                self.video_finished.emit(index, str(existing), use_cookies)
+                return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing))
+
             # 获取信息
             info = self._downloader.get_info(video_id, use_cookies=use_cookies)
 
