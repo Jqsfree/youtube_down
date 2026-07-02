@@ -34,6 +34,7 @@ jobs:
         run: |
           pyinstaller --onefile --windowed `
             --name "YouTubeDownloader" `
+            --add-data "VERSION;." `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
             --collect-all yt_dlp `
