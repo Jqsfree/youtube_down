@@ -343,19 +343,19 @@ class YoutubeDownloader:
     # 内部：构建 yt-dlp 选项
     # ------------------------------------------------------------------
 
-    def _make_opts(self, use_cookies: bool = False, **extra: Any) -> dict[str, Any]:
+    def _make_opts(self, use_cookies: bool = True, **extra: Any) -> dict[str, Any]:
         """构建 yt-dlp 通用选项。
 
         Args:
-            use_cookies: 是否启用浏览器 Cookie。默认 False。
+            use_cookies: 是否启用浏览器 Cookie。默认 True。
         """
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "logger": _QuietLogger(),
             # 网络韧性
-            "extractor_retries": 5,
-            "retries": 5,
+            "extractor_retries": 10,
+            "retries": 10,
             "socket_timeout": 20,
             # 请求节奏控制（yt-dlp 官方建议：访客 ~300/h，登录 ~2000/h）
             "sleep_interval": 3,

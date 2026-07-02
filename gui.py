@@ -79,7 +79,7 @@ class MainWindow(QMainWindow):
         self._last_min_height: int = 720
         self._batch_total: int = 0
         self._batch_video_ids: list[str] = []
-        self._queue_results: list[tuple[int, int, str]] = []  # 队列累计结果  # 当前批次视频总数，避免用 _csv_ids 长度
+        self._queue_results: list[tuple[int, int, int, str]] = []  # (success, fail, skipped, csv)
 
         spec = self._downloader._cookies_spec  # noqa: SLF001
         ver = Path(__file__).parent / "VERSION"
@@ -873,7 +873,7 @@ class MainWindow(QMainWindow):
         self._log(f"  ↳ {msg}")
 
     def _on_batch_all_finished(
-        self, success: int, fail: int, csv_path: str
+        self, success: int, fail: int, skipped: int, csv_path: str
     ) -> None:
         self._batch_progress_bar.setValue(100)
         self._batch_progress_label.setText(f"完成 — 成功 {success}，失败 {fail}")
@@ -883,7 +883,7 @@ class MainWindow(QMainWindow):
 
         # 队列模式：累积结果，最后一个弹窗
         if self._csv_queue:
-            self._queue_results.append((success, fail, csv_path))
+            self._queue_results.append((success, fail, skipped, csv_path))
             fmt_id = self._worker._format_id if self._worker else self._last_fmt_id  # noqa: SLF001
             min_height = self._last_min_height
             self._start_queue(fmt_id, self._output_dir, min_height)
@@ -891,19 +891,19 @@ class MainWindow(QMainWindow):
 
         # 队列全部完成（或单批次）→ 汇总弹窗
         if self._queue_results:
-            self._queue_results.append((success, fail, csv_path))
-            total_ok = sum(s for s, _, _ in self._queue_results)
-            total_fail = sum(f for _, f, _ in self._queue_results)
-            csv_list = "\n".join(f"  {p}" for _, _, p in self._queue_results)
-            msg = (
-                f"队列全部完成\n\n"
-                f"总数: {total_ok + total_fail}\n"
-                f"成功: {total_ok}\n"
-                f"失败: {total_fail}\n\n"
-                f"结果 CSV:\n{csv_list}"
-            )
-            QMessageBox.information(self, "队列下载完成", msg)
-            self._log(f"队列全部完成: 成功 {total_ok}, 失败 {total_fail}")
+            self._queue_results.append((success, fail, skipped, csv_path))
+            total_ok = sum(s for s, _, _, _ in self._queue_results)
+            total_fail = sum(f for _, f, _, _ in self._queue_results)
+            total_skip = sum(k for _, _, k, _ in self._queue_results)
+            csv_list = "\n".join(f"  {p}" for _, _, _, p in self._queue_results)
+            parts = [f"总数: {total_ok + total_fail + total_skip}", f"成功: {total_ok}"]
+            if total_skip:
+                parts.append(f"跳过: {total_skip}")
+            parts.append(f"失败: {total_fail}")
+            parts.append(f"\n结果 CSV:\n{csv_list}")
+            QMessageBox.information(self, "队列下载完成", "\n".join(parts))
+            self._log(f"队列全部完成: 成功 {total_ok}, 失败 {total_fail}" +
+                      (f", 跳过 {total_skip}" if total_skip else ""))
             self._queue_results.clear()
         else:
             total = success + fail

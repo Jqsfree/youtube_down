@@ -22,6 +22,12 @@ jobs:
         run: |
           pip install pyside6 yt-dlp yt-dlp-ejs pyinstaller
 
+      - name: Install deno
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
+          Expand-Archive deno.zip -DestinationPath .
+          Move-Item deno.exe deno.exe
+
       - name: Download ffmpeg
         run: |
           Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
@@ -37,6 +43,7 @@ jobs:
             --add-data "VERSION;." `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
+            --add-binary "deno.exe;." `
             --collect-all yt_dlp `
             --collect-all yt_dlp_ejs `
             --hidden-import PySide6.QtCore `

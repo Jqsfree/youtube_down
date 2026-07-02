@@ -123,7 +123,6 @@ class DownloadWorker(QThread):
                 format_id=self._format_id,
                 output_dir=self._output_dir,
                 progress_callback=on_progress,
-                use_cookies=False,
                 needs_audio_merge=self._needs_audio_merge,
             )
             self.finished.emit(str(result_path))
@@ -207,7 +206,7 @@ class BatchDownloadWorker(QThread):
         eta_changed(str): 预计剩余时间。
         size_changed(str): 已下载/总大小。
         status_changed(str): 状态文字。
-        all_finished(int, int, str): (success, fail, result_csv_path)。
+        all_finished(int, int, int, str): (downloaded, fail, skipped, csv_path)。
     """
 
     all_progress_changed = Signal(int)
@@ -219,7 +218,7 @@ class BatchDownloadWorker(QThread):
     eta_changed = Signal(str)
     size_changed = Signal(str)
     status_changed = Signal(str)
-    all_finished = Signal(int, int, str)
+    all_finished = Signal(int, int, int, str)  # (downloaded, fail, skipped, csv_path)
 
     def __init__(
         self,
@@ -246,8 +245,10 @@ class BatchDownloadWorker(QThread):
         """按顺序下载所有 video_id，两阶段策略。增量写入 + 续传。"""
         total = len(self._video_ids)
         results: list[dict[str, str]] = []
-        success_count = 0
+        downloaded = 0
+        resumed = 0
         fail_count = 0
+        skip_count = 0
 
         # ── 续传：读取上次结果中已完成的 ID ──
         completed_ids = self._load_completed_ids()
@@ -273,46 +274,35 @@ class BatchDownloadWorker(QThread):
                 # 续传：跳过已完成的视频
                 if vid in completed_ids:
                     self._log_resume_skip(i, total, vid)
-                    success_count += 1
+                    resumed += 1
                     continue
 
-                # ── Stage 1: 无 Cookie ──────────────────────────
+                # ── 下载（默认 Cookie）─────────────────────
                 status, cookie_used, category, error_msg = self._try_download(
-                    vid, i, total, use_cookies=False
+                    vid, i, total
                 )
 
                 if status == "success":
-                    success_count += 1
+                    downloaded += 1
                     self._append_csv(_csv_writer, _csv_file, vid, "success", "SUCCESS", "", cookie_used)
-                    continue
-
-                if status == "skipped":
+                elif status == "skipped":
+                    skip_count += 1
                     self._append_csv(_csv_writer, _csv_file, vid, "skipped", "SKIPPED",
                                      clean_error(Exception(error_msg)), cookie_used)
-                    continue
-
-                # ── Stage 2: Cookie 重试 ──────────────────────
-                if category.retry_cookie:
-                    status, cookie_used, category, error_msg = self._try_download(
-                        vid, i, total, use_cookies=True
-                    )
-
-                    if (
-                        status == "failed"
-                        and category.code in ("BOT_VERIFICATION", "AUTH_REQUIRED", "PRIVATE_VIDEO")
-                        and self._downloader.redetect_browser()
-                    ):
+                else:
+                    # 重试一次（重检浏览器）
+                    if self._downloader.redetect_browser():
                         status, cookie_used, category, error_msg = self._try_download(
-                            vid, i, total, use_cookies=True
+                            vid, i, total
                         )
-
-                if status == "success":
-                    success_count += 1
-                elif status != "skipped":
-                    fail_count += 1
-
-                self._append_csv(_csv_writer, _csv_file, vid, status,
-                                 category.code, clean_error(Exception(error_msg)), cookie_used)
+                    if status == "success":
+                        downloaded += 1
+                    elif status == "skipped":
+                        skip_count += 1
+                    else:
+                        fail_count += 1
+                    self._append_csv(_csv_writer, _csv_file, vid, status,
+                                     category.code, clean_error(Exception(error_msg)), cookie_used)
 
                 results.append({
                     "video_id": vid, "status": status,
@@ -330,7 +320,7 @@ class BatchDownloadWorker(QThread):
         self._last_failed_csv = failed_path
 
         self.all_progress_changed.emit(100)
-        self.all_finished.emit(success_count, fail_count, csv_path)
+        self.all_finished.emit(downloaded + resumed, fail_count, skip_count, csv_path)
         self._log_summary(csv_path, skipped_path, failed_path)
 
     def _load_completed_ids(self) -> set[str]:
@@ -436,9 +426,9 @@ class BatchDownloadWorker(QThread):
         return on_progress
 
     def _try_download(
-        self, video_id: str, index: int, total: int, use_cookies: bool
+        self, video_id: str, index: int, total: int, use_cookies: bool = True
     ) -> tuple[str, bool, ErrorCategory, str]:
-        """尝试获取信息 + 下载。
+        """尝试获取信息 + 下载。默认使用 Cookie。
 
         Returns:
             (status, cookie_used, category, error_or_path)
@@ -474,21 +464,21 @@ class BatchDownloadWorker(QThread):
 
         except Exception as exc:
             cat = classify_error(exc)
-            if cat.code == "RATE_LIMIT" and not use_cookies:
+            if cat.code == "RATE_LIMIT":
                 for attempt in range(2):
                     wait = 2 ** (attempt + 2)
                     self.status_changed.emit(f"限流，{wait}s 后重试...")
                     time.sleep(wait)
                     try:
                         fmt, merge = self._resolve_format(
-                            self._downloader.get_info(video_id, use_cookies=False)
+                            self._downloader.get_info(video_id)
                         )
                         if fmt is None:
                             return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "")
                         path = self._downloader.download(
                             video_id=video_id, format_id=fmt,
                             output_dir=self._output_dir,
-                            progress_callback=on_progress, use_cookies=False,
+                            progress_callback=on_progress,
                             needs_audio_merge=merge,
                         )
                         self.video_finished.emit(index, str(path), use_cookies)
