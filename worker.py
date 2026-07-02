@@ -190,74 +190,6 @@ class FetchInfoWorker(QThread):
             self.error.emit(clean_error(exc))
 
 
-class FormatAnalyzer(QThread):
-    """后台分析线程 —— 取 N 个视频的共有格式交集。
-
-    避免在主线程串行网络请求导致 GUI 卡死。
-
-    Signals:
-        finished(list[dict]): 共有格式列表。
-        error(str): 所有采样视频均获取失败。
-        progress(str): 实时状态文字。
-    """
-
-    finished = Signal(dict, list)   # (first_info, common_formats)
-    error = Signal(str)
-    progress = Signal(str)
-
-    def __init__(
-        self,
-        downloader: YoutubeDownloader,
-        video_ids: list[str],
-        sample_size: int = 5,
-        parent: QThread | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._downloader = downloader
-        self._video_ids = video_ids
-        self._sample_size = sample_size
-
-    def run(self) -> None:
-        sample = self._video_ids[: min(self._sample_size, len(self._video_ids))]
-        all_format_ids: list[set[str]] = []
-        first_info = None
-        failed = 0
-
-        for i, vid in enumerate(sample):
-            self.progress.emit(
-                f"正在分析格式 ({i + 1}/{len(sample)})..."
-            )
-            try:
-                info = self._downloader.get_info(vid, use_cookies=False)
-                if first_info is None:
-                    first_info = info  # 只在第一个成功时赋值
-                fmt_set = {
-                    f["format_id"]
-                    for f in self._downloader.list_formats(info=info, min_height=720)
-                }
-                all_format_ids.append(fmt_set)
-            except Exception:
-                failed += 1
-
-        if not all_format_ids:
-            self.error.emit("所有采样视频均获取失败，无法列出格式")
-            return
-
-        # 计算交集
-        common_ids = all_format_ids[0]
-        for s in all_format_ids[1:]:
-            common_ids = common_ids & s
-
-        if not common_ids:
-            common_ids = set().union(*all_format_ids)
-
-        all_formats = self._downloader.list_formats(info=first_info, min_height=720)
-        common_formats = [
-            f for f in all_formats if f["format_id"] in common_ids
-        ]
-
-        self.finished.emit(first_info, common_formats)
-
 
 class BatchDownloadWorker(QThread):
     """批量下载线程 —— 两阶段策略。
@@ -450,7 +382,7 @@ class BatchDownloadWorker(QThread):
         preferred = self._format_id
         formats = self._downloader.list_formats(
             info=info,
-            min_height=max(720, self._min_height),
+            min_height=self._min_height,
         )
         available_ids = {f["format_id"] for f in formats}
 
@@ -465,7 +397,7 @@ class BatchDownloadWorker(QThread):
             except StopIteration:
                 pass
 
-        result = self._downloader.resolve_format_id(formats, min_height=max(720, self._min_height))
+        result = self._downloader.resolve_format_id(formats, min_height=self._min_height)
         if result is None:
             return (None, False)
         result_fmt = next((f for f in formats if f["format_id"] == result), None)
