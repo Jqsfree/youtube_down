@@ -50,6 +50,7 @@ class DownloadWorker(QThread):
         format_id: str,
         output_dir: Path,
         min_height: int = 720,
+        needs_audio_merge: bool = True,
         parent: QThread | None = None,
     ) -> None:
         super().__init__(parent)
@@ -58,6 +59,7 @@ class DownloadWorker(QThread):
         self._format_id = format_id
         self._output_dir = output_dir
         self._min_height = min_height
+        self._needs_audio_merge = needs_audio_merge
 
     def run(self) -> None:
         """在后台线程中执行下载。"""
@@ -96,6 +98,7 @@ class DownloadWorker(QThread):
                 output_dir=self._output_dir,
                 progress_callback=on_progress,
                 use_cookies=False,
+                needs_audio_merge=self._needs_audio_merge,
             )
             self.finished.emit(str(result_path))
 
@@ -540,8 +543,9 @@ class BatchDownloadWorker(QThread):
                     self.status_changed.emit(f"限流，{wait}s 后重试...")
                     time.sleep(wait)
                     try:
-                        info = self._downloader.get_info(video_id, use_cookies=False)
-                        fmt, merge = self._resolve_format(info)
+                        fmt, merge = self._resolve_format(
+                            self._downloader.get_info(video_id, use_cookies=False)
+                        )
                         if fmt is None:
                             return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "")
                         path = self._downloader.download(

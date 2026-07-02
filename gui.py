@@ -664,12 +664,21 @@ class MainWindow(QMainWindow):
 
     def _start_single_download(self, format_id: str, output_dir: Path, min_height: int) -> None:
         """启动单个视频下载。"""
+        # 判断选中格式是否需要合并音频（Video Only → 需要）
+        needs_merge = True
+        if self._info:
+            fmts = self._downloader.list_formats(info=self._info)
+            chosen = next((f for f in fmts if f["format_id"] == format_id), None)
+            if chosen and chosen.get("type") == "Video+Audio":
+                needs_merge = False
+
         self._worker = DownloadWorker(
             downloader=self._downloader,
             video_id=self._video_id,
             format_id=format_id,
             output_dir=output_dir,
             min_height=min_height,
+            needs_audio_merge=needs_merge,
         )
         self._worker.progress_changed.connect(self._on_progress)
         self._worker.status_changed.connect(self._on_status)

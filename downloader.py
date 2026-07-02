@@ -490,7 +490,6 @@ class YoutubeDownloader:
         with self._cancel_lock:
             self._cancelled = False
         output_dir.mkdir(parents=True, exist_ok=True)
-        self.cleanup_partial_files(output_dir)
 
         output_template = str(output_dir / "%(id)s.%(ext)s")
         url = f"https://www.youtube.com/watch?v={video_id}"
