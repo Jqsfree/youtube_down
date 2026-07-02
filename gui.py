@@ -209,10 +209,6 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_error_logs(self, checked: bool) -> None:
         AppLogger.set_gui_show_errors(checked)
-        if checked:
-            self._log("已显示错误日志")
-        else:
-            self._log("已隐藏错误日志")
 
     def _on_copy_log(self) -> None:
         text = self._log_view.toPlainText()
