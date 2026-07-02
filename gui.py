@@ -86,7 +86,7 @@ class MainWindow(QMainWindow):
         ver_str = ver.read_text().strip() if ver.exists() else "dev"
         title = f"YouTube Downloader v{ver_str}"
         if spec:
-            title += f"  |  🍪 {spec}（已检测到）"
+            title += f"  |  🍪"
         self.setWindowTitle(title)
         self.resize(900, 720)
         self.setAcceptDrops(True)
