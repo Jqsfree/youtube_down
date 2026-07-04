@@ -1,4 +1,4 @@
-﻿# Windows local test script
+# Windows local test script (ASCII-only for GBK PowerShell compatibility)
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -LaunchGui
@@ -20,7 +20,7 @@ function Write-Step([string]$Message) {
 
 function Assert-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
-        throw "Command not found: $Name. Install it and add to PATH."
+        throw "Command not found: $Name"
     }
 }
 
@@ -29,7 +29,7 @@ Assert-Command python
 $pyVersion = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 Write-Host "Python $pyVersion"
 if ([double]$pyVersion -lt 3.11) {
-    throw "Python 3.11+ is required."
+    throw "Python 3.11+ required."
 }
 
 Write-Step "Install dependencies"
@@ -37,15 +37,11 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pytest
 
 Write-Step "Check ffmpeg / ffprobe"
-$ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
-$ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
-if (-not $ffmpeg) {
-    Write-Host "Warning: ffmpeg not found. Add to PATH or place under resources\ffmpeg\" -ForegroundColor Yellow
+python -c "from downloader import _resolve_tool; f=_resolve_tool('ffmpeg'); p=_resolve_tool('ffprobe'); print('ffmpeg:', f or 'MISSING'); print('ffprobe:', p or 'MISSING'); import sys; sys.exit(0 if f else 1)"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "WARN: ffmpeg not found. Run: powershell -ExecutionPolicy Bypass -File scripts\setup_dev.ps1" -ForegroundColor Yellow
 } else {
-    ffmpeg -version | Select-Object -First 1
-}
-if (-not $ffprobe) {
-    Write-Host "Warning: ffprobe not found. Post-download validation may be limited." -ForegroundColor Yellow
+    python -c "from downloader import _resolve_tool; import subprocess; subprocess.run([_resolve_tool('ffmpeg'), '-version'], check=False)" 2>&1 | Select-Object -First 1
 }
 
 Write-Step "Run unit tests"
@@ -65,7 +61,7 @@ if (-not $SkipNetwork) {
 }
 
 Write-Step "GUI init check"
-python -c "import sys; from PySide6.QtWidgets import QApplication; from gui import MainWindow; app = QApplication(sys.argv); w = MainWindow(); print('GUI init OK:', w.windowTitle())"
+python -c "import sys; from PySide6.QtWidgets import QApplication; from gui import MainWindow; app = QApplication(sys.argv); w = MainWindow(); print('GUI init OK'); app.quit()"
 if ($LASTEXITCODE -ne 0) {
     throw "GUI init failed."
 }

@@ -189,6 +189,24 @@ class FetchInfoWorker(QThread):
             self.error.emit(clean_error(exc))
 
 
+class ValidateCookieWorker(QThread):
+    """后台验证 Cookie（网络请求），避免导入时阻塞 GUI。"""
+
+    finished = Signal(bool, str)
+
+    def __init__(
+        self,
+        downloader: YoutubeDownloader,
+        parent: QThread | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._downloader = downloader
+
+    def run(self) -> None:
+        ok, msg = self._downloader.validate_cookies()
+        self.finished.emit(ok, msg)
+
+
 
 class BatchDownloadWorker(QThread):
     """批量下载线程 —— 两阶段策略。

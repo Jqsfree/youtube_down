@@ -13,6 +13,17 @@
 pip install -r requirements.txt
 ```
 
+### Windows 源码开发（推荐）
+
+无需全局安装 ffmpeg，一键下载到 `resources/ffmpeg/`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_dev.ps1
+python main.py
+```
+
+也可手动 `winget install Gyan.FFmpeg`，或将 ffmpeg 放入 PATH / `resources\ffmpeg\`。
+
 ## 运行
 
 ```bash
@@ -43,13 +54,14 @@ powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
 | 组件 | 说明 |
 |------|------|
 | Python 3.11+ | [python.org](https://www.python.org/downloads/) 安装时勾选 "Add to PATH" |
-| ffmpeg | 加入 PATH，或解压到 `resources\ffmpeg\` |
+| ffmpeg | 运行 `scripts\setup_dev.ps1`，或加入 PATH，或放到 `resources\ffmpeg\` |
 | 网络 | 冒烟测试会请求 YouTube 获取视频信息 |
 
 可选（Cookie 重试模式）：
 
 - **deno**：Cookie 模式下 YouTube JS 挑战需要
 - **Chrome/Edge**：用于读取浏览器 Cookie
+- **手动 Cookie 文件**：Windows 上若无法自动读取浏览器 Cookie 或获取不到格式，可在 GUI 点击「导入 Cookie 文件」，选择 Netscape 格式的 `cookies.txt`（Chrome/Edge 可用扩展 **Get cookies.txt LOCALLY** 导出）。**Cookie 模式还需要 deno**（`scripts\setup_dev.ps1` 会一并下载，或 `winget install Denoland.Deno`）
 
 ### 手动分步测试
 

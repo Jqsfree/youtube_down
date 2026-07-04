@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 
 from downloader import YoutubeDownloader, check_environment
 from logger_utils import AppLogger
-from worker import BatchDownloadWorker, DownloadWorker, FetchInfoWorker
+from worker import BatchDownloadWorker, DownloadWorker, FetchInfoWorker, ValidateCookieWorker
 
 
 class MainWindow(QMainWindow):
@@ -47,27 +47,14 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        # ── 环境检测 ──
-        all_ok, env_items = check_environment()
-        errors = [i for i in env_items if i.status == "error"]
-        if errors:
-            self._show_env_wizard(errors)
-
-        # 控制台打印版本
-        versions = "  ".join(
-            f"{i.name}={i.version}" if i.version else i.name
-            for i in env_items
-        )
-        print(f"[env] {versions}")
-        # 日志在 _build_ui 之后添加，所以先存起来
-        self._env_report = env_items
-
         self._downloader = YoutubeDownloader()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._log_path = Path.home() / "Downloads" / f"youtube_downloader_{ts}.log"
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         AppLogger.attach_file(self._log_path)
         self._worker: DownloadWorker | BatchDownloadWorker | None = None
+        self._fetch_worker: FetchInfoWorker | None = None
+        self._validate_cookie_worker: ValidateCookieWorker | None = None
         self._video_id: str = ""
         self._info: dict[str, Any] | None = None
         self._output_dir: Path = Path.home() / "Downloads"
@@ -84,19 +71,31 @@ class MainWindow(QMainWindow):
         spec = self._downloader._cookies_spec  # noqa: SLF001
         ver = Path(__file__).parent / "VERSION"
         ver_str = ver.read_text().strip() if ver.exists() else "dev"
-        title = f"YouTube Downloader v{ver_str}"
-        if spec:
-            title += f"  |  🍪"
-        self.setWindowTitle(title)
+        self._base_title = f"YouTube Downloader v{ver_str}"
+        self._update_window_title()
         self.resize(900, 720)
         self.setAcceptDrops(True)
         self._build_ui()
         self._connect_signals()
 
         AppLogger.attach_gui(self._append_log_line)
+
+        # ── 环境检测（UI 就绪后再弹向导）──
+        all_ok, env_items = check_environment()
+        errors = [i for i in env_items if i.status == "error"]
+        warnings = [i for i in env_items if i.status == "warning"]
+        if errors or warnings:
+            self._show_env_wizard(errors, warnings)
+
+        versions = "  ".join(
+            f"{i.name}={i.version}" if i.version else i.name
+            for i in env_items
+        )
+        print(f"[env] {versions}")
+        self._env_report = env_items
+
         AppLogger.get_logger().info("应用启动")
 
-        # 环境日志
         for i in env_items:
             icon = "✗" if i.status == "error" else ("⚠" if i.status == "warning" else "✓")
             self._log(f"  {icon} {i.name} {i.version}")
@@ -107,6 +106,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         """关闭窗口时确保 worker 线程终止。"""
+        self._wait_fetch_worker()
+        if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
+            self._validate_cookie_worker.wait(3000)
         if self._worker is not None and self._worker.isRunning():
             self._downloader.cancel()
             self._worker.quit()
@@ -127,70 +129,118 @@ class MainWindow(QMainWindow):
             url.toLocalFile() for url in event.mimeData().urls()
             if url.toLocalFile().lower().endswith((".csv", ".tsv", ".txt"))
         ]
-        if filepaths:
-            self._process_imported_files(filepaths)
+        if not filepaths:
+            return
+        # 单个 cookies.txt 拖拽 → Cookie 导入，避免与 CSV 批量导入冲突
+        if len(filepaths) == 1 and YoutubeDownloader.is_netscape_cookie_file(filepaths[0]):
+            self._apply_cookie_file(filepaths[0])
+            return
+        self._process_imported_files(filepaths)
 
     # ------------------------------------------------------------------
     # 启动向导
     # ------------------------------------------------------------------
 
-    def _show_env_wizard(self, errors: list) -> None:
-        """启动时检测到缺失依赖，致命项强制安装，非致命项可选跳过。"""
-        fatal = [i for i in errors if i.fatal]
-        non_fatal = [i for i in errors if not i.fatal]
+    def _show_env_wizard(
+        self, errors: list, warnings: list | None = None,
+    ) -> None:
+        """启动时检测到缺失依赖：pip 包可自动安装，系统二进制仅提示安装方式。"""
+        warnings = warnings or []
+        pip_errors = [i for i in errors if i.install_kind == "pip"]
+        binary_errors = [i for i in errors if i.install_kind == "binary"]
+        other_errors = [i for i in errors if i.install_kind not in ("pip", "binary")]
+        pip_warnings = [i for i in warnings if i.install_kind == "pip"]
+        binary_warnings = [i for i in warnings if i.install_kind == "binary"]
 
-        # 致命依赖：必须安装
-        if fatal:
-            lines = ["以下依赖缺失，程序无法正常运行：\n"]
+        if pip_errors:
+            lines = ["以下 Python 包缺失：\n"]
             cmds: list[str] = []
-            for i in fatal:
-                lines.append(f"  ✗ {i.name}（必需）")
+            for i in pip_errors:
+                lines.append(f"  x {i.name}")
                 if "pip install" in i.message:
-                    cmds.append(i.message.split("pip install ")[-1].split("）")[0].rstrip(")"))
-            lines.append("\n是否自动安装？")
+                    cmds.append(
+                        i.message.split("pip install ")[-1].split("）")[0].rstrip(")")
+                    )
+            lines.append("\n是否自动 pip 安装？")
             reply = QMessageBox.question(
-                self, "致命依赖缺失", "\n".join(lines),
+                self, "Python 依赖缺失", "\n".join(lines),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.StandardButton.Yes:
+            if reply == QMessageBox.StandardButton.Yes and cmds:
                 self._status_label.setText("正在安装依赖...")
                 for pkg in cmds:
                     self._log(f"pip install {pkg}")
                     try:
                         subprocess.run(
                             [sys.executable, "-m", "pip", "install"] + pkg.split(),
-                            capture_output=True, timeout=120,
+                            capture_output=True, timeout=120, check=False,
                         )
-                        self._log(f"  ✓ {pkg}")
+                        self._log(f"  ok {pkg}")
                     except Exception as exc:
-                        self._log(f"  ✗ {pkg}: {exc}")
+                        self._log(f"  fail {pkg}: {exc}")
                 self._status_label.setText("依赖安装完成，请重启应用")
 
-        # 非致命依赖：可跳过
-        if non_fatal:
+        if binary_errors:
+            lines = ["以下系统工具缺失，无法自动 pip 安装：\n"]
+            for i in binary_errors:
+                lines.append(f"  x {i.name}")
+                if i.message:
+                    lines.append(f"    {i.message.replace(chr(10), chr(10) + '    ')}")
+            lines.append("\n请按上述说明安装后重启应用。")
+            if os.name == "nt":
+                lines.append("\n也可点击 Yes 尝试 winget install Gyan.FFmpeg（需管理员/网络）。")
+                reply = QMessageBox.question(
+                    self, "系统工具缺失", "\n".join(lines),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._status_label.setText("正在通过 winget 安装 ffmpeg...")
+                    self._log("winget install Gyan.FFmpeg")
+                    try:
+                        subprocess.run(
+                            ["winget", "install", "Gyan.FFmpeg",
+                             "--accept-package-agreements", "--accept-source-agreements"],
+                            capture_output=True, timeout=300, check=False,
+                        )
+                        self._status_label.setText("winget 安装完成，请重启应用并刷新 PATH")
+                        self._log("  winget 安装命令已执行，请重启终端后重开应用")
+                    except Exception as exc:
+                        self._log(f"  winget 失败: {exc}")
+            else:
+                QMessageBox.warning(self, "系统工具缺失", "\n".join(lines))
+
+        if other_errors:
+            lines = ["以下依赖缺失：\n"] + [f"  x {i.name}: {i.message}" for i in other_errors]
+            QMessageBox.warning(self, "依赖缺失", "\n".join(lines))
+
+        optional = pip_warnings + binary_warnings
+        if optional:
             lines = ["以下依赖缺失，部分功能不可用：\n"]
             cmds: list[str] = []
-            for i in non_fatal:
-                lines.append(f"  ⚠ {i.name}: {i.message.split('（')[0] if '（' in i.message else i.message}")
-                if "pip install" in i.message:
-                    cmds.append(i.message.split("pip install ")[-1].split("）")[0].rstrip(")"))
-            lines.append("\n安装以启用完整功能？\n（选 No 可跳过，不影响基本下载）")
+            for i in optional:
+                msg = i.message.split("（")[0] if "（" in i.message else i.message
+                lines.append(f"  ! {i.name}: {msg}")
+                if i.install_kind == "pip" and "pip install" in i.message:
+                    cmds.append(
+                        i.message.split("pip install ")[-1].split("）")[0].rstrip(")")
+                    )
+            lines.append("\n安装以启用完整功能？（No 可跳过，不影响基本下载）")
             reply = QMessageBox.question(
                 self, "可选依赖缺失", "\n".join(lines),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.StandardButton.Yes:
+            if reply == QMessageBox.StandardButton.Yes and cmds:
                 for pkg in cmds:
                     self._log(f"pip install {pkg}")
                     try:
                         subprocess.run(
                             [sys.executable, "-m", "pip", "install"] + pkg.split(),
-                            capture_output=True, timeout=120,
+                            capture_output=True, timeout=120, check=False,
                         )
-                        self._log(f"  ✓ {pkg}")
+                        self._log(f"  ok {pkg}")
                     except Exception as exc:
-                        self._log(f"  ✗ {pkg}: {exc}")
-                self._status_label.setText("依赖安装完成，请重启应用")
+                        self._log(f"  fail {pkg}: {exc}")
+                self._status_label.setText("可选依赖安装完成")
 
     # ------------------------------------------------------------------
     # 日志
@@ -237,6 +287,25 @@ class MainWindow(QMainWindow):
         self._refresh_btn.setToolTip("重新获取当前输入的视频信息和格式")
         id_layout.addWidget(self._refresh_btn)
         root.addLayout(id_layout)
+
+        # ---- Cookie 导入 ----
+        cookie_layout = QHBoxLayout()
+        cookie_layout.addWidget(QLabel("Cookie:"))
+        self._cookie_label = QLabel("未配置")
+        self._cookie_label.setWordWrap(True)
+        cookie_layout.addWidget(self._cookie_label, stretch=1)
+        self._import_cookie_btn = QPushButton("导入 Cookie 文件")
+        self._import_cookie_btn.setToolTip(
+            "选择 Netscape 格式的 cookies.txt。\n"
+            "Chrome/Edge 可用扩展「Get cookies.txt LOCALLY」导出。\n"
+            "导入后请重新点击「获取信息」。"
+        )
+        cookie_layout.addWidget(self._import_cookie_btn)
+        self._clear_cookie_btn = QPushButton("清除")
+        self._clear_cookie_btn.setEnabled(False)
+        cookie_layout.addWidget(self._clear_cookie_btn)
+        root.addLayout(cookie_layout)
+        self._update_cookie_ui()
 
         # ---- CSV 批量导入 ----
         csv_layout = QHBoxLayout()
@@ -372,6 +441,8 @@ class MainWindow(QMainWindow):
         """连接控件信号到处理槽。"""
         self._fetch_btn.clicked.connect(self._on_fetch)
         self._refresh_btn.clicked.connect(self._on_refresh)
+        self._import_cookie_btn.clicked.connect(self._on_import_cookie)
+        self._clear_cookie_btn.clicked.connect(self._on_clear_cookie)
         self._load_csv_btn.clicked.connect(self._on_load_csv)
         self._browse_btn.clicked.connect(self._on_browse)
         self._download_btn.clicked.connect(self._on_download)
@@ -513,6 +584,119 @@ class MainWindow(QMainWindow):
     # 槽：获取视频信息
     # ------------------------------------------------------------------
 
+    def _update_window_title(self) -> None:
+        title = self._base_title
+        src = self._downloader.cookie_source()
+        if src:
+            title += f"  |  {src}"
+        self.setWindowTitle(title)
+
+    def _update_cookie_ui(self) -> None:
+        src = self._downloader.cookie_source()
+        if self._downloader._cookiefile_path:  # noqa: SLF001
+            path = self._downloader._cookiefile_path
+            self._cookie_label.setText(f"文件: {path}")
+            self._clear_cookie_btn.setEnabled(True)
+        elif src:
+            self._cookie_label.setText(f"浏览器: {src.removeprefix('browser:')}")
+            self._clear_cookie_btn.setEnabled(False)
+        else:
+            self._cookie_label.setText("未配置（可导入 cookies.txt 或登录浏览器）")
+            self._clear_cookie_btn.setEnabled(False)
+        self._update_window_title()
+
+    def _is_busy(self) -> bool:
+        """是否有后台 fetch / 下载 / cookie 验证在进行。"""
+        if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
+            return True
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            return True
+        if self._worker is not None and self._worker.isRunning():
+            return True
+        return False
+
+    def _wait_fetch_worker(self, timeout_ms: int = 5000) -> None:
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            self._fetch_worker.wait(timeout_ms)
+
+    def _apply_cookie_file(self, filepath: str) -> None:
+        """加载 cookie 文件并后台验证（供按钮与拖拽共用）。"""
+        if self._is_busy():
+            QMessageBox.warning(
+                self, "请稍候",
+                "当前正在获取信息、下载或验证 Cookie，请完成或取消后再导入。",
+            )
+            return
+        try:
+            self._downloader.set_cookiefile(filepath)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "导入失败", str(exc))
+            return
+        self._update_cookie_ui()
+        self._log(f"已导入 Cookie: {filepath}")
+        self._status_label.setText("Cookie 已导入，正在后台验证...")
+        self._import_cookie_btn.setEnabled(False)
+        self._clear_cookie_btn.setEnabled(False)
+        self._start_cookie_validation()
+
+    def _start_cookie_validation(self) -> None:
+        if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
+            return
+        self._validate_cookie_worker = ValidateCookieWorker(self._downloader)
+        self._validate_cookie_worker.finished.connect(self._on_cookie_validated)
+        self._validate_cookie_worker.start()
+
+    def _on_cookie_validated(self, ok: bool, msg: str) -> None:
+        self._import_cookie_btn.setEnabled(True)
+        self._clear_cookie_btn.setEnabled(self._downloader._cookiefile_path is not None)  # noqa: SLF001
+        if ok:
+            self._log(f"  {msg}")
+            self._status_label.setText("Cookie 验证通过，请重新获取视频信息")
+            QMessageBox.information(
+                self, "Cookie 已导入",
+                f"{msg}\n\n请点击「获取信息」刷新格式列表。",
+            )
+        else:
+            self._log(f"  验证未通过: {msg}")
+            self._status_label.setText("Cookie 已加载，验证未通过")
+            QMessageBox.warning(
+                self, "Cookie 验证",
+                msg,
+            )
+
+    def _on_import_cookie(self) -> None:
+        if self._is_busy():
+            QMessageBox.warning(
+                self, "请稍候",
+                "当前正在获取信息、下载或验证 Cookie，请完成或取消后再导入。",
+            )
+            return
+        start_dir = str(Path.home())
+        saved = self._downloader._cookiefile_path  # noqa: SLF001
+        if saved:
+            start_dir = str(saved.parent)
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Cookie 文件 (Netscape cookies.txt)",
+            start_dir,
+            "Cookie 文件 (*.txt *.cookies);;所有文件 (*.*)",
+        )
+        if filepath:
+            self._apply_cookie_file(filepath)
+
+    def _on_clear_cookie(self) -> None:
+        if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
+            QMessageBox.warning(self, "请稍候", "Cookie 验证进行中，请稍后再清除。")
+            return
+        self._downloader.clear_cookiefile()
+        self._update_cookie_ui()
+        self._log("已清除 Cookie 文件，恢复浏览器自动检测")
+        self._status_label.setText("Cookie 已清除")
+
+    # ------------------------------------------------------------------
+    # 槽：获取信息
+    # ------------------------------------------------------------------
+
     def _on_refresh(self) -> None:
         """刷新当前输入的视频信息。"""
         if self._id_input.text().strip():
@@ -548,7 +732,15 @@ class MainWindow(QMainWindow):
         self._status_label.setText("就绪 — 请选择格式后下载")
 
     def _on_fetch_error(self, msg: str) -> None:
-        QMessageBox.critical(self, "获取失败", msg)
+        hint = (
+            "\n\n若 Windows 上无法获取格式，可尝试：\n"
+            "1. 浏览器登录 YouTube\n"
+            "2. 用扩展导出 cookies.txt（Get cookies.txt LOCALLY）\n"
+            "3. 点击「导入 Cookie 文件」后重新获取信息"
+        )
+        if self._downloader._cookiefile_path:  # noqa: SLF001
+            hint = ""
+        QMessageBox.critical(self, "获取失败", msg + hint)
         self._fetch_btn.setEnabled(True)
         self._fetch_btn.setText("获取信息")
         self._status_label.setText("获取失败")

@@ -17,3 +17,5 @@ test_*.csv
 .DS_Store
 .serena/
 .vscode/
+resources/ffmpeg/
+resources/deno/

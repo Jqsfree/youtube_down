@@ -25,16 +25,65 @@ import yt_dlp
 
 from logger_utils import AppLogger
 
+_COOKIE_CONFIG = Path.home() / ".youtube_downloader" / "cookiefile.txt"
+
+# Netscape cookies.txt 常见文件头
+_NETSCAPE_MARKERS = ("# netscape", "# http cookie file")
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+# 工具名 → resources/ 下的子目录（ffmpeg 与 ffprobe 同目录）
+_RESOURCE_DIRS: dict[str, list[str]] = {
+    "ffmpeg": ["ffmpeg"],
+    "ffprobe": ["ffmpeg"],
+    "deno": ["deno"],
+}
+
+
+def _tool_filenames(name: str) -> list[str]:
+    if os.name == "nt":
+        return [f"{name}.exe", name]
+    return [name]
+
+
+def _resolve_tool(name: str) -> str | None:
+    """解析可执行工具绝对路径：MEIPASS → resources/ → PATH。"""
+    for filename in _tool_filenames(name):
+        if getattr(sys, "frozen", False):
+            bundled = os.path.join(sys._MEIPASS, filename)  # noqa: SLF001
+            if os.path.isfile(bundled):
+                return bundled
+
+        for subdir in _RESOURCE_DIRS.get(name, [name]):
+            local = _PROJECT_ROOT / "resources" / subdir / filename
+            if local.is_file():
+                return str(local)
+
+    found = shutil.which(name)
+    if found:
+        return found
+    if os.name == "nt":
+        found = shutil.which(f"{name}.exe")
+        if found:
+            return found
+    return None
+
 
 def _find_tool(name: str) -> str:
-    """PyInstaller 打包后优先找内嵌的二进制，否则回退 PATH。"""
-    if getattr(sys, "frozen", False):
-        candidates = [name, f"{name}.exe"] if os.name == "nt" else [name]
-        for n in candidates:
-            bundled = os.path.join(sys._MEIPASS, n)  # noqa: SLF001
-            if os.path.exists(bundled):
-                return bundled
-    return name
+    """返回可执行文件路径；未找到时回退为 bare name（供 PATH 查找）。"""
+    resolved = _resolve_tool(name)
+    return resolved if resolved else name
+
+
+def _configure_js_runtimes(opts: dict[str, Any]) -> None:
+    """为 YouTube JS 挑战配置 deno/node 路径（Cookie 模式尤其需要）。"""
+    runtimes: dict[str, dict[str, str]] = {}
+    for name in ("deno", "node"):
+        path = _resolve_tool(name)
+        if path:
+            runtimes[name] = {"path": path}
+    if runtimes:
+        opts["js_runtimes"] = runtimes
 
 # 匹配 ANSI 转义序列（颜色码等），用于清理错误消息
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -67,6 +116,7 @@ class EnvItem:
     version: str
     message: str
     fatal: bool = False  # 致命缺失 → 不允许跳过
+    install_kind: str = ""  # "pip" | "binary" | ""
 
 
 def check_environment() -> tuple[bool, list[EnvItem]]:
@@ -79,7 +129,10 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
         ver = str(_ydl.version.__version__) if hasattr(_ydl, 'version') else "?"
         items.append(EnvItem("yt-dlp", "ok", ver, "", fatal=True))
     except ImportError:
-        items.append(EnvItem("yt-dlp", "error", "", "未安装: pip install yt-dlp", fatal=True))
+        items.append(EnvItem(
+            "yt-dlp", "error", "", "未安装: pip install yt-dlp",
+            fatal=True, install_kind="pip",
+        ))
 
     # yt-dlp-ejs
     try:
@@ -87,11 +140,14 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
         ejs_ver = getattr(yt_dlp_ejs, "__version__", "?")
         items.append(EnvItem("yt-dlp-ejs", "ok", str(ejs_ver), ""))
     except ImportError:
-        items.append(EnvItem("yt-dlp-ejs", "error", "",
-            "未安装: pip install yt-dlp-ejs（Cookie 模式下必需）"))
+        items.append(EnvItem(
+            "yt-dlp-ejs", "error", "",
+            "未安装: pip install yt-dlp-ejs（Cookie 模式下必需）",
+            install_kind="pip",
+        ))
 
     # ffmpeg (致命)
-    ffmpeg_path = shutil.which(_find_tool("ffmpeg"))
+    ffmpeg_path = _resolve_tool("ffmpeg")
     if ffmpeg_path:
         try:
             r = subprocess.run(
@@ -102,16 +158,27 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
         except Exception:
             items.append(EnvItem("ffmpeg", "ok", "?", "", fatal=True))
     else:
-        items.append(EnvItem("ffmpeg", "error", "", "未找到 ffmpeg", fatal=True))
+        hint = (
+            "未找到 ffmpeg。\n"
+            "Windows: winget install Gyan.FFmpeg\n"
+            "或运行: powershell -ExecutionPolicy Bypass -File scripts\\setup_dev.ps1\n"
+            "或将 ffmpeg.exe 放入 resources/ffmpeg/"
+        )
+        items.append(EnvItem(
+            "ffmpeg", "error", "", hint, fatal=True, install_kind="binary",
+        ))
 
     # ffprobe
-    if shutil.which(_find_tool("ffprobe")):
+    if _resolve_tool("ffprobe"):
         items.append(EnvItem("ffprobe", "ok", "", ""))
     else:
-        items.append(EnvItem("ffprobe", "warning", "", "未找到 ffprobe，无法校验下载文件"))
+        items.append(EnvItem(
+            "ffprobe", "warning", "", "未找到 ffprobe，无法校验下载文件",
+            install_kind="binary",
+        ))
 
     # deno
-    deno_path = shutil.which(_find_tool("deno"))
+    deno_path = _resolve_tool("deno")
     if deno_path:
         try:
             r = subprocess.run(
@@ -249,14 +316,23 @@ class YoutubeDownloader:
         """
         self._cancelled: bool = False
         self._cancel_lock = threading.Lock()
-        self._cookiefile_path: Path | None = (
-            Path(cookiefile) if cookiefile else None
-        )
+        self._yt_dlp_lock = threading.RLock()
+        self._cookiefile_path: Path | None = None
         self._cookies_spec: str | None = cookies_from_browser
         self._cookie_broken: bool = False  # Cookie 连续失败标记
-        if self._cookies_spec is None and self._cookiefile_path is None:
-            info = self.detect_browser()
-            self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
+        if cookiefile:
+            self.set_cookiefile(cookiefile, persist=False)
+        elif cookies_from_browser == "":
+            self._cookies_spec = None
+        elif cookies_from_browser is None:
+            saved = self._load_saved_cookiefile()
+            if saved:
+                self.set_cookiefile(saved, persist=False)
+            else:
+                info = self.detect_browser()
+                self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
+        else:
+            self._cookies_spec = cookies_from_browser
 
     # ------------------------------------------------------------------
     # 浏览器检测
@@ -373,6 +449,10 @@ class YoutubeDownloader:
             # 版本提醒
             "warn_when_outdated": True,
         }
+        ffmpeg_path = _resolve_tool("ffmpeg")
+        if ffmpeg_path:
+            opts["ffmpeg_location"] = str(Path(ffmpeg_path).parent)
+        _configure_js_runtimes(opts)
         if use_cookies and (self._cookies_spec or self._cookiefile_path):
             if self._cookiefile_path:
                 opts["cookiefile"] = str(self._cookiefile_path)
@@ -405,25 +485,34 @@ class YoutubeDownloader:
         # Cookie 已标记不可用 → 跳过所有 Cookie 尝试
         if self._cookie_broken:
             use_cookies = False
-        # Cookie 模式失败时自动回退无 Cookie（Chrome 锁定等场景）
+        # Cookie 模式失败时自动回退无 Cookie（Chrome 锁定等场景；cookie 文件不回退）
         last_err = None
-        tried_cookie = use_cookies and bool(self._cookies_spec)
-        for attempt in ([True, False] if tried_cookie else [use_cookies]):
-            try:
-                opts = self._make_opts(use_cookies=attempt)
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info and len(info.get("formats", [])) > 0:
-                        if attempt != use_cookies:  # Cookie 回退成功 → 标记
-                            self._cookie_broken = True
-                        return info
-            except Exception as exc:
-                if "copy chrome cookie" in str(exc).lower():
-                    self._cookie_broken = True  # 锁库，后续全跳过 Cookie
-                last_err = exc
-        raise yt_dlp.utils.DownloadError(
-            f"No formats available for: {video_id}"
-        ) from last_err
+        use_browser = use_cookies and bool(self._cookies_spec) and not self._cookiefile_path
+        attempts = [True, False] if use_browser else [use_cookies]
+        with self._yt_dlp_lock:
+            for attempt in attempts:
+                try:
+                    opts = self._make_opts(use_cookies=attempt)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                        if info and len(info.get("formats", [])) > 0:
+                            if attempt != use_cookies:  # Cookie 回退成功 → 标记
+                                self._cookie_broken = True
+                            return info
+                        if info:
+                            last_err = yt_dlp.utils.DownloadError(
+                                "YouTube 返回了视频信息但格式列表为空"
+                            )
+                except Exception as exc:
+                    if "copy chrome cookie" in str(exc).lower():
+                        self._cookie_broken = True  # 锁库，后续全跳过 Cookie
+                    last_err = exc
+        if last_err:
+            detail = clean_error(last_err)
+            raise yt_dlp.utils.DownloadError(
+                f"No formats available for: {video_id} ({detail})"
+            ) from last_err
+        raise yt_dlp.utils.DownloadError(f"No formats available for: {video_id}")
 
     def list_formats(
         self,
@@ -538,58 +627,59 @@ class YoutubeDownloader:
             prefer_ffmpeg=True,
         )
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=True)
-            except Exception as exc:
-                AppLogger.log_exception(exc, f"下载失败: {video_id}")
-                raise
-            if info is None:
-                raise yt_dlp.utils.DownloadError("下载失败：无法获取视频信息")
-            filename: str = ydl.prepare_filename(info)
-            path = Path(filename)
-            if not path.exists():
-                stem = path.stem
-                candidates = list(output_dir.glob(f"{stem}.*"))
-                # 只保留视频/音频扩展名，排除 .json/.jpg/.part 等
-                _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4a", ".mp3"}
-                candidates = [
-                    c for c in candidates if c.suffix.lower() in _VIDEO_EXTS
-                ]
-                if candidates:
-                    path = candidates[0]
-                else:
+        with self._yt_dlp_lock:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                try:
+                    info = ydl.extract_info(url, download=True)
+                except Exception as exc:
+                    AppLogger.log_exception(exc, f"下载失败: {video_id}")
+                    raise
+                if info is None:
+                    raise yt_dlp.utils.DownloadError("下载失败：无法获取视频信息")
+                filename: str = ydl.prepare_filename(info)
+                path = Path(filename)
+                if not path.exists():
+                    stem = path.stem
+                    candidates = list(output_dir.glob(f"{stem}.*"))
+                    # 只保留视频/音频扩展名，排除 .json/.jpg/.part 等
+                    _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4a", ".mp3"}
+                    candidates = [
+                        c for c in candidates if c.suffix.lower() in _VIDEO_EXTS
+                    ]
+                    if candidates:
+                        path = candidates[0]
+                    else:
+                        raise yt_dlp.utils.DownloadError(
+                            f"下载完成但找不到输出文件: {path}"
+                        )
+                # 校验文件大小合理（> 1KB）
+                if path.stat().st_size <= 1024:
                     raise yt_dlp.utils.DownloadError(
-                        f"下载完成但找不到输出文件: {path}"
+                        f"下载文件过小 ({path.stat().st_size} bytes): {path}"
                     )
-            # 校验文件大小合理（> 1KB）
-            if path.stat().st_size <= 1024:
-                raise yt_dlp.utils.DownloadError(
-                    f"下载文件过小 ({path.stat().st_size} bytes): {path}"
-                )
 
-            # 校验文件是有效媒体（ffprobe 解析 + 时长比对）
-            ffprobe_result = subprocess.run(
-                [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
-                 "format=duration", "-of", "csv=p=0", str(path)],
-                capture_output=True, text=True, timeout=30,
-            )
-            if ffprobe_result.returncode != 0 or not ffprobe_result.stdout.strip():
-                raise yt_dlp.utils.DownloadError(
-                    f"下载文件无法解析为有效媒体: {path}"
+                # 校验文件是有效媒体（ffprobe 解析 + 时长比对）
+                ffprobe_result = subprocess.run(
+                    [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
+                     "format=duration", "-of", "csv=p=0", str(path)],
+                    capture_output=True, text=True, timeout=30,
                 )
-            actual_duration = float(ffprobe_result.stdout.strip())
-            expected_duration = float(info.get("duration") or 0)
-            if (
-                expected_duration > 0
-                and abs(actual_duration - expected_duration) / expected_duration > 0.05
-            ):
-                raise yt_dlp.utils.DownloadError(
-                    f"下载文件时长异常: 期望 {expected_duration:.0f}s,"
-                    f" 实际 {actual_duration:.0f}s (可能是合并中断)"
-                )
+                if ffprobe_result.returncode != 0 or not ffprobe_result.stdout.strip():
+                    raise yt_dlp.utils.DownloadError(
+                        f"下载文件无法解析为有效媒体: {path}"
+                    )
+                actual_duration = float(ffprobe_result.stdout.strip())
+                expected_duration = float(info.get("duration") or 0)
+                if (
+                    expected_duration > 0
+                    and abs(actual_duration - expected_duration) / expected_duration > 0.05
+                ):
+                    raise yt_dlp.utils.DownloadError(
+                        f"下载文件时长异常: 期望 {expected_duration:.0f}s,"
+                        f" 实际 {actual_duration:.0f}s (可能是合并中断)"
+                    )
 
-            return path
+                return path
 
     @staticmethod
     def cleanup_partial_files(output_dir: Path) -> None:
@@ -613,22 +703,145 @@ class YoutubeDownloader:
     # Cookie 管理
     # ------------------------------------------------------------------
 
-    def validate_cookies(self) -> tuple[bool, str]:
-        """启动时验证 Cookie 是否真的可用（非空、YouTube 接受）。
-
-        用一个已知公开视频做测试提取，确认 Cookie 未被拒绝、
-        JS 挑战能正常解决、能拿到可用格式列表。
-        """
-        if not self._cookies_spec:
-            return False, "未配置浏览器 Cookie"
+    @staticmethod
+    def _load_saved_cookiefile() -> Path | None:
+        if not _COOKIE_CONFIG.is_file():
+            return None
         try:
-            info = self.get_info("dQw4w9WgXcQ", use_cookies=True)
+            path = Path(_COOKIE_CONFIG.read_text(encoding="utf-8").strip())
+        except OSError:
+            return None
+        return path if path.is_file() else None
+
+    @staticmethod
+    def _persist_cookiefile(path: Path | None) -> None:
+        try:
+            if path is None:
+                if _COOKIE_CONFIG.is_file():
+                    _COOKIE_CONFIG.unlink()
+                return
+            _COOKIE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            _COOKIE_CONFIG.write_text(str(path.resolve()), encoding="utf-8")
+        except OSError:
+            pass
+
+    def cookie_source(self) -> str:
+        """当前 Cookie 来源描述（用于 UI 显示）。"""
+        if self._cookiefile_path:
+            return f"file:{self._cookiefile_path.name}"
+        if self._cookies_spec:
+            return f"browser:{self._cookies_spec}"
+        return ""
+
+    @staticmethod
+    def is_netscape_cookie_file(path: str | Path) -> bool:
+        """快速判断是否为 Netscape cookies.txt（本地校验，不访问网络）。"""
+        cookie_path = Path(path)
+        if not cookie_path.is_file() or cookie_path.stat().st_size == 0:
+            return False
+        try:
+            head = cookie_path.read_text(encoding="utf-8", errors="replace")[:4096].lower()
+        except OSError:
+            return False
+        if "youtube.com" not in head:
+            return False
+        return any(m in head for m in _NETSCAPE_MARKERS) or "\t" in head
+
+    @staticmethod
+    def validate_cookie_file(path: str | Path) -> tuple[bool, str]:
+        """本地校验 cookie 文件格式（不访问网络）。"""
+        cookie_path = Path(path).expanduser()
+        if not cookie_path.is_file():
+            return False, f"文件不存在: {cookie_path}"
+        if cookie_path.stat().st_size == 0:
+            return False, "文件为空"
+        try:
+            text = cookie_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return False, f"无法读取文件: {exc}"
+        lower = text.lower()
+        if "youtube.com" not in lower:
+            return False, "文件中未找到 youtube.com 的 Cookie（请从已登录 YouTube 的浏览器导出）"
+        if not YoutubeDownloader.is_netscape_cookie_file(cookie_path):
+            return False, (
+                "不是 Netscape cookies.txt 格式。\n"
+                "请使用扩展「Get cookies.txt LOCALLY」导出，勿使用 JSON 格式。"
+            )
+        return True, "格式校验通过"
+
+    def set_cookiefile(self, path: str | Path, *, persist: bool = True) -> None:
+        """设置 Netscape 格式 cookie 文件（优先于浏览器 Cookie）。"""
+        cookie_path = Path(path).expanduser().resolve()
+        ok, msg = self.validate_cookie_file(cookie_path)
+        if not ok:
+            raise ValueError(msg)
+        self._cookiefile_path = cookie_path
+        self._cookies_spec = None
+        self._cookie_broken = False
+        if persist:
+            self._persist_cookiefile(cookie_path)
+
+    def clear_cookiefile(self, *, persist: bool = True) -> None:
+        """清除 cookie 文件，恢复自动检测浏览器 Cookie。"""
+        self._cookiefile_path = None
+        self._cookie_broken = False
+        if persist:
+            self._persist_cookiefile(None)
+        info = self.detect_browser()
+        self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
+
+    def validate_cookies(self) -> tuple[bool, str]:
+        """联网探测 Cookie 是否能让 YouTube 返回格式列表。"""
+        if not self._cookiefile_path and not self._cookies_spec:
+            return False, "未配置 Cookie"
+
+        using_file = bool(self._cookiefile_path)
+        if using_file and not _resolve_tool("deno") and not _resolve_tool("node"):
+            return False, (
+                "未检测到 deno 或 node.js。\n"
+                "Cookie 模式需要 JS 运行时才能通过 YouTube 验证。\n"
+                "请运行: powershell -ExecutionPolicy Bypass -File scripts\\setup_dev.ps1\n"
+                "或: winget install Denoland.Deno\n"
+                "安装后重启应用再试。"
+            )
+
+        test_id = "dQw4w9WgXcQ"
+        cookie_err: Exception | None = None
+        try:
+            info = self.get_info(test_id, use_cookies=True)
             n = len(info.get("formats", []))
-            if n == 0:
-                return False, "Cookie 有效但 YouTube 未返回视频格式"
-            return True, f"Cookie 验证通过 ({n} formats)"
+            return True, f"Cookie 验证通过 ({n} formats, {self.cookie_source()})"
         except Exception as exc:
-            return False, f"Cookie 验证失败: {clean_error(exc)}"
+            cookie_err = exc
+
+        # 对比：无 Cookie 是否能获取格式
+        try:
+            info_no = self.get_info(test_id, use_cookies=False)
+            if len(info_no.get("formats", [])) > 0:
+                detail = clean_error(cookie_err) if cookie_err else "未知错误"
+                return False, (
+                    f"Cookie 未能改善访问（不使用 Cookie 反而能获取格式）。\n"
+                    f"可能 cookies.txt 已过期或导出不完整。\n"
+                    f"详情: {detail}\n"
+                    "请重新登录 YouTube 后导出新的 cookies.txt。"
+                )
+        except Exception:
+            pass
+
+        detail = clean_error(cookie_err) if cookie_err else "YouTube 未返回格式"
+        hints: list[str] = []
+        if using_file:
+            hints.append("确认 cookies.txt 来自已登录 YouTube 的浏览器（扩展 Get cookies.txt LOCALLY）")
+        if "bot" in detail.lower() or "sign in" in detail.lower():
+            hints.append("YouTube 仍要求验证，请重新导出 Cookie 或换网络/IP 后重试")
+        if _resolve_tool("deno") or _resolve_tool("node"):
+            hints.append("已检测到 JS 运行时，若仍失败多为 Cookie 过期")
+        hint_text = "\n".join(f"- {h}" for h in hints) if hints else ""
+        msg = f"Cookie 验证失败: {detail}"
+        if hint_text:
+            msg += f"\n{hint_text}"
+        msg += "\n\nCookie 文件已加载，仍可直接点击「获取信息」测试目标视频。"
+        return False, msg
 
     def redetect_browser(self) -> bool:
         """重新检测浏览器（Profile 可能已切换）。
