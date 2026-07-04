@@ -1,5 +1,5 @@
-# Windows 本地测试脚本
-# 用法:
+﻿# Windows local test script
+# Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -LaunchGui
 #   powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
@@ -20,60 +20,60 @@ function Write-Step([string]$Message) {
 
 function Assert-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
-        throw "未找到 $Name，请先安装并加入 PATH。"
+        throw "Command not found: $Name. Install it and add to PATH."
     }
 }
 
-Write-Step "检查 Python"
+Write-Step "Check Python"
 Assert-Command python
 $pyVersion = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 Write-Host "Python $pyVersion"
 if ([double]$pyVersion -lt 3.11) {
-    throw "需要 Python 3.11 或更高版本。"
+    throw "Python 3.11+ is required."
 }
 
-Write-Step "安装依赖"
+Write-Step "Install dependencies"
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pytest
 
-Write-Step "检查 ffmpeg / ffprobe"
+Write-Step "Check ffmpeg / ffprobe"
 $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
 $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
 if (-not $ffmpeg) {
-    Write-Host "警告: 未找到 ffmpeg。请安装后加入 PATH，或放到 resources\ffmpeg\ 目录。" -ForegroundColor Yellow
+    Write-Host "Warning: ffmpeg not found. Add to PATH or place under resources\ffmpeg\" -ForegroundColor Yellow
 } else {
     ffmpeg -version | Select-Object -First 1
 }
 if (-not $ffprobe) {
-    Write-Host "警告: 未找到 ffprobe，下载后校验功能会受限。" -ForegroundColor Yellow
+    Write-Host "Warning: ffprobe not found. Post-download validation may be limited." -ForegroundColor Yellow
 }
 
-Write-Step "运行单元测试"
+Write-Step "Run unit tests"
 python -m pytest tests/ -v
 if ($LASTEXITCODE -ne 0) {
-    throw "单元测试失败。"
+    throw "Unit tests failed."
 }
 
 if (-not $SkipNetwork) {
-    Write-Step "运行冒烟测试 (get_info)"
+    Write-Step "Run smoke test (get_info)"
     python smoke_test.py
     if ($LASTEXITCODE -ne 0) {
-        throw "冒烟测试失败。"
+        throw "Smoke test failed."
     }
 } else {
-    Write-Host "已跳过网络冒烟测试 (-SkipNetwork)。"
+    Write-Host "Skipped network smoke test (-SkipNetwork)."
 }
 
-Write-Step "GUI 初始化检查"
+Write-Step "GUI init check"
 python -c "import sys; from PySide6.QtWidgets import QApplication; from gui import MainWindow; app = QApplication(sys.argv); w = MainWindow(); print('GUI init OK:', w.windowTitle())"
 if ($LASTEXITCODE -ne 0) {
-    throw "GUI 初始化失败。"
+    throw "GUI init failed."
 }
 
 Write-Host ""
-Write-Host "全部测试通过。" -ForegroundColor Green
+Write-Host "All tests passed." -ForegroundColor Green
 
 if ($LaunchGui) {
-    Write-Step "启动 GUI"
+    Write-Step "Launch GUI"
     python main.py
 }

@@ -36,6 +36,8 @@ powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
 
 也可以双击 `scripts\win_test.bat`。
 
+> 若 PowerShell 报中文乱码或解析错误，请确保使用最新版 `scripts/win_test.ps1`（脚本输出为英文，避免 Windows 编码问题）。
+
 ### 前置条件
 
 | 组件 | 说明 |
