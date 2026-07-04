@@ -20,7 +20,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pyside6 yt-dlp yt-dlp-ejs pyinstaller
+          pip install -r requirements.txt pytest pyinstaller
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -v
 
       - name: Install deno
         run: |

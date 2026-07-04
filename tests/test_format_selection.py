@@ -1,6 +1,5 @@
 from downloader import YoutubeDownloader
 from gui import MainWindow
-from worker import FormatAnalyzer
 
 
 def test_resolve_format_prefers_minimum_height():
@@ -63,4 +62,4 @@ def test_worker_resolve_format_rejects_below_threshold():
     }
 
     worker._downloader = downloader
-    assert worker._resolve_format(info) == "2"
+    assert worker._resolve_format(info) == ("2", False)

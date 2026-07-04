@@ -19,7 +19,45 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## 使用
+## Windows 本地测试
+
+在项目根目录打开 **PowerShell** 或 **命令提示符**，执行：
+
+```powershell
+# 一键测试：安装依赖 + 单元测试 + 冒烟测试 + GUI 初始化
+powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1
+
+# 测试通过后直接启动 GUI
+powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -LaunchGui
+
+# 离线环境（跳过需要网络的 get_info 测试）
+powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
+```
+
+也可以双击 `scripts\win_test.bat`。
+
+### 前置条件
+
+| 组件 | 说明 |
+|------|------|
+| Python 3.11+ | [python.org](https://www.python.org/downloads/) 安装时勾选 "Add to PATH" |
+| ffmpeg | 加入 PATH，或解压到 `resources\ffmpeg\` |
+| 网络 | 冒烟测试会请求 YouTube 获取视频信息 |
+
+可选（Cookie 重试模式）：
+
+- **deno**：Cookie 模式下 YouTube JS 挑战需要
+- **Chrome/Edge**：用于读取浏览器 Cookie
+
+### 手动分步测试
+
+```powershell
+python -m pip install -r requirements.txt pytest
+python -m pytest tests/ -v
+python smoke_test.py
+python main.py
+```
+
 
 1. 输入 YouTube Video ID（例如 `dQw4w9WgXcQ`）
 2. 点击 **获取信息** 查看视频详情和可用格式
