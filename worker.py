@@ -22,11 +22,21 @@ from downloader import ErrorCategory, YoutubeDownloader, _find_tool, classify_er
 from logger_utils import AppLogger
 
 
+def _media_stem(source: str) -> str:
+    try:
+        media = YoutubeDownloader.parse_input(source)
+        stem = media.media_id
+    except Exception:
+        stem = source
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)
+
+
 def _check_existing(video_id: str, output_dir: Path) -> Path | None:
     """检查输出目录是否已有此视频的有效文件（用于去重）。"""
     import subprocess as _sp
+    stem = _media_stem(video_id)
     for ext in (".mp4", ".webm", ".mkv", ".m4a"):
-        candidate = output_dir / f"{video_id}{ext}"
+        candidate = output_dir / f"{stem}{ext}"
         if not candidate.is_file() or candidate.stat().st_size <= 1024:
             continue
         try:
@@ -279,8 +289,8 @@ class BatchDownloadWorker(QThread):
         self._last_results_csv = csv_path
         _csv_file = open(csv_path, "w", newline="", encoding="utf-8")
         _csv_writer = _csv.DictWriter(_csv_file, fieldnames=[
-            "video_id", "title", "status", "error_category",
-            "error_message", "cookie_used", "output_dir",
+            "video_id", "platform", "source_url", "title", "status",
+            "error_category", "error_message", "cookie_used", "output_dir",
         ])
         _csv_writer.writeheader()
 
@@ -322,7 +332,10 @@ class BatchDownloadWorker(QThread):
                                      category.code, clean_error(Exception(error_msg)), cookie_used)
 
                 results.append({
-                    "video_id": vid, "status": status,
+                    "video_id": vid,
+                    "platform": self._platform_for_source(vid),
+                    "source_url": self._url_for_source(vid),
+                    "status": status,
                     "error_category": category.code,
                     "error_message": clean_error(Exception(error_msg)),
                     "cookie_used": str(cookie_used).lower(),
@@ -354,13 +367,31 @@ class BatchDownloadWorker(QThread):
                 pass
         return completed
 
+    @staticmethod
+    def _platform_for_source(source: str) -> str:
+        try:
+            return YoutubeDownloader.parse_input(source).platform
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _url_for_source(source: str) -> str:
+        try:
+            return YoutubeDownloader.parse_input(source).url
+        except Exception:
+            return source
+
     def _append_csv(
         self, writer: Any, f: Any, vid: str, title: str, status: str,
         category: str, error_msg: str, cookie_used: bool,
     ) -> None:
         """增量写入一行结果到 CSV。"""
         writer.writerow({
-            "video_id": vid, "title": title, "status": status,
+            "video_id": vid,
+            "platform": self._platform_for_source(vid),
+            "source_url": self._url_for_source(vid),
+            "title": title,
+            "status": status,
             "error_category": category, "error_message": error_msg,
             "cookie_used": str(cookie_used).lower(),
             "output_dir": str(self._output_dir),
@@ -515,8 +546,8 @@ class BatchDownloadWorker(QThread):
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv_module.DictWriter(
                     f, fieldnames=[
-                        "video_id", "title", "status", "error_category",
-                        "error_message", "cookie_used", "output_dir",
+                        "video_id", "platform", "source_url", "title", "status",
+                        "error_category", "error_message", "cookie_used", "output_dir",
                     ]
                 )
                 writer.writeheader()
@@ -527,8 +558,8 @@ class BatchDownloadWorker(QThread):
                 with open(fallback, "w", newline="", encoding="utf-8") as f:
                     writer = csv_module.DictWriter(
                         f, fieldnames=[
-                            "video_id", "status", "error_category",
-                            "error_message", "cookie_used", "output_dir",
+                            "video_id", "platform", "source_url", "status",
+                            "error_category", "error_message", "cookie_used", "output_dir",
                         ]
                     )
                     writer.writeheader()
@@ -542,7 +573,12 @@ class BatchDownloadWorker(QThread):
     def _write_skipped_csv(self, results: list[dict[str, str]]) -> str:
         """导出低于阈值被跳过的视频 ID。"""
         skipped = [
-            {"video_id": item["video_id"], "reason": item["error_message"]}
+            {
+                "video_id": item["video_id"],
+                "platform": item.get("platform", ""),
+                "source_url": item.get("source_url", ""),
+                "reason": item["error_message"],
+            }
             for item in results if item.get("status") == "skipped"
         ]
         if not skipped:
@@ -555,7 +591,7 @@ class BatchDownloadWorker(QThread):
         path = str(self._results_dir / f"skipped_videos_{timestamp}.csv")
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv_module.DictWriter(f, fieldnames=["video_id", "reason"])
+                writer = csv_module.DictWriter(f, fieldnames=["video_id", "platform", "source_url", "reason"])
                 writer.writeheader()
                 writer.writerows(skipped)
         except OSError:
@@ -565,7 +601,12 @@ class BatchDownloadWorker(QThread):
     def _write_failed_csv(self, results: list[dict[str, str]]) -> str:
         """导出下载失败的视频 ID，便于重新下载。"""
         failed = [
-            {"video_id": item["video_id"], "reason": item["error_message"]}
+            {
+                "video_id": item["video_id"],
+                "platform": item.get("platform", ""),
+                "source_url": item.get("source_url", ""),
+                "reason": item["error_message"],
+            }
             for item in results if item.get("status") == "failed"
         ]
         if not failed:
@@ -578,7 +619,7 @@ class BatchDownloadWorker(QThread):
         path = str(self._results_dir / f"failed_videos_{timestamp}.csv")
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv_module.DictWriter(f, fieldnames=["video_id", "reason"])
+                writer = csv_module.DictWriter(f, fieldnames=["video_id", "platform", "source_url", "reason"])
                 writer.writeheader()
                 writer.writerows(failed)
         except OSError:

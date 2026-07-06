@@ -21,6 +21,18 @@ def cookie_txt(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def bilibili_cookie_txt(tmp_path: Path) -> Path:
+    path = tmp_path / "bilibili_cookies.txt"
+    path.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".bilibili.com\tTRUE\t/\tTRUE\t1893456000\tSESSDATA\ttest\n"
+        ".bilibili.com\tTRUE\t/\tTRUE\t1893456000\tbili_jct\tcsrf\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_set_cookiefile_clears_browser_spec(cookie_txt: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         YoutubeDownloader, "detect_browser", staticmethod(lambda: ("edge", "Default"))
@@ -30,8 +42,9 @@ def test_set_cookiefile_clears_browser_spec(cookie_txt: Path, monkeypatch: pytes
 
     dl.set_cookiefile(cookie_txt, persist=False)
     assert dl._cookiefile_path == cookie_txt.resolve()
+    assert dl._cookiefile_platform == "youtube"
     assert dl._cookies_spec is None
-    assert dl.cookie_source() == f"file:{cookie_txt.name}"
+    assert dl.cookie_source() == f"YouTube:{cookie_txt.name}"
 
 
 def test_clear_cookiefile_redetects_browser(cookie_txt: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,6 +62,13 @@ def test_persist_cookiefile(tmp_path: Path, cookie_txt: Path, monkeypatch: pytes
     config_dir = tmp_path / "cfg"
     config_file = config_dir / "cookiefile.txt"
     monkeypatch.setattr("downloader._COOKIE_CONFIG", config_file)
+    monkeypatch.setattr(
+        "downloader._PLATFORM_COOKIE_CONFIGS",
+        {
+            "youtube": config_dir / "youtube_cookiefile.txt",
+            "bilibili": config_dir / "bilibili_cookiefile.txt",
+        },
+    )
     monkeypatch.setattr(
         YoutubeDownloader, "detect_browser", staticmethod(lambda: None)
     )
@@ -72,7 +92,21 @@ def test_validate_cookie_file_rejects_json(tmp_path: Path) -> None:
     bad.write_text('{"cookies": []}', encoding="utf-8")
     ok, msg = YoutubeDownloader.validate_cookie_file(bad)
     assert not ok
-    assert "youtube.com" in msg or "Netscape" in msg
+    assert "youtube.com" in msg or "bilibili.com" in msg or "Netscape" in msg
+
+
+def test_set_bilibili_cookiefile_sets_platform(bilibili_cookie_txt: Path) -> None:
+    dl = YoutubeDownloader(cookies_from_browser="")
+    dl.set_cookiefile(bilibili_cookie_txt, persist=False)
+    assert dl._cookiefile_path == bilibili_cookie_txt.resolve()
+    assert dl._cookiefile_platform == "bilibili"
+    assert dl.cookie_source() == f"Bilibili:{bilibili_cookie_txt.name}"
+
+
+def test_validate_cookie_file_accepts_bilibili(bilibili_cookie_txt: Path) -> None:
+    ok, msg = YoutubeDownloader.validate_cookie_file(bilibili_cookie_txt)
+    assert ok
+    assert "Bilibili" in msg
 
 
 def test_validate_cookies_requires_deno_for_file(cookie_txt: Path, monkeypatch: pytest.MonkeyPatch) -> None:

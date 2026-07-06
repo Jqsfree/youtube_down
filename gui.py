@@ -71,7 +71,7 @@ class MainWindow(QMainWindow):
         spec = self._downloader._cookies_spec  # noqa: SLF001
         ver = Path(__file__).parent / "VERSION"
         ver_str = ver.read_text().strip() if ver.exists() else "dev"
-        self._base_title = f"YouTube Downloader v{ver_str}"
+        self._base_title = f"Multi-Platform Downloader v{ver_str}"
         self._update_window_title()
         self.resize(900, 720)
         self.setAcceptDrops(True)
@@ -275,11 +275,13 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ---- Video ID 输入区 ----
+        # ---- 视频来源输入区 ----
         id_layout = QHBoxLayout()
-        id_layout.addWidget(QLabel("Video ID:"))
+        id_layout.addWidget(QLabel("视频链接 / ID:"))
         self._id_input = QLineEdit()
-        self._id_input.setPlaceholderText("输入 YouTube Video ID，例如 dQw4w9WgXcQ")
+        self._id_input.setPlaceholderText(
+            "YouTube ID/URL 或 Bilibili BV/av/URL，例如 dQw4w9WgXcQ / BV1GJ411x7h7"
+        )
         id_layout.addWidget(self._id_input)
         self._fetch_btn = QPushButton("获取信息")
         id_layout.addWidget(self._fetch_btn)
@@ -297,7 +299,7 @@ class MainWindow(QMainWindow):
         self._import_cookie_btn = QPushButton("导入 Cookie 文件")
         self._import_cookie_btn.setToolTip(
             "选择 Netscape 格式的 cookies.txt。\n"
-            "Chrome/Edge 可用扩展「Get cookies.txt LOCALLY」导出。\n"
+            "支持 YouTube 或 Bilibili Cookie；Chrome/Edge 可用扩展「Get cookies.txt LOCALLY」导出。\n"
             "导入后请重新点击「获取信息」。"
         )
         cookie_layout.addWidget(self._import_cookie_btn)
@@ -314,7 +316,7 @@ class MainWindow(QMainWindow):
         csv_layout.addWidget(self._load_csv_btn)
         csv_layout.addWidget(QLabel("字段:"))
         self._csv_column_input = QLineEdit()
-        self._csv_column_input.setPlaceholderText("如 video_id / id / url")
+        self._csv_column_input.setPlaceholderText("如 video_id / source / bvid / aid / url")
         self._csv_column_input.setText("video_id")
         self._csv_column_input.setMaximumWidth(180)
         csv_layout.addWidget(self._csv_column_input)
@@ -520,7 +522,7 @@ class MainWindow(QMainWindow):
         total = sum(len(ids) for _, ids, _ in self._csv_queue)
         parts = " → ".join(f"{name}({len(ids)})" for name, ids, _ in self._csv_queue)
         self._csv_label.setText(
-            f"队列 {len(self._csv_queue)} 组 / 共 {total} 个 Video ID（依据列: {import_column}）"
+            f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频（依据列: {import_column}）"
         )
         self._refresh_imported_files_list(self._csv_queue)
         self._log(f"加载队列: {parts}")
@@ -595,13 +597,15 @@ class MainWindow(QMainWindow):
         src = self._downloader.cookie_source()
         if self._downloader._cookiefile_path:  # noqa: SLF001
             path = self._downloader._cookiefile_path
-            self._cookie_label.setText(f"文件: {path}")
+            platform = self._downloader._cookiefile_platform  # noqa: SLF001
+            label = YoutubeDownloader._platform_label(platform) if platform else "自动"
+            self._cookie_label.setText(f"文件 ({label}): {path}")
             self._clear_cookie_btn.setEnabled(True)
         elif src:
             self._cookie_label.setText(f"浏览器: {src.removeprefix('browser:')}")
             self._clear_cookie_btn.setEnabled(False)
         else:
-            self._cookie_label.setText("未配置（可导入 cookies.txt 或登录浏览器）")
+            self._cookie_label.setText("未配置（可导入 YouTube/Bilibili cookies.txt 或登录浏览器）")
             self._clear_cookie_btn.setEnabled(False)
         self._update_window_title()
 
@@ -702,13 +706,13 @@ class MainWindow(QMainWindow):
         if self._id_input.text().strip():
             self._on_fetch()
         else:
-            QMessageBox.information(self, "提示", "先输入 Video ID 再刷新")
+            QMessageBox.information(self, "提示", "先输入视频链接或 ID 再刷新")
 
     def _on_fetch(self) -> None:
         """后台获取视频信息（不卡 GUI）。"""
         video_id = self._id_input.text().strip()
         if not video_id:
-            QMessageBox.warning(self, "提示", "请输入 Video ID")
+            QMessageBox.warning(self, "提示", "请输入视频链接或 ID")
             return
 
         self._video_id = video_id
@@ -734,8 +738,8 @@ class MainWindow(QMainWindow):
     def _on_fetch_error(self, msg: str) -> None:
         hint = (
             "\n\n若 Windows 上无法获取格式，可尝试：\n"
-            "1. 浏览器登录 YouTube\n"
-            "2. 用扩展导出 cookies.txt（Get cookies.txt LOCALLY）\n"
+            "1. 浏览器登录对应平台（YouTube / Bilibili）\n"
+            "2. 用扩展导出该平台 cookies.txt（Get cookies.txt LOCALLY）\n"
             "3. 点击「导入 Cookie 文件」后重新获取信息"
         )
         if self._downloader._cookiefile_path:  # noqa: SLF001
@@ -751,10 +755,11 @@ class MainWindow(QMainWindow):
         uploader = info.get("uploader") or info.get("channel") or "—"
         duration = info.get("duration") or 0
         duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "—"
+        platform = info.get("_platform") or "—"
 
         self._title_label.setText(f"Title: {title}")
         self._uploader_label.setText(f"Uploader: {uploader}")
-        self._duration_label.setText(f"Duration: {duration_str}")
+        self._duration_label.setText(f"Duration: {duration_str}  |  Platform: {platform}")
 
     def _show_formats(self, video_id: str, info: dict[str, Any]) -> None:
         """填充格式列表 QTreeWidget。"""

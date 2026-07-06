@@ -20,12 +20,27 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
 from logger_utils import AppLogger
 
-_COOKIE_CONFIG = Path.home() / ".youtube_downloader" / "cookiefile.txt"
+_COOKIE_CONFIG_DIR = Path.home() / ".youtube_downloader"
+_COOKIE_CONFIG = _COOKIE_CONFIG_DIR / "cookiefile.txt"
+_PLATFORM_COOKIE_CONFIGS = {
+    "youtube": _COOKIE_CONFIG_DIR / "youtube_cookiefile.txt",
+    "bilibili": _COOKIE_CONFIG_DIR / "bilibili_cookiefile.txt",
+}
+_PLATFORM_COOKIE_DOMAINS = {
+    "youtube": ("youtube.com", "youtu.be"),
+    "bilibili": ("bilibili.com", "b23.tv"),
+}
+_PLATFORM_LABELS = {
+    "youtube": "YouTube",
+    "bilibili": "Bilibili",
+    "generic": "Generic",
+}
 
 # Netscape cookies.txt 常见文件头
 _NETSCAPE_MARKERS = ("# netscape", "# http cookie file")
@@ -117,6 +132,20 @@ class EnvItem:
     message: str
     fatal: bool = False  # 致命缺失 → 不允许跳过
     install_kind: str = ""  # "pip" | "binary" | ""
+
+
+@dataclass(frozen=True)
+class MediaInput:
+    """Normalized media source resolved from a user-provided ID or URL."""
+
+    platform: str
+    original: str
+    media_id: str
+    url: str
+
+    @property
+    def label(self) -> str:
+        return _PLATFORM_LABELS.get(self.platform, self.platform)
 
 
 def check_environment() -> tuple[bool, list[EnvItem]]:
@@ -318,6 +347,8 @@ class YoutubeDownloader:
         self._cancel_lock = threading.Lock()
         self._yt_dlp_lock = threading.RLock()
         self._cookiefile_path: Path | None = None
+        self._cookiefile_platform: str | None = None
+        self._platform_cookiefiles: dict[str, Path] = {}
         self._cookies_spec: str | None = cookies_from_browser
         self._cookie_broken: bool = False  # Cookie 连续失败标记
         if cookiefile:
@@ -325,7 +356,8 @@ class YoutubeDownloader:
         elif cookies_from_browser == "":
             self._cookies_spec = None
         elif cookies_from_browser is None:
-            saved = self._load_saved_cookiefile()
+            self._platform_cookiefiles = self._load_saved_cookiefiles()
+            saved = self._platform_cookiefiles.get("youtube") or self._load_saved_cookiefile()
             if saved:
                 self.set_cookiefile(saved, persist=False)
             else:
@@ -337,6 +369,77 @@ class YoutubeDownloader:
     # ------------------------------------------------------------------
     # 浏览器检测
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def parse_input(value: str) -> MediaInput:
+        """解析 YouTube / Bilibili ID 或 URL，返回 yt-dlp 可直接使用的 URL。"""
+        text = (value or "").strip()
+        if not text:
+            raise ValueError("请输入视频链接或 ID")
+        text = text.replace("\\", "/")
+        normalized = text
+        if re.match(r"^(www\.|m\.|b23\.tv|bilibili\.com|youtube\.com|youtu\.be)", normalized, re.I):
+            normalized = f"https://{normalized}"
+
+        parsed = urlparse(normalized)
+        host = parsed.netloc.lower()
+        path = parsed.path or ""
+
+        if host.endswith("youtu.be"):
+            media_id = path.strip("/").split("/")[0]
+            if media_id:
+                return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+        if "youtube.com" in host:
+            query = parse_qs(parsed.query)
+            media_id = (query.get("v") or [""])[0]
+            if not media_id:
+                match = re.search(r"/(?:shorts|embed|v)/([A-Za-z0-9_-]{11})", path)
+                media_id = match.group(1) if match else ""
+            if media_id:
+                return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+
+        if "bilibili.com" in host or host.endswith("b23.tv"):
+            media_id = YoutubeDownloader._extract_bilibili_id(normalized) or normalized
+            return MediaInput("bilibili", text, media_id, normalized)
+
+        bili_id = YoutubeDownloader._extract_bilibili_id(text)
+        if bili_id:
+            url_id = bili_id
+            return MediaInput("bilibili", text, bili_id, f"https://www.bilibili.com/video/{url_id}")
+
+        yt_match = re.search(r"^([A-Za-z0-9_-]{11})$", text)
+        if yt_match:
+            media_id = yt_match.group(1)
+            return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+
+        if parsed.scheme in {"http", "https"} and host:
+            return MediaInput("generic", text, normalized, normalized)
+
+        # Preserve historical behavior: unknown bare values are treated as YouTube IDs.
+        return MediaInput("youtube", text, text, f"https://www.youtube.com/watch?v={text}")
+
+    @staticmethod
+    def _extract_bilibili_id(value: str) -> str:
+        bv_match = re.search(r"\b(BV[0-9A-Za-z]{10})\b", value, flags=re.I)
+        if bv_match:
+            raw = bv_match.group(1)
+            return "BV" + raw[2:]
+        av_match = re.search(r"\bav(\d+)\b", value, flags=re.I)
+        if av_match:
+            return f"av{av_match.group(1)}"
+        return ""
+
+    @staticmethod
+    def _platform_label(platform: str) -> str:
+        return _PLATFORM_LABELS.get(platform, platform)
+
+    @staticmethod
+    def _cookie_platform_from_text(text: str) -> str | None:
+        lower = text.lower()
+        for platform, domains in _PLATFORM_COOKIE_DOMAINS.items():
+            if any(domain in lower for domain in domains):
+                return platform
+        return None
 
     @staticmethod
     def detect_browser() -> tuple[str, str] | None:
@@ -420,7 +523,12 @@ class YoutubeDownloader:
     # 内部：构建 yt-dlp 选项
     # ------------------------------------------------------------------
 
-    def _make_opts(self, use_cookies: bool = True, **extra: Any) -> dict[str, Any]:
+    def _make_opts(
+        self,
+        use_cookies: bool = True,
+        media: MediaInput | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
         """构建 yt-dlp 通用选项。
 
         Args:
@@ -453,9 +561,10 @@ class YoutubeDownloader:
         if ffmpeg_path:
             opts["ffmpeg_location"] = str(Path(ffmpeg_path).parent)
         _configure_js_runtimes(opts)
-        if use_cookies and (self._cookies_spec or self._cookiefile_path):
-            if self._cookiefile_path:
-                opts["cookiefile"] = str(self._cookiefile_path)
+        cookiefile = self._cookiefile_for_platform(media.platform if media else None)
+        if use_cookies and (self._cookies_spec or cookiefile):
+            if cookiefile:
+                opts["cookiefile"] = str(cookiefile)
             elif self._cookies_spec:
                 parts = self._cookies_spec.split(":")
                 opts["cookiesfrombrowser"] = tuple(parts)  # type: ignore[assignment]
@@ -472,7 +581,7 @@ class YoutubeDownloader:
         """获取视频元信息和可用格式列表。
 
         Args:
-            video_id: YouTube video ID。
+            video_id: YouTube/Bilibili ID 或完整 URL。
             use_cookies: 是否使用浏览器 Cookie。默认 False。
 
         Returns:
@@ -481,7 +590,8 @@ class YoutubeDownloader:
         Raises:
             yt_dlp.utils.DownloadError: yt-dlp 内部错误（由调用方分类处理）。
         """
-        url = f"https://www.youtube.com/watch?v={video_id}"
+        media = self.parse_input(video_id)
+        url = media.url
         # Cookie 已标记不可用 → 跳过所有 Cookie 尝试
         if self._cookie_broken:
             use_cookies = False
@@ -492,16 +602,19 @@ class YoutubeDownloader:
         with self._yt_dlp_lock:
             for attempt in attempts:
                 try:
-                    opts = self._make_opts(use_cookies=attempt)
+                    opts = self._make_opts(use_cookies=attempt, media=media)
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                         if info and len(info.get("formats", [])) > 0:
+                            info.setdefault("_platform", media.platform)
+                            info.setdefault("_source_url", media.url)
+                            info.setdefault("_media_id", media.media_id)
                             if attempt != use_cookies:  # Cookie 回退成功 → 标记
                                 self._cookie_broken = True
                             return info
                         if info:
                             last_err = yt_dlp.utils.DownloadError(
-                                "YouTube 返回了视频信息但格式列表为空"
+                                f"{media.label} 返回了视频信息但格式列表为空"
                             )
                 except Exception as exc:
                     if "copy chrome cookie" in str(exc).lower():
@@ -523,7 +636,7 @@ class YoutubeDownloader:
         """获取所有可用格式（过滤后）。
 
         Args:
-            video_id: YouTube video ID。如提供 info 则可省略。
+            video_id: YouTube/Bilibili ID 或 URL。如提供 info 则可省略。
             info: 预先获取的 info dict（避免重复请求）。
 
         Returns:
@@ -584,7 +697,7 @@ class YoutubeDownloader:
         """下载指定格式的视频。
 
         Args:
-            video_id: YouTube video ID。
+            video_id: YouTube/Bilibili ID 或完整 URL。
             format_id: yt-dlp format ID。
             output_dir: 输出目录。
             progress_callback: 进度回调。
@@ -597,7 +710,8 @@ class YoutubeDownloader:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_template = str(output_dir / "%(id)s.%(ext)s")
-        url = f"https://www.youtube.com/watch?v={video_id}"
+        media = self.parse_input(video_id)
+        url = media.url
 
         def _progress_hook(d: dict[str, Any]) -> None:
             if progress_callback:
@@ -615,6 +729,7 @@ class YoutubeDownloader:
             fmt_str = format_id
         opts = self._make_opts(
             use_cookies=use_cookies,
+            media=media,
             format=fmt_str,
             outtmpl=output_template,
             progress_hooks=[_progress_hook],
@@ -714,6 +829,23 @@ class YoutubeDownloader:
         return path if path.is_file() else None
 
     @staticmethod
+    def _load_saved_cookiefiles() -> dict[str, Path]:
+        result: dict[str, Path] = {}
+        for platform, config_path in _PLATFORM_COOKIE_CONFIGS.items():
+            if not config_path.is_file():
+                continue
+            try:
+                path = Path(config_path.read_text(encoding="utf-8").strip())
+            except OSError:
+                continue
+            if path.is_file():
+                result[platform] = path
+        legacy = YoutubeDownloader._load_saved_cookiefile()
+        if legacy and "youtube" not in result:
+            result["youtube"] = legacy
+        return result
+
+    @staticmethod
     def _persist_cookiefile(path: Path | None) -> None:
         try:
             if path is None:
@@ -725,10 +857,36 @@ class YoutubeDownloader:
         except OSError:
             pass
 
+    @staticmethod
+    def _persist_platform_cookiefile(platform: str, path: Path | None) -> None:
+        config_path = _PLATFORM_COOKIE_CONFIGS.get(platform)
+        if config_path is None:
+            return
+        try:
+            if path is None:
+                if config_path.is_file():
+                    config_path.unlink()
+                return
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(str(path.resolve()), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _cookiefile_for_platform(self, platform: str | None) -> Path | None:
+        if platform and platform in self._platform_cookiefiles:
+            return self._platform_cookiefiles[platform]
+        if (
+            self._cookiefile_path
+            and (self._cookiefile_platform is None or platform is None or self._cookiefile_platform == platform)
+        ):
+            return self._cookiefile_path
+        return None
+
     def cookie_source(self) -> str:
         """当前 Cookie 来源描述（用于 UI 显示）。"""
         if self._cookiefile_path:
-            return f"file:{self._cookiefile_path.name}"
+            prefix = self._platform_label(self._cookiefile_platform) if self._cookiefile_platform else "file"
+            return f"{prefix}:{self._cookiefile_path.name}"
         if self._cookies_spec:
             return f"browser:{self._cookies_spec}"
         return ""
@@ -743,12 +901,10 @@ class YoutubeDownloader:
             head = cookie_path.read_text(encoding="utf-8", errors="replace")[:4096].lower()
         except OSError:
             return False
-        if "youtube.com" not in head:
-            return False
         return any(m in head for m in _NETSCAPE_MARKERS) or "\t" in head
 
     @staticmethod
-    def validate_cookie_file(path: str | Path) -> tuple[bool, str]:
+    def validate_cookie_file(path: str | Path, platform: str | None = None) -> tuple[bool, str]:
         """本地校验 cookie 文件格式（不访问网络）。"""
         cookie_path = Path(path).expanduser()
         if not cookie_path.is_file():
@@ -760,43 +916,75 @@ class YoutubeDownloader:
         except OSError as exc:
             return False, f"无法读取文件: {exc}"
         lower = text.lower()
-        if "youtube.com" not in lower:
-            return False, "文件中未找到 youtube.com 的 Cookie（请从已登录 YouTube 的浏览器导出）"
         if not YoutubeDownloader.is_netscape_cookie_file(cookie_path):
             return False, (
                 "不是 Netscape cookies.txt 格式。\n"
                 "请使用扩展「Get cookies.txt LOCALLY」导出，勿使用 JSON 格式。"
             )
-        return True, "格式校验通过"
+        detected = YoutubeDownloader._cookie_platform_from_text(lower)
+        if platform:
+            expected_domains = _PLATFORM_COOKIE_DOMAINS.get(platform, ())
+            if not any(domain in lower for domain in expected_domains):
+                label = YoutubeDownloader._platform_label(platform)
+                domains = " / ".join(expected_domains)
+                return False, f"文件中未找到 {domains} 的 Cookie（请从已登录 {label} 的浏览器导出）"
+            detected = platform
+        elif detected is None:
+            return False, "文件中未找到 youtube.com 或 bilibili.com 的 Cookie"
+        msg = f"格式校验通过 ({YoutubeDownloader._platform_label(detected)})"
+        if detected == "bilibili" and "sessdata" not in lower:
+            msg += "；未检测到 SESSDATA，可能不是登录 Cookie"
+        return True, msg
 
     def set_cookiefile(self, path: str | Path, *, persist: bool = True) -> None:
         """设置 Netscape 格式 cookie 文件（优先于浏览器 Cookie）。"""
         cookie_path = Path(path).expanduser().resolve()
-        ok, msg = self.validate_cookie_file(cookie_path)
+        if not cookie_path.is_file():
+            raise ValueError(f"文件不存在: {cookie_path}")
+        try:
+            text = cookie_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise ValueError(f"无法读取文件: {exc}") from exc
+        platform = self._cookie_platform_from_text(text)
+        ok, msg = self.validate_cookie_file(cookie_path, platform=platform)
         if not ok:
             raise ValueError(msg)
         self._cookiefile_path = cookie_path
+        self._cookiefile_platform = platform
+        if platform:
+            self._platform_cookiefiles[platform] = cookie_path
         self._cookies_spec = None
         self._cookie_broken = False
         if persist:
-            self._persist_cookiefile(cookie_path)
+            if platform:
+                self._persist_platform_cookiefile(platform, cookie_path)
+            # Keep legacy config for YouTube so existing installs continue to work.
+            if platform in (None, "youtube"):
+                self._persist_cookiefile(cookie_path)
 
     def clear_cookiefile(self, *, persist: bool = True) -> None:
         """清除 cookie 文件，恢复自动检测浏览器 Cookie。"""
+        old_platform = self._cookiefile_platform
         self._cookiefile_path = None
+        self._cookiefile_platform = None
         self._cookie_broken = False
         if persist:
+            if old_platform:
+                self._platform_cookiefiles.pop(old_platform, None)
+                self._persist_platform_cookiefile(old_platform, None)
             self._persist_cookiefile(None)
         info = self.detect_browser()
         self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
 
     def validate_cookies(self) -> tuple[bool, str]:
-        """联网探测 Cookie 是否能让 YouTube 返回格式列表。"""
+        """联网探测 Cookie 是否能让当前平台返回格式列表。"""
         if not self._cookiefile_path and not self._cookies_spec:
             return False, "未配置 Cookie"
 
         using_file = bool(self._cookiefile_path)
-        if using_file and not _resolve_tool("deno") and not _resolve_tool("node"):
+        platform = self._cookiefile_platform or "youtube"
+        label = self._platform_label(platform)
+        if platform == "youtube" and using_file and not _resolve_tool("deno") and not _resolve_tool("node"):
             return False, (
                 "未检测到 deno 或 node.js。\n"
                 "Cookie 模式需要 JS 运行时才能通过 YouTube 验证。\n"
@@ -805,10 +993,10 @@ class YoutubeDownloader:
                 "安装后重启应用再试。"
             )
 
-        test_id = "dQw4w9WgXcQ"
+        test_source = "dQw4w9WgXcQ" if platform == "youtube" else "BV1GJ411x7h7"
         cookie_err: Exception | None = None
         try:
-            info = self.get_info(test_id, use_cookies=True)
+            info = self.get_info(test_source, use_cookies=True)
             n = len(info.get("formats", []))
             return True, f"Cookie 验证通过 ({n} formats, {self.cookie_source()})"
         except Exception as exc:
@@ -816,24 +1004,26 @@ class YoutubeDownloader:
 
         # 对比：无 Cookie 是否能获取格式
         try:
-            info_no = self.get_info(test_id, use_cookies=False)
+            info_no = self.get_info(test_source, use_cookies=False)
             if len(info_no.get("formats", [])) > 0:
                 detail = clean_error(cookie_err) if cookie_err else "未知错误"
                 return False, (
                     f"Cookie 未能改善访问（不使用 Cookie 反而能获取格式）。\n"
                     f"可能 cookies.txt 已过期或导出不完整。\n"
                     f"详情: {detail}\n"
-                    "请重新登录 YouTube 后导出新的 cookies.txt。"
+                    f"请重新登录 {label} 后导出新的 cookies.txt。"
                 )
         except Exception:
             pass
 
-        detail = clean_error(cookie_err) if cookie_err else "YouTube 未返回格式"
+        detail = clean_error(cookie_err) if cookie_err else f"{label} 未返回格式"
         hints: list[str] = []
         if using_file:
-            hints.append("确认 cookies.txt 来自已登录 YouTube 的浏览器（扩展 Get cookies.txt LOCALLY）")
+            hints.append(f"确认 cookies.txt 来自已登录 {label} 的浏览器（扩展 Get cookies.txt LOCALLY）")
+        if platform == "bilibili" and using_file:
+            hints.append("Bilibili 高画质通常需要 cookies.txt 中包含 SESSDATA")
         if "bot" in detail.lower() or "sign in" in detail.lower():
-            hints.append("YouTube 仍要求验证，请重新导出 Cookie 或换网络/IP 后重试")
+            hints.append(f"{label} 仍要求验证，请重新导出 Cookie 或换网络/IP 后重试")
         if _resolve_tool("deno") or _resolve_tool("node"):
             hints.append("已检测到 JS 运行时，若仍失败多为 Cookie 过期")
         hint_text = "\n".join(f"- {h}" for h in hints) if hints else ""
@@ -861,7 +1051,7 @@ class YoutubeDownloader:
 
     @staticmethod
     def load_csv(filepath: Path, column: str = "video_id") -> list[str]:
-        """从 CSV/TSV/TXT 读取 video ID 列表（自动去重、支持 URL 提取）。"""
+        """从 CSV/TSV/TXT 读取媒体来源列表（自动去重、支持 URL 提取）。"""
         rows = YoutubeDownloader.load_csv_rows(filepath, column=column)
         return [row["video_id"] for row in rows]
 
@@ -906,14 +1096,22 @@ class YoutubeDownloader:
 
                     rows: list[dict[str, str]] = []
                     seen: set[str] = set()
+                    target_key = target_column.strip().lower().replace(" ", "_").replace("-", "_")
                     for row in reader:
                         raw_value = row.get(target_column, "") or ""
-                        vid = YoutubeDownloader._normalize_video_id(raw_value)
+                        media_value = raw_value
+                        if target_key in {"aid", "av"} and raw_value.strip().isdigit():
+                            media_value = f"av{raw_value.strip()}"
+                        vid = YoutubeDownloader._normalize_video_id(media_value)
                         if not vid or vid in seen:
                             continue
                         seen.add(vid)
+                        media = YoutubeDownloader.parse_input(media_value)
                         record = {key: (value or "") for key, value in row.items() if value is not None}
                         record["video_id"] = vid
+                        record["platform"] = media.platform
+                        record["source_url"] = media.url
+                        record["media_id"] = media.media_id
                         rows.append(record)
                     return rows
             except (UnicodeDecodeError, UnicodeError) as exc:
@@ -933,27 +1131,30 @@ class YoutubeDownloader:
             if key in normalized:
                 return normalized[key]
 
-        for key in ("video_id", "videoid", "id", "youtube_id", "youtubeid", "url", "video_url"):
+        for key in (
+            "video_id", "videoid", "media_id", "source", "id",
+            "youtube_id", "youtubeid", "bvid", "bv", "aid", "av",
+            "url", "video_url", "source_url",
+        ):
             if key in normalized:
                 return normalized[key]
         return None
 
     @staticmethod
     def _normalize_video_id(value: str) -> str:
-        """从原始单元格内容中提取 11 位 YouTube video ID。"""
+        """从原始单元格内容中提取可下载媒体来源。"""
         text = (value or "").strip()
         if not text:
             return ""
-        text = text.replace("\\", "/")
-        patterns = [
-            r"(?:v=|vi=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})",
-            r"^([A-Za-z0-9_-]{11})$",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1)
-        return text
+        media = YoutubeDownloader.parse_input(text)
+        if media.platform == "youtube":
+            return media.media_id
+        if media.platform == "bilibili":
+            parsed = urlparse(media.original if "://" in media.original else media.url)
+            if parsed.netloc.lower().endswith("b23.tv"):
+                return media.url
+            return media.media_id
+        return media.url
 
     # ------------------------------------------------------------------
     # 内部辅助
