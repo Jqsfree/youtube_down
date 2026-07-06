@@ -124,6 +124,7 @@ class DownloadWorker(QThread):
                 output_dir=self._output_dir,
                 progress_callback=on_progress,
                 needs_audio_merge=self._needs_audio_merge,
+                min_height=self._min_height,
             )
             self.finished.emit(str(result_path))
 
@@ -456,10 +457,7 @@ class BatchDownloadWorker(QThread):
 
             info = self._downloader.get_info(video_id, use_cookies=use_cookies)
             title = info.get("title", "") or ""
-            if use_cookies:
-                fmt, merge = "best", False
-            else:
-                fmt, merge = self._resolve_format(info)
+            fmt, merge = self._resolve_format(info)
 
             if fmt is None:
                 msg = f"低于 {self._min_height}p，跳过下载: {video_id}"
@@ -471,6 +469,7 @@ class BatchDownloadWorker(QThread):
                 output_dir=self._output_dir,
                 progress_callback=on_progress, use_cookies=use_cookies,
                 needs_audio_merge=merge,
+                min_height=self._min_height,
             )
             self.video_finished.emit(index, str(path), use_cookies)
             return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)

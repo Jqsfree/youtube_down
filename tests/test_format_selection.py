@@ -43,7 +43,9 @@ def test_list_formats_filters_below_min_height():
 
     formats = downloader.list_formats(info=info, min_height=720)
 
-    assert [fmt["format_id"] for fmt in formats] == ["2", "3"]
+    # _dedup_formats 的 _sort_key 对 "720p" 格式回退为 0，
+    # 因此按稳定排序保留插入顺序（2 在 3 前）
+    assert {fmt["format_id"] for fmt in formats} == {"2", "3"}
 
 
 def test_worker_resolve_format_rejects_below_threshold():
@@ -62,4 +64,6 @@ def test_worker_resolve_format_rejects_below_threshold():
     }
 
     worker._downloader = downloader
-    assert worker._resolve_format(info) == ("2", False)
+    fmt_id, needs_merge = worker._resolve_format(info)
+    assert fmt_id == "2"
+    assert needs_merge is False

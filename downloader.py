@@ -580,6 +580,7 @@ class YoutubeDownloader:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         use_cookies: bool = True,
         needs_audio_merge: bool = True,
+        min_height: int | None = None,
     ) -> Path:
         """下载指定格式的视频。
 
@@ -679,7 +680,27 @@ class YoutubeDownloader:
                         f" 实际 {actual_duration:.0f}s (可能是合并中断)"
                     )
 
-                return path
+            # 校验下载后视频分辨率不低于最低要求
+            if min_height and min_height > 0:
+                height_result = subprocess.run(
+                    [_find_tool("ffprobe"), "-v", "error",
+                     "-select_streams", "v:0", "-show_entries",
+                     "stream=height", "-of", "csv=p=0", str(path)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                height_str = height_result.stdout.strip()
+                if height_str:
+                    try:
+                        actual_height = int(height_str)
+                        if actual_height < min_height:
+                            raise yt_dlp.utils.DownloadError(
+                                f"下载视频分辨率 ({actual_height}p)"
+                                f" 低于最低要求 ({min_height}p)"
+                            )
+                    except ValueError:
+                        pass  # 无法解析高度时跳过（非视频文件）
+
+            return path
 
     @staticmethod
     def cleanup_partial_files(output_dir: Path) -> None:
