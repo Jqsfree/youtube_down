@@ -256,6 +256,7 @@ class BatchDownloadWorker(QThread):
         output_dir: Path,
         min_height: int = 720,
         results_dir: Path | None = None,
+        cookie_overrides: dict[str, dict[str, str]] | None = None,
         parent: QThread | None = None,
     ) -> None:
         super().__init__(parent)
@@ -268,6 +269,7 @@ class BatchDownloadWorker(QThread):
         self._last_results_csv = ""
         self._last_skipped_csv = ""
         self._last_failed_csv = ""
+        self._cookie_overrides = cookie_overrides or {}
 
     def run(self) -> None:
         """按顺序下载所有 video_id，两阶段策略。增量写入 + 续传。"""
@@ -305,9 +307,9 @@ class BatchDownloadWorker(QThread):
                     resumed += 1
                     continue
 
-                # ── 下载（默认 Cookie）─────────────────────
+                # ── 下载（默认无 Cookie）─────────────────────
                 status, cookie_used, category, error_msg, title = self._try_download(
-                    vid, i, total
+                    vid, i, total, use_cookies=False
                 )
 
                 if status == "success":
@@ -318,9 +320,9 @@ class BatchDownloadWorker(QThread):
                     self._append_csv(_csv_writer, _csv_file, vid, title, "skipped", "SKIPPED",
                                      clean_error(Exception(error_msg)), cookie_used)
                 else:
-                    if self._downloader.redetect_browser():
+                    if self._should_retry_with_cookie(category, error_msg) and self._has_cookie_for_source(vid):
                         status, cookie_used, category, error_msg, title = self._try_download(
-                            vid, i, total
+                            vid, i, total, use_cookies=True
                         )
                     if status == "success":
                         downloaded += 1
@@ -380,6 +382,34 @@ class BatchDownloadWorker(QThread):
             return YoutubeDownloader.parse_input(source).url
         except Exception:
             return source
+
+    def _cookie_args_for_source(self, source: str) -> dict[str, str]:
+        return self._cookie_overrides.get(source, {})
+
+    def _has_cookie_for_source(self, source: str) -> bool:
+        args = self._cookie_args_for_source(source)
+        if args.get("cookiefile") or args.get("cookies_from_browser"):
+            return True
+        return self._downloader.has_cookie_for_source(source)
+
+    @staticmethod
+    def _should_retry_with_cookie(category: ErrorCategory, error_msg: str) -> bool:
+        if category.retry_cookie:
+            return True
+        lowered = (error_msg or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "login",
+                "premium",
+                "member",
+                "会员",
+                "大会员",
+                "format(s)",
+                "use --cookies",
+                "cookies-from-browser",
+            )
+        )
 
     def _append_csv(
         self, writer: Any, f: Any, vid: str, title: str, status: str,
@@ -468,9 +498,9 @@ class BatchDownloadWorker(QThread):
         return on_progress
 
     def _try_download(
-        self, video_id: str, index: int, total: int, use_cookies: bool = True
+        self, video_id: str, index: int, total: int, use_cookies: bool = False
     ) -> tuple[str, bool, ErrorCategory, str, str]:
-        """尝试获取信息 + 下载。默认使用 Cookie。
+        """尝试获取信息 + 下载。默认不使用 Cookie。
 
         Returns:
             (status, cookie_used, category, error_or_path, title)
@@ -485,7 +515,13 @@ class BatchDownloadWorker(QThread):
                 self.video_finished.emit(index, str(existing), use_cookies)
                 return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing), "")
 
-            info = self._downloader.get_info(video_id, use_cookies=use_cookies)
+            cookie_args = self._cookie_args_for_source(video_id) if use_cookies else {}
+            info = self._downloader.get_info(
+                video_id,
+                use_cookies=use_cookies,
+                cookiefile_override=cookie_args.get("cookiefile"),
+                cookies_from_browser_override=cookie_args.get("cookies_from_browser"),
+            )
             title = info.get("title", "") or ""
             if use_cookies:
                 fmt, merge = "best", False
@@ -502,6 +538,8 @@ class BatchDownloadWorker(QThread):
                 output_dir=self._output_dir,
                 progress_callback=on_progress, use_cookies=use_cookies,
                 needs_audio_merge=merge,
+                cookiefile_override=cookie_args.get("cookiefile"),
+                cookies_from_browser_override=cookie_args.get("cookies_from_browser"),
             )
             self.video_finished.emit(index, str(path), use_cookies)
             return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)
@@ -515,7 +553,7 @@ class BatchDownloadWorker(QThread):
                     time.sleep(wait)
                     try:
                         fmt, merge = self._resolve_format(
-                            self._downloader.get_info(video_id)
+                            self._downloader.get_info(video_id, use_cookies=False)
                         )
                         if fmt is None:
                             return ("skipped", use_cookies, ErrorCategory("SKIPPED", False, ""), "", "")
@@ -523,6 +561,7 @@ class BatchDownloadWorker(QThread):
                             video_id=video_id, format_id=fmt,
                             output_dir=self._output_dir,
                             progress_callback=on_progress,
+                            use_cookies=False,
                             needs_audio_merge=merge,
                         )
                         self.video_finished.emit(index, str(path), use_cookies)

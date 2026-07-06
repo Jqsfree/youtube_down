@@ -57,3 +57,43 @@ def test_make_opts_uses_matching_platform_cookiefile(tmp_path: Path):
     opts = dl._make_opts(use_cookies=True, media=media)
 
     assert opts["cookiefile"] == str(bilibili_cookie.resolve())
+
+
+def test_make_opts_prefers_temporary_cookiefile_override(tmp_path: Path):
+    saved_cookie = tmp_path / "saved.txt"
+    saved_cookie.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tVISITOR_INFO1_LIVE\ttest\n",
+        encoding="utf-8",
+    )
+    temporary_cookie = tmp_path / "temporary.txt"
+    temporary_cookie.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tVISITOR_INFO1_LIVE\ttemp\n",
+        encoding="utf-8",
+    )
+
+    dl = YoutubeDownloader(cookies_from_browser="")
+    dl.set_cookiefile(saved_cookie, persist=False)
+    media = YoutubeDownloader.parse_input("dQw4w9WgXcQ")
+
+    opts = dl._make_opts(
+        use_cookies=True,
+        media=media,
+        cookiefile_override=temporary_cookie,
+    )
+
+    assert opts["cookiefile"] == str(temporary_cookie.resolve())
+
+
+def test_make_opts_uses_temporary_browser_override():
+    dl = YoutubeDownloader(cookies_from_browser="")
+    media = YoutubeDownloader.parse_input("dQw4w9WgXcQ")
+
+    opts = dl._make_opts(
+        use_cookies=True,
+        media=media,
+        cookies_from_browser_override="firefox:default-release",
+    )
+
+    assert opts["cookiesfrombrowser"] == ("firefox", "default-release")

@@ -50,3 +50,18 @@ def test_load_csv_supports_bilibili_aid_column(tmp_path):
 
     assert rows[0]["video_id"] == "av170001"
     assert rows[0]["platform"] == "bilibili"
+
+
+def test_load_csv_preserves_temporary_cookie_columns(tmp_path):
+    csv_path = tmp_path / "videos_with_cookie.csv"
+    csv_path.write_text(
+        "source,cookiefile,cookies_from_browser\n"
+        "dQw4w9WgXcQ,cookies.txt,firefox\n",
+        encoding="utf-8",
+    )
+
+    rows = YoutubeDownloader.load_csv_rows(csv_path, column="source")
+
+    assert rows[0]["video_id"] == "dQw4w9WgXcQ"
+    assert rows[0]["cookiefile"] == "cookies.txt"
+    assert rows[0]["cookies_from_browser"] == "firefox"

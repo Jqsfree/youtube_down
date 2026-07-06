@@ -19,6 +19,7 @@ from PySide6.QtGui import QShortcut
 
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -60,6 +61,8 @@ class MainWindow(QMainWindow):
         self._output_dir: Path = Path.home() / "Downloads"
         self._csv_ids: list[str] = []
         self._csv_queue: list[tuple[str, list[str], Path | None]] = []
+        self._csv_cookie_overrides: dict[str, dict[str, str]] = {}
+        self._cookie_persisted: bool = self._downloader._cookiefile_path is not None  # noqa: SLF001
         self._batch_done: int = 0
         self._batch_errors: list[tuple[int, str]] = []
         self._last_fmt_id: str = ""
@@ -296,13 +299,19 @@ class MainWindow(QMainWindow):
         self._cookie_label = QLabel("未配置")
         self._cookie_label.setWordWrap(True)
         cookie_layout.addWidget(self._cookie_label, stretch=1)
-        self._import_cookie_btn = QPushButton("导入 Cookie 文件")
+        self._import_cookie_btn = QPushButton("选择临时 Cookie")
         self._import_cookie_btn.setToolTip(
             "选择 Netscape 格式的 cookies.txt。\n"
             "支持 YouTube 或 Bilibili Cookie；Chrome/Edge 可用扩展「Get cookies.txt LOCALLY」导出。\n"
-            "导入后请重新点击「获取信息」。"
+            "默认仅本次运行使用；勾选「记住为默认」才会保存。"
         )
         cookie_layout.addWidget(self._import_cookie_btn)
+        self._remember_cookie_checkbox = QCheckBox("记住为默认")
+        self._remember_cookie_checkbox.setToolTip(
+            "不勾选时等同 yt-dlp --cookies /path/cookies.txt 的临时 Cookie；"
+            "勾选后保存为当前平台默认 Cookie。"
+        )
+        cookie_layout.addWidget(self._remember_cookie_checkbox)
         self._clear_cookie_btn = QPushButton("清除")
         self._clear_cookie_btn.setEnabled(False)
         cookie_layout.addWidget(self._clear_cookie_btn)
@@ -488,6 +497,7 @@ class MainWindow(QMainWindow):
         all_ids: list[str] = []
         errors: list[str] = []
         self._csv_queue = []
+        self._csv_cookie_overrides = {}
         seen_names: set[str] = set()
 
         for fp in filepaths:
@@ -506,6 +516,24 @@ class MainWindow(QMainWindow):
 
             ids = [row["video_id"] for row in rows]
             all_ids.extend(ids)
+            for row in rows:
+                override: dict[str, str] = {}
+                cookiefile = (
+                    row.get("cookiefile")
+                    or row.get("cookies_file")
+                    or row.get("cookie_file")
+                    or ""
+                ).strip()
+                if cookiefile:
+                    cookie_path = Path(cookiefile).expanduser()
+                    if not cookie_path.is_absolute():
+                        cookie_path = (path.parent / cookie_path).resolve()
+                    override["cookiefile"] = str(cookie_path)
+                browser = (row.get("cookies_from_browser") or "").strip()
+                if browser:
+                    override["cookies_from_browser"] = browser
+                if override:
+                    self._csv_cookie_overrides[row["video_id"]] = override
             name = self._build_queue_name(path.stem, seen_names)
             seen_names.add(name)
             output_dir = self._resolve_import_output_dir(rows)
@@ -599,13 +627,16 @@ class MainWindow(QMainWindow):
             path = self._downloader._cookiefile_path
             platform = self._downloader._cookiefile_platform  # noqa: SLF001
             label = YoutubeDownloader._platform_label(platform) if platform else "自动"
-            self._cookie_label.setText(f"文件 ({label}): {path}")
+            mode = "默认" if self._cookie_persisted else "临时"
+            self._cookie_label.setText(f"{mode}文件 ({label}): {path}")
             self._clear_cookie_btn.setEnabled(True)
         elif src:
             self._cookie_label.setText(f"浏览器: {src.removeprefix('browser:')}")
             self._clear_cookie_btn.setEnabled(False)
         else:
-            self._cookie_label.setText("未配置（可导入 YouTube/Bilibili cookies.txt 或登录浏览器）")
+            self._cookie_label.setText(
+                "未配置（可临时选择 cookies.txt；Linux 可尝试浏览器 Cookie，Windows 推荐导出 cookies.txt）"
+            )
             self._clear_cookie_btn.setEnabled(False)
         self._update_window_title()
 
@@ -632,13 +663,16 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            self._downloader.set_cookiefile(filepath)
+            persist = self._remember_cookie_checkbox.isChecked()
+            self._downloader.set_cookiefile(filepath, persist=persist)
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "导入失败", str(exc))
             return
+        self._cookie_persisted = persist
         self._update_cookie_ui()
-        self._log(f"已导入 Cookie: {filepath}")
-        self._status_label.setText("Cookie 已导入，正在后台验证...")
+        mode = "默认" if persist else "临时"
+        self._log(f"已选择{mode} Cookie: {filepath}")
+        self._status_label.setText(f"{mode} Cookie 已加载，正在后台验证...")
         self._import_cookie_btn.setEnabled(False)
         self._clear_cookie_btn.setEnabled(False)
         self._start_cookie_validation()
@@ -693,6 +727,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "请稍候", "Cookie 验证进行中，请稍后再清除。")
             return
         self._downloader.clear_cookiefile()
+        self._cookie_persisted = False
         self._update_cookie_ui()
         self._log("已清除 Cookie 文件，恢复浏览器自动检测")
         self._status_label.setText("Cookie 已清除")
@@ -898,6 +933,11 @@ class MainWindow(QMainWindow):
             output_dir=output_dir,
             min_height=min_height,
             results_dir=results_dir,
+            cookie_overrides={
+                source: self._csv_cookie_overrides[source]
+                for source in video_ids
+                if source in self._csv_cookie_overrides
+            },
         )
         w: BatchDownloadWorker = self._worker  # type narrowing
         w.all_progress_changed.connect(self._on_batch_progress)

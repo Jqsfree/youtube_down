@@ -527,6 +527,8 @@ class YoutubeDownloader:
         self,
         use_cookies: bool = True,
         media: MediaInput | None = None,
+        cookiefile_override: str | Path | None = None,
+        cookies_from_browser_override: str | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """构建 yt-dlp 通用选项。
@@ -570,12 +572,16 @@ class YoutubeDownloader:
                 ),
                 "Referer": "https://www.bilibili.com/",
             }
-        cookiefile = self._cookiefile_for_platform(media.platform if media else None)
-        if use_cookies and (self._cookies_spec or cookiefile):
+        cookiefile = (
+            Path(cookiefile_override).expanduser().resolve()
+            if cookiefile_override else self._cookiefile_for_platform(media.platform if media else None)
+        )
+        cookies_spec = cookies_from_browser_override or self._cookies_spec
+        if use_cookies and (cookies_spec or cookiefile):
             if cookiefile:
                 opts["cookiefile"] = str(cookiefile)
-            elif self._cookies_spec:
-                parts = self._cookies_spec.split(":")
+            elif cookies_spec:
+                parts = cookies_spec.split(":")
                 opts["cookiesfrombrowser"] = tuple(parts)  # type: ignore[assignment]
         opts.update(extra)  # extra 中的 extractor_args 会覆盖默认值
         return opts
@@ -585,7 +591,11 @@ class YoutubeDownloader:
     # ------------------------------------------------------------------
 
     def get_info(
-        self, video_id: str, use_cookies: bool = True
+        self,
+        video_id: str,
+        use_cookies: bool = True,
+        cookiefile_override: str | Path | None = None,
+        cookies_from_browser_override: str | None = None,
     ) -> dict[str, Any]:
         """获取视频元信息和可用格式列表。
 
@@ -606,12 +616,26 @@ class YoutubeDownloader:
             use_cookies = False
         # Cookie 模式失败时自动回退无 Cookie（Chrome 锁定等场景；cookie 文件不回退）
         last_err = None
-        use_browser = use_cookies and bool(self._cookies_spec) and not self._cookiefile_path
+        has_cookiefile_override = cookiefile_override is not None
+        has_browser_override = bool(cookies_from_browser_override)
+        platform_cookiefile = self._cookiefile_for_platform(media.platform)
+        use_browser = (
+            use_cookies
+            and bool(self._cookies_spec)
+            and platform_cookiefile is None
+            and not has_cookiefile_override
+            and not has_browser_override
+        )
         attempts = [True, False] if use_browser else [use_cookies]
         with self._yt_dlp_lock:
             for attempt in attempts:
                 try:
-                    opts = self._make_opts(use_cookies=attempt, media=media)
+                    opts = self._make_opts(
+                        use_cookies=attempt,
+                        media=media,
+                        cookiefile_override=cookiefile_override,
+                        cookies_from_browser_override=cookies_from_browser_override,
+                    )
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                         if info and len(info.get("formats", [])) > 0:
@@ -702,6 +726,8 @@ class YoutubeDownloader:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         use_cookies: bool = True,
         needs_audio_merge: bool = True,
+        cookiefile_override: str | Path | None = None,
+        cookies_from_browser_override: str | None = None,
     ) -> Path:
         """下载指定格式的视频。
 
@@ -739,6 +765,8 @@ class YoutubeDownloader:
         opts = self._make_opts(
             use_cookies=use_cookies,
             media=media,
+            cookiefile_override=cookiefile_override,
+            cookies_from_browser_override=cookies_from_browser_override,
             format=fmt_str,
             outtmpl=output_template,
             progress_hooks=[_progress_hook],
@@ -890,6 +918,16 @@ class YoutubeDownloader:
         ):
             return self._cookiefile_path
         return None
+
+    def has_cookie_for_source(self, source: str) -> bool:
+        """Return whether a cookie source is available for a media input."""
+        try:
+            media = self.parse_input(source)
+        except ValueError:
+            media = None
+        if self._cookiefile_for_platform(media.platform if media else None):
+            return True
+        return bool(self._cookies_spec)
 
     def cookie_source(self) -> str:
         """当前 Cookie 来源描述（用于 UI 显示）。"""
@@ -1121,6 +1159,17 @@ class YoutubeDownloader:
                         record["platform"] = media.platform
                         record["source_url"] = media.url
                         record["media_id"] = media.media_id
+                        cookiefile = (
+                            record.get("cookiefile")
+                            or record.get("cookies_file")
+                            or record.get("cookie_file")
+                            or ""
+                        ).strip()
+                        if cookiefile:
+                            record["cookiefile"] = cookiefile
+                        browser_cookie = (record.get("cookies_from_browser") or "").strip()
+                        if browser_cookie:
+                            record["cookies_from_browser"] = browser_cookie
                         rows.append(record)
                     return rows
             except (UnicodeDecodeError, UnicodeError) as exc:
