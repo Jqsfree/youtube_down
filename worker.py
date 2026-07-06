@@ -492,6 +492,7 @@ class BatchDownloadWorker(QThread):
                             output_dir=self._output_dir,
                             progress_callback=on_progress,
                             needs_audio_merge=merge,
+                            min_height=self._min_height,
                         )
                         self.video_finished.emit(index, str(path), use_cookies)
                         return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)

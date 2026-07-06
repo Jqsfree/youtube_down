@@ -48,6 +48,32 @@ def test_list_formats_filters_below_min_height():
     assert {fmt["format_id"] for fmt in formats} == {"2", "3"}
 
 
+def test_list_formats_returns_descending_by_height():
+    """验证 list_formats 返回的格式按分辨率高度降序排列。"""
+    downloader = YoutubeDownloader.__new__(YoutubeDownloader)
+    info = {
+        "formats": [
+            {"format_id": "1", "resolution": "1280x720", "ext": "mp4",
+             "vcodec": "avc1", "acodec": "mp4a", "filesize": 2000},
+            {"format_id": "2", "resolution": "1920x1080", "ext": "mp4",
+             "vcodec": "avc1", "acodec": "mp4a", "filesize": 3000},
+            {"format_id": "3", "resolution": "640x480", "ext": "mp4",
+             "vcodec": "avc1", "acodec": "mp4a", "filesize": 1000},
+        ]
+    }
+
+    formats = downloader.list_formats(info=info)
+
+    heights = []
+    for f in formats:
+        try:
+            heights.append(int(f["resolution"].split("x")[-1]))
+        except (ValueError, IndexError):
+            heights.append(0)
+    assert heights == sorted(heights, reverse=True), \
+        f"格式应按高度降序排列，实际: {heights}"
+
+
 def test_worker_resolve_format_rejects_below_threshold():
     from worker import BatchDownloadWorker
 

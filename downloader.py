@@ -698,7 +698,10 @@ class YoutubeDownloader:
                                 f" 低于最低要求 ({min_height}p)"
                             )
                     except ValueError:
-                        pass  # 无法解析高度时跳过（非视频文件）
+                        AppLogger.get_logger().warning(
+                            "无法解析视频高度用于分辨率校验: height_str=%s, file=%s",
+                            height_str, path.name,
+                        )
 
             return path
 
