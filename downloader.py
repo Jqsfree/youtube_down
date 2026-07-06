@@ -561,6 +561,15 @@ class YoutubeDownloader:
         if ffmpeg_path:
             opts["ffmpeg_location"] = str(Path(ffmpeg_path).parent)
         _configure_js_runtimes(opts)
+        if media and media.platform == "bilibili":
+            opts["http_headers"] = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.bilibili.com/",
+            }
         cookiefile = self._cookiefile_for_platform(media.platform if media else None)
         if use_cookies and (self._cookies_spec or cookiefile):
             if cookiefile:
