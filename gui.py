@@ -325,7 +325,7 @@ class MainWindow(QMainWindow):
         csv_layout.addWidget(self._load_csv_btn)
         csv_layout.addWidget(QLabel("字段:"))
         self._csv_column_input = QLineEdit()
-        self._csv_column_input.setPlaceholderText("如 video_id / source / bvid / aid / url")
+        self._csv_column_input.setPlaceholderText("如 video_id / csvid / source / bvid / url")
         self._csv_column_input.setText("video_id")
         self._csv_column_input.setMaximumWidth(180)
         csv_layout.addWidget(self._csv_column_input)

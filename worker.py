@@ -134,6 +134,7 @@ class DownloadWorker(QThread):
                 output_dir=self._output_dir,
                 progress_callback=on_progress,
                 needs_audio_merge=self._needs_audio_merge,
+                min_height=self._min_height,
             )
             self.finished.emit(str(result_path))
 
@@ -193,7 +194,10 @@ class FetchInfoWorker(QThread):
 
     def run(self) -> None:
         try:
-            info = self._downloader.get_info(self._video_id)
+            info = self._downloader.get_info(
+                self._video_id,
+                use_cookies=self._downloader.prefers_cookies_for_fetch(),
+            )
             self.finished.emit(info)
         except Exception as exc:
             self.error.emit(clean_error(exc))
@@ -454,7 +458,7 @@ class BatchDownloadWorker(QThread):
         if preferred in available_ids:
             try:
                 preferred_fmt = next(f for f in formats if f["format_id"] == preferred)
-                if preferred_fmt.get("container") == "mp4" and preferred_fmt.get("type") in {"Video+Audio", "Video Only"}:
+                if preferred_fmt.get("type") in {"Video+Audio", "Video Only"}:
                     return (preferred, _needs_merge(preferred_fmt))
             except StopIteration:
                 pass
@@ -523,10 +527,7 @@ class BatchDownloadWorker(QThread):
                 cookies_from_browser_override=cookie_args.get("cookies_from_browser"),
             )
             title = info.get("title", "") or ""
-            if use_cookies:
-                fmt, merge = "best", False
-            else:
-                fmt, merge = self._resolve_format(info)
+            fmt, merge = self._resolve_format(info)
 
             if fmt is None:
                 msg = f"低于 {self._min_height}p，跳过下载: {video_id}"
@@ -538,6 +539,7 @@ class BatchDownloadWorker(QThread):
                 output_dir=self._output_dir,
                 progress_callback=on_progress, use_cookies=use_cookies,
                 needs_audio_merge=merge,
+                min_height=self._min_height,
                 cookiefile_override=cookie_args.get("cookiefile"),
                 cookies_from_browser_override=cookie_args.get("cookies_from_browser"),
             )
@@ -563,6 +565,7 @@ class BatchDownloadWorker(QThread):
                             progress_callback=on_progress,
                             use_cookies=False,
                             needs_audio_merge=merge,
+                            min_height=self._min_height,
                         )
                         self.video_finished.emit(index, str(path), use_cookies)
                         return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)
