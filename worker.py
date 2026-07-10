@@ -37,18 +37,24 @@ def _check_existing(video_id: str, output_dir: Path) -> Path | None:
     """检查输出目录是否已有此视频的有效文件（用于去重）。"""
     import subprocess as _sp
     stem = _media_stem(video_id)
-    for ext in (".mp4", ".webm", ".mkv", ".m4a"):
+    for ext in (".mp4", ".webm", ".mkv", ".mov", ".flv"):
         candidate = output_dir / f"{stem}{ext}"
         if not candidate.is_file() or candidate.stat().st_size <= 1024:
             continue
         try:
             r = _sp.run(
-                [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
-                 "format=duration", "-of", "csv=p=0", str(candidate)],
+                [_find_tool("ffprobe"), "-v", "quiet", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(candidate)],
                 capture_output=True, text=True, timeout=10,
             )
-            if r.returncode == 0 and r.stdout.strip():
-                return candidate
+            if r.returncode == 0 and r.stdout.strip() == "video":
+                r2 = _sp.run(
+                    [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
+                     "format=duration", "-of", "csv=p=0", str(candidate)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r2.returncode == 0 and r2.stdout.strip():
+                    return candidate
         except Exception:
             pass
     return None
@@ -448,6 +454,9 @@ class BatchDownloadWorker(QThread):
             format_id 为 None 表示低于阈值应跳过。
         """
         preferred = self._format_id
+        if preferred in (AUTO_FORMAT_ID, "", None):
+            return ("best", False)
+
         formats = self._downloader.list_formats(
             info=info,
             min_height=self._min_height,

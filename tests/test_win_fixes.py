@@ -61,6 +61,16 @@ def test_build_format_selector_avoids_unbounded_best_fallback() -> None:
     assert "22+bestaudio" in selector
     assert "height>=720" in selector
     assert selector.endswith("bestaudio") or "bestvideo[height>=720]+bestaudio" in selector
+    assert "/best[" not in selector
+    assert not selector.endswith("/best")
+
+
+def test_build_format_selector_best_mode_requires_video() -> None:
+    selector = YoutubeDownloader.build_format_selector("best", min_height=720)
+
+    assert "bestvideo[height>=720]+bestaudio" in selector
+    assert "/best[" not in selector
+    assert not selector.endswith("/best")
 
 
 def test_batch_cookie_retry_respects_min_height(tmp_path: Path) -> None:

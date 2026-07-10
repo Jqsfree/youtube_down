@@ -62,7 +62,7 @@ def test_worker_resolve_format_uses_auto_mode():
     }
 
     worker._downloader = downloader
-    assert worker._resolve_format(info) == ("2", False)
+    assert worker._resolve_format(info) == ("best", False)
 
 
 def test_worker_resolve_format_rejects_below_threshold():

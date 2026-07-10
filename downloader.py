@@ -574,8 +574,11 @@ class YoutubeDownloader:
         height = f"[height>={min_height}]" if min_height > 0 else ""
         if format_id == "best":
             if min_height > 0:
-                return f"bestvideo{height}+bestaudio/bestvideo{height}+bestaudio/best{height}"
-            return "best"
+                return (
+                    f"bestvideo[height>={min_height}]+bestaudio/"
+                    f"bestvideo[height>={min_height}]+bestaudio"
+                )
+            return "bestvideo+bestaudio/bestvideo+bestaudio"
         if needs_audio_merge:
             primary = f"{format_id}+bestaudio"
             if min_height > 0:
@@ -754,18 +757,26 @@ class YoutubeDownloader:
                 return 0
 
         results: list[dict[str, Any]] = []
-        _VIDEO_EXTS = {"mp4", "m4a", "webm", "flv", "mkv", "mov"}
+        _VIDEO_EXTS = {"mp4", "m4a", "webm", "flv", "mkv", "mov", "m4s", "fmp4"}
         for fmt in raw_formats:
             if fmt.get("ext") not in _VIDEO_EXTS:
                 continue
             resolution = fmt.get("resolution") or ""
             if resolution == "audio only":
-                resolution = "Audio"
+                continue
+            height = fmt.get("height") or 0
+            if not resolution and height:
+                resolution = f"{fmt.get('width', '?')}x{height}"
             elif not resolution:
                 continue
 
-            if min_height is not None and resolution != "Audio":
-                if _height(resolution) < min_height:
+            fmt_type = self._format_type(fmt)
+            if fmt_type == "Audio":
+                continue
+
+            if min_height is not None:
+                res_height = height or _height(resolution)
+                if res_height < min_height:
                     continue
 
             results.append({
@@ -782,6 +793,20 @@ class YoutubeDownloader:
 
         # 每档分辨率只保留最优版本：Video Only > Video+Audio，大文件 > 小文件
         return self._dedup_formats(results)
+
+    @staticmethod
+    def _has_video_stream(path: Path) -> bool:
+        """确认输出文件包含视频轨，避免仅音频文件被当成成功。"""
+        result = subprocess.run(
+            [
+                _find_tool("ffprobe"), "-v", "quiet", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "video"
 
     def download(
         self,
@@ -858,12 +883,13 @@ class YoutubeDownloader:
                 if not path.exists():
                     stem = path.stem
                     candidates = list(output_dir.glob(f"{stem}.*"))
-                    # 只保留视频/音频扩展名，排除 .json/.jpg/.part 等
-                    _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4a", ".mp3"}
-                    candidates = [
+                    _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".flv"}
+                    video_candidates = [
                         c for c in candidates if c.suffix.lower() in _VIDEO_EXTS
                     ]
-                    if candidates:
+                    if video_candidates:
+                        path = max(video_candidates, key=lambda p: p.stat().st_size)
+                    elif candidates:
                         path = candidates[0]
                     else:
                         raise yt_dlp.utils.DownloadError(
@@ -873,6 +899,11 @@ class YoutubeDownloader:
                 if path.stat().st_size <= 1024:
                     raise yt_dlp.utils.DownloadError(
                         f"下载文件过小 ({path.stat().st_size} bytes): {path}"
+                    )
+
+                if not self._has_video_stream(path):
+                    raise yt_dlp.utils.DownloadError(
+                        f"下载结果只有音频或缺少视频轨: {path}"
                     )
 
                 # 校验文件是有效媒体（ffprobe 解析 + 时长比对）

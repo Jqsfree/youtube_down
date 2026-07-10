@@ -68,8 +68,8 @@ class MainWindow(QMainWindow):
 
         spec = self._downloader._cookies_spec  # noqa: SLF001
         ver = Path(__file__).parent / "VERSION"
-        ver_str = ver.read_text().strip() if ver.exists() else "dev"
-        self._base_title = f"Multi-Platform Downloader v{ver_str}"
+        self._app_version = ver.read_text().strip() if ver.exists() else "dev"
+        self._base_title = f"Multi-Platform Downloader v{self._app_version}"
         self._update_window_title()
         self.resize(900, 560)
         self.setAcceptDrops(True)
@@ -300,10 +300,11 @@ class MainWindow(QMainWindow):
         # ---- CSV 批量导入 ----
         csv_layout = QHBoxLayout()
         self._load_csv_btn = QPushButton("Load CSV")
-        self._load_csv_btn.setToolTip(
-            "支持 CSV/TSV/TXT。自动识别列名（video_id / csvid / 链接 / url 等）或每行一个 ID"
-        )
+        self._load_csv_btn.setToolTip("导入 CSV/TSV/TXT，自动识别链接或 BV/ID 列")
         csv_layout.addWidget(self._load_csv_btn)
+        self._version_label = QLabel(f"v{self._app_version}")
+        self._version_label.setStyleSheet("color: gray;")
+        csv_layout.addWidget(self._version_label)
         csv_layout.addWidget(QLabel("最小分辨率:"))
         self._min_height_input = QLineEdit()
         self._min_height_input.setPlaceholderText("如 720 / 1080")
