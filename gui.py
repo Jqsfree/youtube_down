@@ -20,6 +20,7 @@ from PySide6.QtGui import QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -42,6 +43,15 @@ from worker import AUTO_FORMAT_ID, BatchDownloadWorker, ValidateCookieWorker
 
 class MainWindow(QMainWindow):
     """YouTube Downloader 主窗口。"""
+
+    _QUALITY_PRESETS: tuple[tuple[str, int | None], ...] = (
+        ("720p", 720),
+        ("1080p", 1080),
+        ("1440p", 1440),
+        ("2160p (4K)", 2160),
+        ("自动（尽量最高 ≥720p）", 720),
+        ("自定义", None),
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -305,11 +315,21 @@ class MainWindow(QMainWindow):
         self._version_label = QLabel(f"v{self._app_version}")
         self._version_label.setStyleSheet("color: gray;")
         csv_layout.addWidget(self._version_label)
-        csv_layout.addWidget(QLabel("最小分辨率:"))
+        csv_layout.addWidget(QLabel("清晰度:"))
+        self._quality_combo = QComboBox()
+        for label, _ in self._QUALITY_PRESETS:
+            self._quality_combo.addItem(label)
+        self._quality_combo.setCurrentIndex(0)
+        self._quality_combo.setToolTip(
+            "批量下载时逐条自动匹配不低于所选清晰度的最佳格式"
+        )
+        self._quality_combo.setMinimumWidth(150)
+        csv_layout.addWidget(self._quality_combo)
         self._min_height_input = QLineEdit()
         self._min_height_input.setPlaceholderText("如 720 / 1080")
         self._min_height_input.setText("720")
         self._min_height_input.setMaximumWidth(90)
+        self._min_height_input.setVisible(False)
         csv_layout.addWidget(self._min_height_input)
         self._csv_label = QLabel("")
         csv_layout.addWidget(self._csv_label)
@@ -403,6 +423,7 @@ class MainWindow(QMainWindow):
         self._import_cookie_btn.clicked.connect(self._on_import_cookie)
         self._clear_cookie_btn.clicked.connect(self._on_clear_cookie)
         self._load_csv_btn.clicked.connect(self._on_load_csv)
+        self._quality_combo.currentIndexChanged.connect(self._on_quality_changed)
         self._browse_btn.clicked.connect(self._on_browse)
         self._download_btn.clicked.connect(self._on_download)
         self._cancel_btn.clicked.connect(self._on_cancel)
@@ -508,10 +529,10 @@ class MainWindow(QMainWindow):
         self._refresh_imported_files_list(self._csv_queue)
         self._log(f"加载队列: {parts}")
 
-        min_height = self._parse_min_height(self._min_height_input.text())
+        min_height = self._get_min_height()
         self._download_btn.setEnabled(True)
         self._status_label.setText(
-            f"已加载 {total} 个视频 — 将按最小分辨率 {min_height}p 逐条自动匹配格式"
+            f"已加载 {total} 个视频 — 将按 {self._quality_label(min_height)} 逐条自动匹配格式"
         )
 
     def _refresh_imported_files_list(self, queue: list[tuple[str, list[str], Path | None]]) -> None:
@@ -662,7 +683,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先 Load CSV 导入视频列表")
             return
 
-        min_height = self._parse_min_height(self._min_height_input.text())
+        min_height = self._get_min_height()
         output_dir = Path(self._output_input.text())
         if not output_dir.exists():
             try:
@@ -735,6 +756,27 @@ class MainWindow(QMainWindow):
         self._set_downloading_ui(True)
         self._worker.start()
 
+    def _on_quality_changed(self, index: int) -> None:
+        """切换清晰度预设时同步自定义输入框。"""
+        _, preset = self._QUALITY_PRESETS[index]
+        is_custom = preset is None
+        self._min_height_input.setVisible(is_custom)
+        if not is_custom and preset is not None:
+            self._min_height_input.setText(str(preset))
+
+    def _get_min_height(self) -> int:
+        """从清晰度下拉或自定义输入解析目标分辨率。"""
+        index = self._quality_combo.currentIndex()
+        _, preset = self._QUALITY_PRESETS[index]
+        if preset is not None:
+            return preset
+        return self._parse_min_height(self._min_height_input.text())
+
+    @staticmethod
+    def _quality_label(min_height: int) -> str:
+        """生成状态栏用的清晰度描述。"""
+        return f"不低于 {min_height}p 的最佳格式"
+
     @staticmethod
     def _parse_min_height(value: str) -> int:
         """解析最小分辨率阈值，非法时回退到 720。"""
@@ -788,6 +830,8 @@ class MainWindow(QMainWindow):
         self._load_csv_btn.setEnabled(not downloading)
         self._download_btn.setEnabled(not downloading and bool(self._csv_queue or self._csv_ids))
         self._cancel_btn.setEnabled(downloading)
+        self._quality_combo.setEnabled(not downloading)
+        self._min_height_input.setEnabled(not downloading)
         self._output_input.setEnabled(not downloading)
         self._browse_btn.setEnabled(not downloading)
         if not downloading:

@@ -31,6 +31,21 @@ def test_parse_min_height_uses_custom_value():
     assert MainWindow._parse_min_height("invalid") == 720
 
 
+def test_get_min_height_uses_quality_preset():
+    window = MainWindow.__new__(MainWindow)
+    window._QUALITY_PRESETS = MainWindow._QUALITY_PRESETS
+    window._quality_combo = type("Combo", (), {"currentIndex": lambda self: 1})()
+    assert window._get_min_height() == 1080
+
+
+def test_get_min_height_uses_custom_input():
+    window = MainWindow.__new__(MainWindow)
+    window._QUALITY_PRESETS = MainWindow._QUALITY_PRESETS
+    window._quality_combo = type("Combo", (), {"currentIndex": lambda self: 5})()
+    window._min_height_input = type("Input", (), {"text": lambda self: "900"})()
+    assert window._get_min_height() == 900
+
+
 def test_list_formats_filters_below_min_height():
     downloader = YoutubeDownloader.__new__(YoutubeDownloader)
     info = {
