@@ -300,14 +300,10 @@ class MainWindow(QMainWindow):
         # ---- CSV 批量导入 ----
         csv_layout = QHBoxLayout()
         self._load_csv_btn = QPushButton("Load CSV")
-        self._load_csv_btn.setToolTip("支持 CSV/TSV/TXT，并可按自定义字段名导入")
+        self._load_csv_btn.setToolTip(
+            "支持 CSV/TSV/TXT。自动识别列名（video_id / csvid / 链接 / url 等）或每行一个 ID"
+        )
         csv_layout.addWidget(self._load_csv_btn)
-        csv_layout.addWidget(QLabel("字段:"))
-        self._csv_column_input = QLineEdit()
-        self._csv_column_input.setPlaceholderText("如 video_id / csvid / source / bvid / url")
-        self._csv_column_input.setText("video_id")
-        self._csv_column_input.setMaximumWidth(180)
-        csv_layout.addWidget(self._csv_column_input)
         csv_layout.addWidget(QLabel("最小分辨率:"))
         self._min_height_input = QLineEdit()
         self._min_height_input.setPlaceholderText("如 720 / 1080")
@@ -442,9 +438,9 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        import_column = self._csv_column_input.text().strip() or "video_id"
         all_ids: list[str] = []
         errors: list[str] = []
+        detected_columns: list[str] = []
         self._csv_queue = []
         self._csv_cookie_overrides = {}
         seen_names: set[str] = set()
@@ -452,7 +448,7 @@ class MainWindow(QMainWindow):
         for fp in filepaths:
             path = Path(fp)
             try:
-                rows = YoutubeDownloader.load_csv_rows(path, column=import_column)
+                rows = YoutubeDownloader.load_csv_rows(path)
             except FileNotFoundError as exc:
                 errors.append(f"{path.name}: {exc}")
                 continue
@@ -461,7 +457,12 @@ class MainWindow(QMainWindow):
                 continue
 
             if not rows:
+                errors.append(f"{path.name}: 未识别到有效视频 ID/链接")
                 continue
+
+            used_column = rows[0].get("_import_column", "")
+            if used_column:
+                detected_columns.append(f"{path.name}→{used_column}")
 
             ids = [row["video_id"] for row in rows]
             all_ids.extend(ids)
@@ -492,14 +493,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "文件错误", "\n".join(errors))
 
         if not self._csv_queue:
-            QMessageBox.warning(self, "提示", "CSV 中未找到有效的 video_id")
+            detail = "\n".join(errors) if errors else "请检查 CSV 是否包含 BV/URL/YouTube ID 列"
+            QMessageBox.warning(self, "导入失败", f"未能从文件中识别视频列表。\n\n{detail}")
             return
 
         self._csv_ids = list(dict.fromkeys(all_ids))
         total = sum(len(ids) for _, ids, _ in self._csv_queue)
         parts = " → ".join(f"{name}({len(ids)})" for name, ids, _ in self._csv_queue)
+        col_hint = f" | 列: {', '.join(detected_columns)}" if detected_columns else ""
         self._csv_label.setText(
-            f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频（依据列: {import_column}）"
+            f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频{col_hint}"
         )
         self._refresh_imported_files_list(self._csv_queue)
         self._log(f"加载队列: {parts}")

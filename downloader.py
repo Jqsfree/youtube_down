@@ -45,6 +45,23 @@ _PLATFORM_LABELS = {
 # Netscape cookies.txt 常见文件头
 _NETSCAPE_MARKERS = ("# netscape", "# http cookie file")
 
+# CSV 列名别名（含中文表头）
+_CSV_COLUMN_ALIASES: tuple[str, ...] = (
+    "video_id", "videoid", "video-id", "media_id", "source", "id",
+    "csvid", "csv_id", "video", "link",
+    "youtube_id", "youtubeid", "bvid", "bv", "aid", "av",
+    "url", "video_url", "source_url", "watch", "uri",
+    "视频链接", "视频地址", "视频id", "视频_id", "视频", "链接", "地址",
+    "bv号", "bv_id", "网址", "url地址", "播放链接", "分享链接", "视频url",
+)
+
+_CSV_ENCODINGS: tuple[str, ...] = (
+    "utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be",
+    "gb18030", "gbk", "cp936", "latin-1",
+)
+
+_CSV_DELIMITERS: tuple[str, ...] = (",", ";", "\t", "|")
+
 _PROJECT_ROOT = Path(__file__).resolve().parent
 
 # 工具名 → resources/ 下的子目录（ffmpeg 与 ffprobe 同目录）
@@ -1128,108 +1145,198 @@ class YoutubeDownloader:
         msg += "\n\nCookie 文件已加载，可导入 CSV 后开始批量下载。"
         return False, msg
 
-    def redetect_browser(self) -> bool:
-        """重新检测浏览器（Profile 可能已切换）。
-        返回 True 表示检测到了新的 Cookie 源。
-        """
-        old = self._cookies_spec
-        info = self.detect_browser()
-        self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
-        changed = self._cookies_spec is not None
-        if changed and self._cookies_spec == old:
-            changed = False  # 没变，不算重载成功
-        return changed
-
     # ------------------------------------------------------------------
     # CSV
     # ------------------------------------------------------------------
 
     @staticmethod
-    def load_csv(filepath: Path, column: str = "video_id") -> list[str]:
+    def _clean_fieldname(name: str) -> str:
+        return (name or "").strip().strip("\ufeff").strip()
+
+    @staticmethod
+    def _normalize_column_key(name: str) -> str:
+        return YoutubeDownloader._clean_fieldname(name).lower().replace(" ", "_").replace("-", "_")
+
+    @staticmethod
+    def load_csv(filepath: Path, column: str = "") -> list[str]:
         """从 CSV/TSV/TXT 读取媒体来源列表（自动去重、支持 URL 提取）。"""
         rows = YoutubeDownloader.load_csv_rows(filepath, column=column)
         return [row["video_id"] for row in rows]
 
     @staticmethod
-    def load_csv_rows(filepath: Path, column: str = "video_id") -> list[dict[str, str]]:
+    def load_csv_rows(filepath: Path, column: str = "") -> list[dict[str, str]]:
         """从 CSV/TSV/TXT 读取带原始字段的记录，保留 output_dir 等信息。"""
         if not filepath.exists():
             raise FileNotFoundError(f"文件不存在: {filepath}")
 
         ext = filepath.suffix.lower()
-        delimiter: str | None = None
         if ext == ".tsv":
-            delimiter = "\t"
-        elif ext == ".txt":
-            delimiter = None
+            delimiters: tuple[str, ...] = ("\t",)
         else:
-            delimiter = ","
+            delimiters = _CSV_DELIMITERS
 
         last_err: Exception | None = None
-        for encoding in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "gbk", "cp936", "latin-1"):
-            try:
-                with open(filepath, "r", encoding=encoding, newline="") as f:
-                    sample = f.read(4096)
-                    f.seek(0)
-                    if delimiter is None:
-                        try:
-                            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-                            delimiter = dialect.delimiter
-                        except csv.Error:
-                            delimiter = ","
-
-                    reader = csv.DictReader(f, delimiter=delimiter)
-                    fieldnames = [name.strip() if name else "" for name in (reader.fieldnames or [])]
-                    if not fieldnames:
-                        raise ValueError("文件中没有可解析的表头")
-
-                    rows, seen = YoutubeDownloader._read_csv_rows(
-                        reader, fieldnames, column, delimiter or ","
+        last_value_err: Exception | None = None
+        for encoding in _CSV_ENCODINGS:
+            for delimiter in delimiters:
+                try:
+                    rows = YoutubeDownloader._load_csv_rows_with_delimiter(
+                        filepath, encoding=encoding, delimiter=delimiter, column=column,
                     )
                     if rows:
                         return rows
+                except UnicodeDecodeError as exc:
+                    last_err = exc
+                    break
+                except UnicodeError as exc:
+                    last_err = exc
+                    break
+                except ValueError as exc:
+                    last_value_err = exc
+                    continue
+                except csv.Error:
+                    continue
 
-                    # 无表头单列文件：整列视为 ID 列表
-                    f.seek(0)
-                    headerless = YoutubeDownloader._read_headerless_column(f, delimiter or ",")
-                    if headerless:
-                        return headerless
-
-                    target_column = YoutubeDownloader._resolve_column(fieldnames, column)
-                    if target_column is None:
-                        raise ValueError(
-                            f"文件中没有 '{column}' 列，可用列: {fieldnames}"
-                        )
-                    raise ValueError(f"列 '{target_column}' 中没有有效的视频 ID")
-            except (UnicodeDecodeError, UnicodeError) as exc:
-                last_err = exc
-                continue
-            except ValueError:
-                raise
-
-        raise ValueError(f"无法识别文件编码或格式: {filepath}") from last_err
+        if last_value_err:
+            raise last_value_err
+        raise ValueError(
+            f"无法识别文件编码或格式: {filepath}"
+            + (f"（{last_err}）" if last_err else "")
+        ) from last_err
 
     @staticmethod
-    def _read_csv_rows(
-        reader: csv.DictReader,
-        fieldnames: list[str],
-        column: str,
+    def _load_csv_rows_with_delimiter(
+        filepath: Path,
+        *,
+        encoding: str,
         delimiter: str,
-    ) -> tuple[list[dict[str, str]], set[str]]:
-        target_column = YoutubeDownloader._resolve_column(fieldnames, column)
-        if target_column is None:
-            return [], set()
+        column: str,
+    ) -> list[dict[str, str]]:
+        with open(filepath, "r", encoding=encoding, newline="") as f:
+            sample = f.read(4096)
+            f.seek(0)
+            if not sample.strip():
+                return []
 
+            reader = csv.DictReader(f, delimiter=delimiter)
+            fieldnames = [
+                YoutubeDownloader._clean_fieldname(name)
+                for name in (reader.fieldnames or [])
+            ]
+            fieldnames = [name for name in fieldnames if name]
+            if len(fieldnames) == 1 and any(ch in fieldnames[0] for ch in (";", "\t", "|")):
+                embedded = fieldnames[0]
+                for alt in (";", "\t", "|"):
+                    if alt in embedded:
+                        f.seek(0)
+                        nested = YoutubeDownloader._load_csv_rows_with_delimiter(
+                            filepath,
+                            encoding=encoding,
+                            delimiter=alt,
+                            column=column,
+                        )
+                        if nested:
+                            return nested
+                        break
+
+            if not fieldnames:
+                f.seek(0)
+                return YoutubeDownloader._read_headerless_column(f, delimiter)
+
+            if len(fieldnames) == 1 and YoutubeDownloader._looks_like_media_cell(fieldnames[0]):
+                f.seek(0)
+                headerless = YoutubeDownloader._read_headerless_column(f, delimiter)
+                if headerless:
+                    return headerless
+
+            raw_rows = list(reader)
+            used_column, rows = YoutubeDownloader._detect_best_column(
+                fieldnames, raw_rows, column,
+            )
+            if rows:
+                for record in rows:
+                    record["_import_column"] = used_column or ""
+                return rows
+
+            f.seek(0)
+            headerless = YoutubeDownloader._read_headerless_column(f, delimiter)
+            if headerless:
+                for record in headerless:
+                    record["_import_column"] = ""
+                return headerless
+
+            preview_cols = ", ".join(fieldnames[:8])
+            if len(fieldnames) > 8:
+                preview_cols += ", ..."
+            raise ValueError(
+                f"未在表头 [{preview_cols}] 中找到有效视频 ID/链接。"
+                f"请确认列内为 YouTube ID、BV 号或完整 URL"
+            )
+
+    @staticmethod
+    def _detect_best_column(
+        fieldnames: list[str],
+        raw_rows: list[dict[str, str]],
+        preferred: str,
+    ) -> tuple[str | None, list[dict[str, str]]]:
+        target = YoutubeDownloader._resolve_column(fieldnames, preferred)
+        if target:
+            rows = YoutubeDownloader._extract_rows_from_raw(raw_rows, target)
+            if rows:
+                return target, rows
+
+        best_column: str | None = None
+        best_rows: list[dict[str, str]] = []
+        best_score = -1
+        for col in fieldnames:
+            rows = YoutubeDownloader._extract_rows_from_raw(raw_rows, col)
+            score = sum(
+                YoutubeDownloader._media_cell_score(row.get(col, "") or "")
+                for row in raw_rows
+            )
+            if len(rows) > len(best_rows) or (len(rows) == len(best_rows) and score > best_score):
+                best_rows = rows
+                best_column = col
+                best_score = score
+        return best_column, best_rows
+
+    @staticmethod
+    def _looks_like_media_cell(value: str) -> bool:
+        return YoutubeDownloader._media_cell_score(value) > 0
+
+    @staticmethod
+    def _media_cell_score(value: str) -> int:
+        text = (value or "").strip()
+        if not text:
+            return 0
+        lower = text.lower()
+        if "://" in text or "youtu" in lower or "bilibili" in lower or "b23.tv" in lower:
+            return 3
+        if re.search(r"\bBV[0-9A-Za-z]{10}\b", text, flags=re.I):
+            return 3
+        if re.search(r"\bav\d+\b", text, flags=re.I):
+            return 2
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", text):
+            return 2
+        return 0
+
+    @staticmethod
+    def _extract_rows_from_raw(
+        raw_rows: list[dict[str, str]],
+        target_column: str,
+    ) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
         seen: set[str] = set()
-        target_key = target_column.strip().lower().replace(" ", "_").replace("-", "_")
-        for row in reader:
+        target_key = YoutubeDownloader._normalize_column_key(target_column)
+        for row in raw_rows:
             raw_value = row.get(target_column, "") or ""
             media_value = raw_value
             if target_key in {"aid", "av"} and raw_value.strip().isdigit():
                 media_value = f"av{raw_value.strip()}"
             vid = YoutubeDownloader._normalize_video_id(media_value)
             if not vid or vid in seen:
+                continue
+            if target_key not in {"aid", "av"} and YoutubeDownloader._media_cell_score(raw_value) <= 0:
                 continue
             seen.add(vid)
             media = YoutubeDownloader.parse_input(media_value)
@@ -1250,7 +1357,7 @@ class YoutubeDownloader:
             if browser_cookie:
                 record["cookies_from_browser"] = browser_cookie
             rows.append(record)
-        return rows, seen
+        return rows
 
     @staticmethod
     def _read_headerless_column(handle: Any, delimiter: str) -> list[dict[str, str]]:
@@ -1261,37 +1368,40 @@ class YoutubeDownloader:
         for line in reader:
             if not line:
                 continue
-            raw_value = (line[0] or "").strip()
-            if not raw_value or raw_value.startswith("#"):
-                continue
-            vid = YoutubeDownloader._normalize_video_id(raw_value)
-            if not vid or vid in seen:
-                continue
-            seen.add(vid)
-            media = YoutubeDownloader.parse_input(raw_value)
-            rows.append({
-                "video_id": vid,
-                "platform": media.platform,
-                "source_url": media.url,
-                "media_id": media.media_id,
-            })
+            for raw_value in line:
+                text = (raw_value or "").strip()
+                if not text or text.startswith("#"):
+                    continue
+                vid = YoutubeDownloader._normalize_video_id(text)
+                if not vid or vid in seen:
+                    continue
+                if YoutubeDownloader._media_cell_score(text) <= 0:
+                    continue
+                seen.add(vid)
+                media = YoutubeDownloader.parse_input(text)
+                rows.append({
+                    "video_id": vid,
+                    "platform": media.platform,
+                    "source_url": media.url,
+                    "media_id": media.media_id,
+                })
         return rows
 
     @staticmethod
     def _resolve_column(fieldnames: list[str], preferred: str) -> str | None:
-        """在表头中匹配用户指定字段，支持大小写和空格差异。"""
-        normalized = {name.strip().lower().replace(" ", "_").replace("-", "_"): name for name in fieldnames}
+        """在表头中匹配视频 ID 列，支持中英文别名。"""
+        normalized = {
+            YoutubeDownloader._normalize_column_key(name): name
+            for name in fieldnames
+            if YoutubeDownloader._clean_fieldname(name)
+        }
         if preferred:
-            key = preferred.strip().lower().replace(" ", "_").replace("-", "_")
+            key = YoutubeDownloader._normalize_column_key(preferred)
             if key in normalized:
                 return normalized[key]
 
-        for key in (
-            "video_id", "videoid", "media_id", "source", "id",
-            "csvid", "csv_id", "video", "link",
-            "youtube_id", "youtubeid", "bvid", "bv", "aid", "av",
-            "url", "video_url", "source_url",
-        ):
+        for alias in _CSV_COLUMN_ALIASES:
+            key = YoutubeDownloader._normalize_column_key(alias)
             if key in normalized:
                 return normalized[key]
         return None
@@ -1304,13 +1414,31 @@ class YoutubeDownloader:
             return ""
         media = YoutubeDownloader.parse_input(text)
         if media.platform == "youtube":
-            return media.media_id
+            if "youtube" in text.lower() or "youtu.be" in text.lower() or re.fullmatch(
+                r"[A-Za-z0-9_-]{11}", media.media_id
+            ):
+                return media.media_id
+            return ""
         if media.platform == "bilibili":
             parsed = urlparse(media.original if "://" in media.original else media.url)
             if parsed.netloc.lower().endswith("b23.tv"):
                 return media.url
             return media.media_id
-        return media.url
+        if "://" in text:
+            return media.url
+        return ""
+
+    def redetect_browser(self) -> bool:
+        """重新检测浏览器（Profile 可能已切换）。
+        返回 True 表示检测到了新的 Cookie 源。
+        """
+        old = self._cookies_spec
+        info = self.detect_browser()
+        self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
+        changed = self._cookies_spec is not None
+        if changed and self._cookies_spec == old:
+            changed = False  # 没变，不算重载成功
+        return changed
 
     # ------------------------------------------------------------------
     # 内部辅助
