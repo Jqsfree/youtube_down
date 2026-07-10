@@ -74,6 +74,25 @@ def test_list_formats_returns_descending_by_height():
         f"格式应按高度降序排列，实际: {heights}"
 
 
+def test_worker_resolve_format_uses_auto_mode():
+    from worker import AUTO_FORMAT_ID, BatchDownloadWorker
+
+    worker = BatchDownloadWorker.__new__(BatchDownloadWorker)
+    worker._format_id = AUTO_FORMAT_ID
+    worker._min_height = 720
+    downloader = YoutubeDownloader.__new__(YoutubeDownloader)
+
+    info = {
+        "formats": [
+            {"format_id": "1", "resolution": "480p", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "filesize": 1000},
+            {"format_id": "2", "resolution": "720p", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "filesize": 2000},
+        ]
+    }
+
+    worker._downloader = downloader
+    assert worker._resolve_format(info) == ("best", False)
+
+
 def test_worker_resolve_format_rejects_below_threshold():
     from worker import BatchDownloadWorker
 
@@ -90,6 +109,4 @@ def test_worker_resolve_format_rejects_below_threshold():
     }
 
     worker._downloader = downloader
-    fmt_id, needs_merge = worker._resolve_format(info)
-    assert fmt_id == "2"
-    assert needs_merge is False
+    assert worker._resolve_format(info) == ("2", False)

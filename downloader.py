@@ -20,15 +20,47 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
 from logger_utils import AppLogger
 
-_COOKIE_CONFIG = Path.home() / ".youtube_downloader" / "cookiefile.txt"
+_COOKIE_CONFIG_DIR = Path.home() / ".youtube_downloader"
+_COOKIE_CONFIG = _COOKIE_CONFIG_DIR / "cookiefile.txt"
+_PLATFORM_COOKIE_CONFIGS = {
+    "youtube": _COOKIE_CONFIG_DIR / "youtube_cookiefile.txt",
+    "bilibili": _COOKIE_CONFIG_DIR / "bilibili_cookiefile.txt",
+}
+_PLATFORM_COOKIE_DOMAINS = {
+    "youtube": ("youtube.com", "youtu.be"),
+    "bilibili": ("bilibili.com", "b23.tv"),
+}
+_PLATFORM_LABELS = {
+    "youtube": "YouTube",
+    "bilibili": "Bilibili",
+    "generic": "Generic",
+}
 
 # Netscape cookies.txt 常见文件头
 _NETSCAPE_MARKERS = ("# netscape", "# http cookie file")
+
+# CSV 列名别名（含中文表头）
+_CSV_COLUMN_ALIASES: tuple[str, ...] = (
+    "video_id", "videoid", "video-id", "media_id", "source", "id",
+    "csvid", "csv_id", "video", "link",
+    "youtube_id", "youtubeid", "bvid", "bv", "aid", "av",
+    "url", "video_url", "source_url", "watch", "uri",
+    "视频链接", "视频地址", "视频id", "视频_id", "视频", "链接", "地址",
+    "bv号", "bv_id", "网址", "url地址", "播放链接", "分享链接", "视频url",
+)
+
+_CSV_ENCODINGS: tuple[str, ...] = (
+    "utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be",
+    "gb18030", "gbk", "cp936", "latin-1",
+)
+
+_CSV_DELIMITERS: tuple[str, ...] = (",", ";", "\t", "|")
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -117,6 +149,20 @@ class EnvItem:
     message: str
     fatal: bool = False  # 致命缺失 → 不允许跳过
     install_kind: str = ""  # "pip" | "binary" | ""
+
+
+@dataclass(frozen=True)
+class MediaInput:
+    """Normalized media source resolved from a user-provided ID or URL."""
+
+    platform: str
+    original: str
+    media_id: str
+    url: str
+
+    @property
+    def label(self) -> str:
+        return _PLATFORM_LABELS.get(self.platform, self.platform)
 
 
 def check_environment() -> tuple[bool, list[EnvItem]]:
@@ -318,14 +364,17 @@ class YoutubeDownloader:
         self._cancel_lock = threading.Lock()
         self._yt_dlp_lock = threading.RLock()
         self._cookiefile_path: Path | None = None
+        self._cookiefile_platform: str | None = None
+        self._platform_cookiefiles: dict[str, Path] = {}
         self._cookies_spec: str | None = cookies_from_browser
-        self._cookie_broken: bool = False  # Cookie 连续失败标记
+        self._browser_cookie_broken: bool = False  # 浏览器 Cookie 不可用（如 Windows Chrome 锁库）
         if cookiefile:
             self.set_cookiefile(cookiefile, persist=False)
         elif cookies_from_browser == "":
             self._cookies_spec = None
         elif cookies_from_browser is None:
-            saved = self._load_saved_cookiefile()
+            self._platform_cookiefiles = self._load_saved_cookiefiles()
+            saved = self._platform_cookiefiles.get("youtube") or self._load_saved_cookiefile()
             if saved:
                 self.set_cookiefile(saved, persist=False)
             else:
@@ -337,6 +386,77 @@ class YoutubeDownloader:
     # ------------------------------------------------------------------
     # 浏览器检测
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def parse_input(value: str) -> MediaInput:
+        """解析 YouTube / Bilibili ID 或 URL，返回 yt-dlp 可直接使用的 URL。"""
+        text = (value or "").strip()
+        if not text:
+            raise ValueError("请输入视频链接或 ID")
+        text = text.replace("\\", "/")
+        normalized = text
+        if re.match(r"^(www\.|m\.|b23\.tv|bilibili\.com|youtube\.com|youtu\.be)", normalized, re.I):
+            normalized = f"https://{normalized}"
+
+        parsed = urlparse(normalized)
+        host = parsed.netloc.lower()
+        path = parsed.path or ""
+
+        if host.endswith("youtu.be"):
+            media_id = path.strip("/").split("/")[0]
+            if media_id:
+                return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+        if "youtube.com" in host:
+            query = parse_qs(parsed.query)
+            media_id = (query.get("v") or [""])[0]
+            if not media_id:
+                match = re.search(r"/(?:shorts|embed|v)/([A-Za-z0-9_-]{11})", path)
+                media_id = match.group(1) if match else ""
+            if media_id:
+                return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+
+        if "bilibili.com" in host or host.endswith("b23.tv"):
+            media_id = YoutubeDownloader._extract_bilibili_id(normalized) or normalized
+            return MediaInput("bilibili", text, media_id, normalized)
+
+        bili_id = YoutubeDownloader._extract_bilibili_id(text)
+        if bili_id:
+            url_id = bili_id
+            return MediaInput("bilibili", text, bili_id, f"https://www.bilibili.com/video/{url_id}")
+
+        yt_match = re.search(r"^([A-Za-z0-9_-]{11})$", text)
+        if yt_match:
+            media_id = yt_match.group(1)
+            return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+
+        if parsed.scheme in {"http", "https"} and host:
+            return MediaInput("generic", text, normalized, normalized)
+
+        # Preserve historical behavior: unknown bare values are treated as YouTube IDs.
+        return MediaInput("youtube", text, text, f"https://www.youtube.com/watch?v={text}")
+
+    @staticmethod
+    def _extract_bilibili_id(value: str) -> str:
+        bv_match = re.search(r"\b(BV[0-9A-Za-z]{10})\b", value, flags=re.I)
+        if bv_match:
+            raw = bv_match.group(1)
+            return "BV" + raw[2:]
+        av_match = re.search(r"\bav(\d+)\b", value, flags=re.I)
+        if av_match:
+            return f"av{av_match.group(1)}"
+        return ""
+
+    @staticmethod
+    def _platform_label(platform: str) -> str:
+        return _PLATFORM_LABELS.get(platform, platform)
+
+    @staticmethod
+    def _cookie_platform_from_text(text: str) -> str | None:
+        lower = text.lower()
+        for platform, domains in _PLATFORM_COOKIE_DOMAINS.items():
+            if any(domain in lower for domain in domains):
+                return platform
+        return None
 
     @staticmethod
     def detect_browser() -> tuple[str, str] | None:
@@ -420,7 +540,60 @@ class YoutubeDownloader:
     # 内部：构建 yt-dlp 选项
     # ------------------------------------------------------------------
 
-    def _make_opts(self, use_cookies: bool = True, **extra: Any) -> dict[str, Any]:
+    def prefers_cookies_for_fetch(self) -> bool:
+        """是否应在「获取信息」时尝试 Cookie（有 cookie 文件或可用浏览器源）。"""
+        if self._cookiefile_path or self._platform_cookiefiles:
+            return True
+        if self._browser_cookie_broken:
+            return False
+        # Windows 上 Chrome/Edge Cookie 数据库常被锁定，默认不自动读取浏览器
+        if os.name == "nt":
+            return False
+        return bool(self._cookies_spec)
+
+    def _has_explicit_cookie(
+        self,
+        media: MediaInput | None = None,
+        cookiefile_override: str | Path | None = None,
+        cookies_from_browser_override: str | None = None,
+    ) -> bool:
+        if cookiefile_override is not None or cookies_from_browser_override:
+            return True
+        if self._cookiefile_for_platform(media.platform if media else None):
+            return True
+        return False
+
+    @staticmethod
+    def build_format_selector(
+        format_id: str,
+        *,
+        min_height: int = 0,
+        needs_audio_merge: bool = True,
+    ) -> str:
+        """构建 yt-dlp format 字符串，避免无约束的 /best 回退到低画质。"""
+        height = f"[height>={min_height}]" if min_height > 0 else ""
+        if format_id == "best":
+            if min_height > 0:
+                return (
+                    f"bestvideo[height>={min_height}]+bestaudio/"
+                    f"bestvideo[height>={min_height}]+bestaudio"
+                )
+            return "bestvideo+bestaudio/bestvideo+bestaudio"
+        if needs_audio_merge:
+            primary = f"{format_id}+bestaudio"
+            if min_height > 0:
+                return f"{primary}/bestvideo{height}+bestaudio"
+            return primary
+        return format_id
+
+    def _make_opts(
+        self,
+        use_cookies: bool = True,
+        media: MediaInput | None = None,
+        cookiefile_override: str | Path | None = None,
+        cookies_from_browser_override: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
         """构建 yt-dlp 通用选项。
 
         Args:
@@ -453,11 +626,25 @@ class YoutubeDownloader:
         if ffmpeg_path:
             opts["ffmpeg_location"] = str(Path(ffmpeg_path).parent)
         _configure_js_runtimes(opts)
-        if use_cookies and (self._cookies_spec or self._cookiefile_path):
-            if self._cookiefile_path:
-                opts["cookiefile"] = str(self._cookiefile_path)
-            elif self._cookies_spec:
-                parts = self._cookies_spec.split(":")
+        if media and media.platform == "bilibili":
+            opts["http_headers"] = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.bilibili.com/",
+            }
+        cookiefile = (
+            Path(cookiefile_override).expanduser().resolve()
+            if cookiefile_override else self._cookiefile_for_platform(media.platform if media else None)
+        )
+        cookies_spec = cookies_from_browser_override or self._cookies_spec
+        if use_cookies and (cookies_spec or cookiefile):
+            if cookiefile:
+                opts["cookiefile"] = str(cookiefile)
+            elif cookies_spec:
+                parts = cookies_spec.split(":")
                 opts["cookiesfrombrowser"] = tuple(parts)  # type: ignore[assignment]
         opts.update(extra)  # extra 中的 extractor_args 会覆盖默认值
         return opts
@@ -467,12 +654,16 @@ class YoutubeDownloader:
     # ------------------------------------------------------------------
 
     def get_info(
-        self, video_id: str, use_cookies: bool = True
+        self,
+        video_id: str,
+        use_cookies: bool = True,
+        cookiefile_override: str | Path | None = None,
+        cookies_from_browser_override: str | None = None,
     ) -> dict[str, Any]:
         """获取视频元信息和可用格式列表。
 
         Args:
-            video_id: YouTube video ID。
+            video_id: YouTube/Bilibili ID 或完整 URL。
             use_cookies: 是否使用浏览器 Cookie。默认 False。
 
         Returns:
@@ -481,31 +672,53 @@ class YoutubeDownloader:
         Raises:
             yt_dlp.utils.DownloadError: yt-dlp 内部错误（由调用方分类处理）。
         """
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        # Cookie 已标记不可用 → 跳过所有 Cookie 尝试
-        if self._cookie_broken:
+        media = self.parse_input(video_id)
+        url = media.url
+        has_explicit = self._has_explicit_cookie(
+            media, cookiefile_override, cookies_from_browser_override
+        )
+        # 仅禁用浏览器 Cookie；显式 cookie 文件/覆盖不受 _browser_cookie_broken 影响
+        if self._browser_cookie_broken and not has_explicit:
             use_cookies = False
         # Cookie 模式失败时自动回退无 Cookie（Chrome 锁定等场景；cookie 文件不回退）
         last_err = None
-        use_browser = use_cookies and bool(self._cookies_spec) and not self._cookiefile_path
+        has_cookiefile_override = cookiefile_override is not None
+        has_browser_override = bool(cookies_from_browser_override)
+        platform_cookiefile = self._cookiefile_for_platform(media.platform)
+        use_browser = (
+            use_cookies
+            and bool(self._cookies_spec)
+            and platform_cookiefile is None
+            and not has_cookiefile_override
+            and not has_browser_override
+            and not self._browser_cookie_broken
+        )
         attempts = [True, False] if use_browser else [use_cookies]
         with self._yt_dlp_lock:
             for attempt in attempts:
                 try:
-                    opts = self._make_opts(use_cookies=attempt)
+                    opts = self._make_opts(
+                        use_cookies=attempt,
+                        media=media,
+                        cookiefile_override=cookiefile_override,
+                        cookies_from_browser_override=cookies_from_browser_override,
+                    )
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                         if info and len(info.get("formats", [])) > 0:
-                            if attempt != use_cookies:  # Cookie 回退成功 → 标记
-                                self._cookie_broken = True
+                            info.setdefault("_platform", media.platform)
+                            info.setdefault("_source_url", media.url)
+                            info.setdefault("_media_id", media.media_id)
+                            if attempt != use_cookies:  # 浏览器 Cookie 回退成功 → 标记
+                                self._browser_cookie_broken = True
                             return info
                         if info:
                             last_err = yt_dlp.utils.DownloadError(
-                                "YouTube 返回了视频信息但格式列表为空"
+                                f"{media.label} 返回了视频信息但格式列表为空"
                             )
                 except Exception as exc:
                     if "copy chrome cookie" in str(exc).lower():
-                        self._cookie_broken = True  # 锁库，后续全跳过 Cookie
+                        self._browser_cookie_broken = True  # 锁库，后续跳过浏览器 Cookie
                     last_err = exc
         if last_err:
             detail = clean_error(last_err)
@@ -523,7 +736,7 @@ class YoutubeDownloader:
         """获取所有可用格式（过滤后）。
 
         Args:
-            video_id: YouTube video ID。如提供 info 则可省略。
+            video_id: YouTube/Bilibili ID 或 URL。如提供 info 则可省略。
             info: 预先获取的 info dict（避免重复请求）。
 
         Returns:
@@ -544,17 +757,26 @@ class YoutubeDownloader:
                 return 0
 
         results: list[dict[str, Any]] = []
+        _VIDEO_EXTS = {"mp4", "m4a", "webm", "flv", "mkv", "mov", "m4s", "fmp4"}
         for fmt in raw_formats:
-            if fmt.get("ext") not in ("mp4", "m4a"):
+            if fmt.get("ext") not in _VIDEO_EXTS:
                 continue
             resolution = fmt.get("resolution") or ""
             if resolution == "audio only":
-                resolution = "Audio"
+                continue
+            height = fmt.get("height") or 0
+            if not resolution and height:
+                resolution = f"{fmt.get('width', '?')}x{height}"
             elif not resolution:
                 continue
 
-            if min_height is not None and resolution != "Audio":
-                if _height(resolution) < min_height:
+            fmt_type = self._format_type(fmt)
+            if fmt_type == "Audio":
+                continue
+
+            if min_height is not None:
+                res_height = height or _height(resolution)
+                if res_height < min_height:
                     continue
 
             results.append({
@@ -572,6 +794,20 @@ class YoutubeDownloader:
         # 每档分辨率只保留最优版本：Video Only > Video+Audio，大文件 > 小文件
         return self._dedup_formats(results)
 
+    @staticmethod
+    def _has_video_stream(path: Path) -> bool:
+        """确认输出文件包含视频轨，避免仅音频文件被当成成功。"""
+        result = subprocess.run(
+            [
+                _find_tool("ffprobe"), "-v", "quiet", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "video"
+
     def download(
         self,
         video_id: str,
@@ -580,12 +816,14 @@ class YoutubeDownloader:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         use_cookies: bool = True,
         needs_audio_merge: bool = True,
-        min_height: int | None = None,
+        min_height: int = 0,
+        cookiefile_override: str | Path | None = None,
+        cookies_from_browser_override: str | None = None,
     ) -> Path:
         """下载指定格式的视频。
 
         Args:
-            video_id: YouTube video ID。
+            video_id: YouTube/Bilibili ID 或完整 URL。
             format_id: yt-dlp format ID。
             output_dir: 输出目录。
             progress_callback: 进度回调。
@@ -598,7 +836,8 @@ class YoutubeDownloader:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_template = str(output_dir / "%(id)s.%(ext)s")
-        url = f"https://www.youtube.com/watch?v={video_id}"
+        media = self.parse_input(video_id)
+        url = media.url
 
         def _progress_hook(d: dict[str, Any]) -> None:
             if progress_callback:
@@ -608,14 +847,16 @@ class YoutubeDownloader:
             if cancelled:
                 raise yt_dlp.utils.DownloadError("下载已取消")
 
-        if format_id == "best":
-            fmt_str = "best"
-        elif needs_audio_merge:
-            fmt_str = f"{format_id}+bestaudio/best"
-        else:
-            fmt_str = format_id
+        fmt_str = self.build_format_selector(
+            format_id,
+            min_height=min_height,
+            needs_audio_merge=needs_audio_merge,
+        )
         opts = self._make_opts(
             use_cookies=use_cookies,
+            media=media,
+            cookiefile_override=cookiefile_override,
+            cookies_from_browser_override=cookies_from_browser_override,
             format=fmt_str,
             outtmpl=output_template,
             progress_hooks=[_progress_hook],
@@ -642,12 +883,13 @@ class YoutubeDownloader:
                 if not path.exists():
                     stem = path.stem
                     candidates = list(output_dir.glob(f"{stem}.*"))
-                    # 只保留视频/音频扩展名，排除 .json/.jpg/.part 等
-                    _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4a", ".mp3"}
-                    candidates = [
+                    _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".flv"}
+                    video_candidates = [
                         c for c in candidates if c.suffix.lower() in _VIDEO_EXTS
                     ]
-                    if candidates:
+                    if video_candidates:
+                        path = max(video_candidates, key=lambda p: p.stat().st_size)
+                    elif candidates:
                         path = candidates[0]
                     else:
                         raise yt_dlp.utils.DownloadError(
@@ -657,6 +899,11 @@ class YoutubeDownloader:
                 if path.stat().st_size <= 1024:
                     raise yt_dlp.utils.DownloadError(
                         f"下载文件过小 ({path.stat().st_size} bytes): {path}"
+                    )
+
+                if not self._has_video_stream(path):
+                    raise yt_dlp.utils.DownloadError(
+                        f"下载结果只有音频或缺少视频轨: {path}"
                     )
 
                 # 校验文件是有效媒体（ffprobe 解析 + 时长比对）
@@ -738,6 +985,23 @@ class YoutubeDownloader:
         return path if path.is_file() else None
 
     @staticmethod
+    def _load_saved_cookiefiles() -> dict[str, Path]:
+        result: dict[str, Path] = {}
+        for platform, config_path in _PLATFORM_COOKIE_CONFIGS.items():
+            if not config_path.is_file():
+                continue
+            try:
+                path = Path(config_path.read_text(encoding="utf-8").strip())
+            except OSError:
+                continue
+            if path.is_file():
+                result[platform] = path
+        legacy = YoutubeDownloader._load_saved_cookiefile()
+        if legacy and "youtube" not in result:
+            result["youtube"] = legacy
+        return result
+
+    @staticmethod
     def _persist_cookiefile(path: Path | None) -> None:
         try:
             if path is None:
@@ -749,10 +1013,46 @@ class YoutubeDownloader:
         except OSError:
             pass
 
+    @staticmethod
+    def _persist_platform_cookiefile(platform: str, path: Path | None) -> None:
+        config_path = _PLATFORM_COOKIE_CONFIGS.get(platform)
+        if config_path is None:
+            return
+        try:
+            if path is None:
+                if config_path.is_file():
+                    config_path.unlink()
+                return
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(str(path.resolve()), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _cookiefile_for_platform(self, platform: str | None) -> Path | None:
+        if platform and platform in self._platform_cookiefiles:
+            return self._platform_cookiefiles[platform]
+        if (
+            self._cookiefile_path
+            and (self._cookiefile_platform is None or platform is None or self._cookiefile_platform == platform)
+        ):
+            return self._cookiefile_path
+        return None
+
+    def has_cookie_for_source(self, source: str) -> bool:
+        """Return whether a cookie source is available for a media input."""
+        try:
+            media = self.parse_input(source)
+        except ValueError:
+            media = None
+        if self._cookiefile_for_platform(media.platform if media else None):
+            return True
+        return bool(self._cookies_spec)
+
     def cookie_source(self) -> str:
         """当前 Cookie 来源描述（用于 UI 显示）。"""
         if self._cookiefile_path:
-            return f"file:{self._cookiefile_path.name}"
+            prefix = self._platform_label(self._cookiefile_platform) if self._cookiefile_platform else "file"
+            return f"{prefix}:{self._cookiefile_path.name}"
         if self._cookies_spec:
             return f"browser:{self._cookies_spec}"
         return ""
@@ -767,12 +1067,10 @@ class YoutubeDownloader:
             head = cookie_path.read_text(encoding="utf-8", errors="replace")[:4096].lower()
         except OSError:
             return False
-        if "youtube.com" not in head:
-            return False
         return any(m in head for m in _NETSCAPE_MARKERS) or "\t" in head
 
     @staticmethod
-    def validate_cookie_file(path: str | Path) -> tuple[bool, str]:
+    def validate_cookie_file(path: str | Path, platform: str | None = None) -> tuple[bool, str]:
         """本地校验 cookie 文件格式（不访问网络）。"""
         cookie_path = Path(path).expanduser()
         if not cookie_path.is_file():
@@ -784,43 +1082,75 @@ class YoutubeDownloader:
         except OSError as exc:
             return False, f"无法读取文件: {exc}"
         lower = text.lower()
-        if "youtube.com" not in lower:
-            return False, "文件中未找到 youtube.com 的 Cookie（请从已登录 YouTube 的浏览器导出）"
         if not YoutubeDownloader.is_netscape_cookie_file(cookie_path):
             return False, (
                 "不是 Netscape cookies.txt 格式。\n"
                 "请使用扩展「Get cookies.txt LOCALLY」导出，勿使用 JSON 格式。"
             )
-        return True, "格式校验通过"
+        detected = YoutubeDownloader._cookie_platform_from_text(lower)
+        if platform:
+            expected_domains = _PLATFORM_COOKIE_DOMAINS.get(platform, ())
+            if not any(domain in lower for domain in expected_domains):
+                label = YoutubeDownloader._platform_label(platform)
+                domains = " / ".join(expected_domains)
+                return False, f"文件中未找到 {domains} 的 Cookie（请从已登录 {label} 的浏览器导出）"
+            detected = platform
+        elif detected is None:
+            return False, "文件中未找到 youtube.com 或 bilibili.com 的 Cookie"
+        msg = f"格式校验通过 ({YoutubeDownloader._platform_label(detected)})"
+        if detected == "bilibili" and "sessdata" not in lower:
+            msg += "；未检测到 SESSDATA，可能不是登录 Cookie"
+        return True, msg
 
     def set_cookiefile(self, path: str | Path, *, persist: bool = True) -> None:
         """设置 Netscape 格式 cookie 文件（优先于浏览器 Cookie）。"""
         cookie_path = Path(path).expanduser().resolve()
-        ok, msg = self.validate_cookie_file(cookie_path)
+        if not cookie_path.is_file():
+            raise ValueError(f"文件不存在: {cookie_path}")
+        try:
+            text = cookie_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise ValueError(f"无法读取文件: {exc}") from exc
+        platform = self._cookie_platform_from_text(text)
+        ok, msg = self.validate_cookie_file(cookie_path, platform=platform)
         if not ok:
             raise ValueError(msg)
         self._cookiefile_path = cookie_path
+        self._cookiefile_platform = platform
+        if platform:
+            self._platform_cookiefiles[platform] = cookie_path
         self._cookies_spec = None
-        self._cookie_broken = False
+        self._browser_cookie_broken = False
         if persist:
-            self._persist_cookiefile(cookie_path)
+            if platform:
+                self._persist_platform_cookiefile(platform, cookie_path)
+            # Keep legacy config for YouTube so existing installs continue to work.
+            if platform in (None, "youtube"):
+                self._persist_cookiefile(cookie_path)
 
     def clear_cookiefile(self, *, persist: bool = True) -> None:
         """清除 cookie 文件，恢复自动检测浏览器 Cookie。"""
+        old_platform = self._cookiefile_platform
         self._cookiefile_path = None
-        self._cookie_broken = False
+        self._cookiefile_platform = None
+        self._browser_cookie_broken = False
         if persist:
+            if old_platform:
+                self._platform_cookiefiles.pop(old_platform, None)
+                self._persist_platform_cookiefile(old_platform, None)
             self._persist_cookiefile(None)
         info = self.detect_browser()
         self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
 
     def validate_cookies(self) -> tuple[bool, str]:
-        """联网探测 Cookie 是否能让 YouTube 返回格式列表。"""
+        """联网探测 Cookie 是否能让当前平台返回格式列表。"""
         if not self._cookiefile_path and not self._cookies_spec:
             return False, "未配置 Cookie"
 
         using_file = bool(self._cookiefile_path)
-        if using_file and not _resolve_tool("deno") and not _resolve_tool("node"):
+        platform = self._cookiefile_platform or "youtube"
+        label = self._platform_label(platform)
+        if platform == "youtube" and using_file and not _resolve_tool("deno") and not _resolve_tool("node"):
             return False, (
                 "未检测到 deno 或 node.js。\n"
                 "Cookie 模式需要 JS 运行时才能通过 YouTube 验证。\n"
@@ -829,10 +1159,10 @@ class YoutubeDownloader:
                 "安装后重启应用再试。"
             )
 
-        test_id = "dQw4w9WgXcQ"
+        test_source = "dQw4w9WgXcQ" if platform == "youtube" else "BV1GJ411x7h7"
         cookie_err: Exception | None = None
         try:
-            info = self.get_info(test_id, use_cookies=True)
+            info = self.get_info(test_source, use_cookies=True)
             n = len(info.get("formats", []))
             return True, f"Cookie 验证通过 ({n} formats, {self.cookie_source()})"
         except Exception as exc:
@@ -840,32 +1170,317 @@ class YoutubeDownloader:
 
         # 对比：无 Cookie 是否能获取格式
         try:
-            info_no = self.get_info(test_id, use_cookies=False)
+            info_no = self.get_info(test_source, use_cookies=False)
             if len(info_no.get("formats", [])) > 0:
                 detail = clean_error(cookie_err) if cookie_err else "未知错误"
                 return False, (
                     f"Cookie 未能改善访问（不使用 Cookie 反而能获取格式）。\n"
                     f"可能 cookies.txt 已过期或导出不完整。\n"
                     f"详情: {detail}\n"
-                    "请重新登录 YouTube 后导出新的 cookies.txt。"
+                    f"请重新登录 {label} 后导出新的 cookies.txt。"
                 )
         except Exception:
             pass
 
-        detail = clean_error(cookie_err) if cookie_err else "YouTube 未返回格式"
+        detail = clean_error(cookie_err) if cookie_err else f"{label} 未返回格式"
         hints: list[str] = []
         if using_file:
-            hints.append("确认 cookies.txt 来自已登录 YouTube 的浏览器（扩展 Get cookies.txt LOCALLY）")
+            hints.append(f"确认 cookies.txt 来自已登录 {label} 的浏览器（扩展 Get cookies.txt LOCALLY）")
+        if platform == "bilibili" and using_file:
+            hints.append("Bilibili 高画质通常需要 cookies.txt 中包含 SESSDATA")
         if "bot" in detail.lower() or "sign in" in detail.lower():
-            hints.append("YouTube 仍要求验证，请重新导出 Cookie 或换网络/IP 后重试")
+            hints.append(f"{label} 仍要求验证，请重新导出 Cookie 或换网络/IP 后重试")
         if _resolve_tool("deno") or _resolve_tool("node"):
             hints.append("已检测到 JS 运行时，若仍失败多为 Cookie 过期")
         hint_text = "\n".join(f"- {h}" for h in hints) if hints else ""
         msg = f"Cookie 验证失败: {detail}"
         if hint_text:
             msg += f"\n{hint_text}"
-        msg += "\n\nCookie 文件已加载，仍可直接点击「获取信息」测试目标视频。"
+        msg += "\n\nCookie 文件已加载，可导入 CSV 后开始批量下载。"
         return False, msg
+
+    # ------------------------------------------------------------------
+    # CSV
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_fieldname(name: str) -> str:
+        return (name or "").strip().strip("\ufeff").strip()
+
+    @staticmethod
+    def _normalize_column_key(name: str) -> str:
+        return YoutubeDownloader._clean_fieldname(name).lower().replace(" ", "_").replace("-", "_")
+
+    @staticmethod
+    def load_csv(filepath: Path, column: str = "") -> list[str]:
+        """从 CSV/TSV/TXT 读取媒体来源列表（自动去重、支持 URL 提取）。"""
+        rows = YoutubeDownloader.load_csv_rows(filepath, column=column)
+        return [row["video_id"] for row in rows]
+
+    @staticmethod
+    def load_csv_rows(filepath: Path, column: str = "") -> list[dict[str, str]]:
+        """从 CSV/TSV/TXT 读取带原始字段的记录，保留 output_dir 等信息。"""
+        if not filepath.exists():
+            raise FileNotFoundError(f"文件不存在: {filepath}")
+
+        ext = filepath.suffix.lower()
+        if ext == ".tsv":
+            delimiters: tuple[str, ...] = ("\t",)
+        else:
+            delimiters = _CSV_DELIMITERS
+
+        last_err: Exception | None = None
+        last_value_err: Exception | None = None
+        for encoding in _CSV_ENCODINGS:
+            for delimiter in delimiters:
+                try:
+                    rows = YoutubeDownloader._load_csv_rows_with_delimiter(
+                        filepath, encoding=encoding, delimiter=delimiter, column=column,
+                    )
+                    if rows:
+                        return rows
+                except UnicodeDecodeError as exc:
+                    last_err = exc
+                    break
+                except UnicodeError as exc:
+                    last_err = exc
+                    break
+                except ValueError as exc:
+                    last_value_err = exc
+                    continue
+                except csv.Error:
+                    continue
+
+        if last_value_err:
+            raise last_value_err
+        raise ValueError(
+            f"无法识别文件编码或格式: {filepath}"
+            + (f"（{last_err}）" if last_err else "")
+        ) from last_err
+
+    @staticmethod
+    def _load_csv_rows_with_delimiter(
+        filepath: Path,
+        *,
+        encoding: str,
+        delimiter: str,
+        column: str,
+    ) -> list[dict[str, str]]:
+        with open(filepath, "r", encoding=encoding, newline="") as f:
+            sample = f.read(4096)
+            f.seek(0)
+            if not sample.strip():
+                return []
+
+            reader = csv.DictReader(f, delimiter=delimiter)
+            fieldnames = [
+                YoutubeDownloader._clean_fieldname(name)
+                for name in (reader.fieldnames or [])
+            ]
+            fieldnames = [name for name in fieldnames if name]
+            if len(fieldnames) == 1 and any(ch in fieldnames[0] for ch in (";", "\t", "|")):
+                embedded = fieldnames[0]
+                for alt in (";", "\t", "|"):
+                    if alt in embedded:
+                        f.seek(0)
+                        nested = YoutubeDownloader._load_csv_rows_with_delimiter(
+                            filepath,
+                            encoding=encoding,
+                            delimiter=alt,
+                            column=column,
+                        )
+                        if nested:
+                            return nested
+                        break
+
+            if not fieldnames:
+                f.seek(0)
+                return YoutubeDownloader._read_headerless_column(f, delimiter)
+
+            if len(fieldnames) == 1 and YoutubeDownloader._looks_like_media_cell(fieldnames[0]):
+                f.seek(0)
+                headerless = YoutubeDownloader._read_headerless_column(f, delimiter)
+                if headerless:
+                    return headerless
+
+            raw_rows = list(reader)
+            used_column, rows = YoutubeDownloader._detect_best_column(
+                fieldnames, raw_rows, column,
+            )
+            if rows:
+                for record in rows:
+                    record["_import_column"] = used_column or ""
+                return rows
+
+            f.seek(0)
+            headerless = YoutubeDownloader._read_headerless_column(f, delimiter)
+            if headerless:
+                for record in headerless:
+                    record["_import_column"] = ""
+                return headerless
+
+            preview_cols = ", ".join(fieldnames[:8])
+            if len(fieldnames) > 8:
+                preview_cols += ", ..."
+            raise ValueError(
+                f"未在表头 [{preview_cols}] 中找到有效视频 ID/链接。"
+                f"请确认列内为 YouTube ID、BV 号或完整 URL"
+            )
+
+    @staticmethod
+    def _detect_best_column(
+        fieldnames: list[str],
+        raw_rows: list[dict[str, str]],
+        preferred: str,
+    ) -> tuple[str | None, list[dict[str, str]]]:
+        target = YoutubeDownloader._resolve_column(fieldnames, preferred)
+        if target:
+            rows = YoutubeDownloader._extract_rows_from_raw(raw_rows, target)
+            if rows:
+                return target, rows
+
+        best_column: str | None = None
+        best_rows: list[dict[str, str]] = []
+        best_score = -1
+        for col in fieldnames:
+            rows = YoutubeDownloader._extract_rows_from_raw(raw_rows, col)
+            score = sum(
+                YoutubeDownloader._media_cell_score(row.get(col, "") or "")
+                for row in raw_rows
+            )
+            if len(rows) > len(best_rows) or (len(rows) == len(best_rows) and score > best_score):
+                best_rows = rows
+                best_column = col
+                best_score = score
+        return best_column, best_rows
+
+    @staticmethod
+    def _looks_like_media_cell(value: str) -> bool:
+        return YoutubeDownloader._media_cell_score(value) > 0
+
+    @staticmethod
+    def _media_cell_score(value: str) -> int:
+        text = (value or "").strip()
+        if not text:
+            return 0
+        lower = text.lower()
+        if "://" in text or "youtu" in lower or "bilibili" in lower or "b23.tv" in lower:
+            return 3
+        if re.search(r"\bBV[0-9A-Za-z]{10}\b", text, flags=re.I):
+            return 3
+        if re.search(r"\bav\d+\b", text, flags=re.I):
+            return 2
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", text):
+            return 2
+        return 0
+
+    @staticmethod
+    def _extract_rows_from_raw(
+        raw_rows: list[dict[str, str]],
+        target_column: str,
+    ) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        target_key = YoutubeDownloader._normalize_column_key(target_column)
+        for row in raw_rows:
+            raw_value = row.get(target_column, "") or ""
+            media_value = raw_value
+            if target_key in {"aid", "av"} and raw_value.strip().isdigit():
+                media_value = f"av{raw_value.strip()}"
+            vid = YoutubeDownloader._normalize_video_id(media_value)
+            if not vid or vid in seen:
+                continue
+            if target_key not in {"aid", "av"} and YoutubeDownloader._media_cell_score(raw_value) <= 0:
+                continue
+            seen.add(vid)
+            media = YoutubeDownloader.parse_input(media_value)
+            record = {key: (value or "") for key, value in row.items() if value is not None}
+            record["video_id"] = vid
+            record["platform"] = media.platform
+            record["source_url"] = media.url
+            record["media_id"] = media.media_id
+            cookiefile = (
+                record.get("cookiefile")
+                or record.get("cookies_file")
+                or record.get("cookie_file")
+                or ""
+            ).strip()
+            if cookiefile:
+                record["cookiefile"] = cookiefile
+            browser_cookie = (record.get("cookies_from_browser") or "").strip()
+            if browser_cookie:
+                record["cookies_from_browser"] = browser_cookie
+            rows.append(record)
+        return rows
+
+    @staticmethod
+    def _read_headerless_column(handle: Any, delimiter: str) -> list[dict[str, str]]:
+        """解析无表头单列文件（每行一个 ID/URL）。"""
+        reader = csv.reader(handle, delimiter=delimiter)
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for line in reader:
+            if not line:
+                continue
+            for raw_value in line:
+                text = (raw_value or "").strip()
+                if not text or text.startswith("#"):
+                    continue
+                vid = YoutubeDownloader._normalize_video_id(text)
+                if not vid or vid in seen:
+                    continue
+                if YoutubeDownloader._media_cell_score(text) <= 0:
+                    continue
+                seen.add(vid)
+                media = YoutubeDownloader.parse_input(text)
+                rows.append({
+                    "video_id": vid,
+                    "platform": media.platform,
+                    "source_url": media.url,
+                    "media_id": media.media_id,
+                })
+        return rows
+
+    @staticmethod
+    def _resolve_column(fieldnames: list[str], preferred: str) -> str | None:
+        """在表头中匹配视频 ID 列，支持中英文别名。"""
+        normalized = {
+            YoutubeDownloader._normalize_column_key(name): name
+            for name in fieldnames
+            if YoutubeDownloader._clean_fieldname(name)
+        }
+        if preferred:
+            key = YoutubeDownloader._normalize_column_key(preferred)
+            if key in normalized:
+                return normalized[key]
+
+        for alias in _CSV_COLUMN_ALIASES:
+            key = YoutubeDownloader._normalize_column_key(alias)
+            if key in normalized:
+                return normalized[key]
+        return None
+
+    @staticmethod
+    def _normalize_video_id(value: str) -> str:
+        """从原始单元格内容中提取可下载媒体来源。"""
+        text = (value or "").strip()
+        if not text:
+            return ""
+        media = YoutubeDownloader.parse_input(text)
+        if media.platform == "youtube":
+            if "youtube" in text.lower() or "youtu.be" in text.lower() or re.fullmatch(
+                r"[A-Za-z0-9_-]{11}", media.media_id
+            ):
+                return media.media_id
+            return ""
+        if media.platform == "bilibili":
+            parsed = urlparse(media.original if "://" in media.original else media.url)
+            if parsed.netloc.lower().endswith("b23.tv"):
+                return media.url
+            return media.media_id
+        if "://" in text:
+            return media.url
+        return ""
 
     def redetect_browser(self) -> bool:
         """重新检测浏览器（Profile 可能已切换）。
@@ -878,106 +1493,6 @@ class YoutubeDownloader:
         if changed and self._cookies_spec == old:
             changed = False  # 没变，不算重载成功
         return changed
-
-    # ------------------------------------------------------------------
-    # CSV
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def load_csv(filepath: Path, column: str = "video_id") -> list[str]:
-        """从 CSV/TSV/TXT 读取 video ID 列表（自动去重、支持 URL 提取）。"""
-        rows = YoutubeDownloader.load_csv_rows(filepath, column=column)
-        return [row["video_id"] for row in rows]
-
-    @staticmethod
-    def load_csv_rows(filepath: Path, column: str = "video_id") -> list[dict[str, str]]:
-        """从 CSV/TSV/TXT 读取带原始字段的记录，保留 output_dir 等信息。"""
-        if not filepath.exists():
-            raise FileNotFoundError(f"文件不存在: {filepath}")
-
-        ext = filepath.suffix.lower()
-        delimiter: str | None = None
-        if ext == ".tsv":
-            delimiter = "\t"
-        elif ext == ".txt":
-            delimiter = None
-        else:
-            delimiter = ","
-
-        last_err: Exception | None = None
-        for encoding in ("utf-8-sig", "utf-8", "utf-16", "gbk", "latin-1"):
-            try:
-                with open(filepath, "r", encoding=encoding, newline="") as f:
-                    sample = f.read(4096)
-                    f.seek(0)
-                    if delimiter is None:
-                        try:
-                            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-                            delimiter = dialect.delimiter
-                        except csv.Error:
-                            delimiter = ","
-
-                    reader = csv.DictReader(f, delimiter=delimiter)
-                    fieldnames = [name.strip() if name else "" for name in (reader.fieldnames or [])]
-                    if not fieldnames:
-                        raise ValueError("文件中没有可解析的表头")
-
-                    target_column = YoutubeDownloader._resolve_column(fieldnames, column)
-                    if target_column is None:
-                        raise ValueError(
-                            f"文件中没有 '{column}' 列，可用列: {fieldnames}"
-                        )
-
-                    rows: list[dict[str, str]] = []
-                    seen: set[str] = set()
-                    for row in reader:
-                        raw_value = row.get(target_column, "") or ""
-                        vid = YoutubeDownloader._normalize_video_id(raw_value)
-                        if not vid or vid in seen:
-                            continue
-                        seen.add(vid)
-                        record = {key: (value or "") for key, value in row.items() if value is not None}
-                        record["video_id"] = vid
-                        rows.append(record)
-                    return rows
-            except (UnicodeDecodeError, UnicodeError) as exc:
-                last_err = exc
-                continue
-            except ValueError:
-                raise
-
-        raise ValueError(f"无法识别文件编码或格式: {filepath}") from last_err
-
-    @staticmethod
-    def _resolve_column(fieldnames: list[str], preferred: str) -> str | None:
-        """在表头中匹配用户指定字段，支持大小写和空格差异。"""
-        normalized = {name.strip().lower().replace(" ", "_").replace("-", "_"): name for name in fieldnames}
-        if preferred:
-            key = preferred.strip().lower().replace(" ", "_").replace("-", "_")
-            if key in normalized:
-                return normalized[key]
-
-        for key in ("video_id", "videoid", "id", "youtube_id", "youtubeid", "url", "video_url"):
-            if key in normalized:
-                return normalized[key]
-        return None
-
-    @staticmethod
-    def _normalize_video_id(value: str) -> str:
-        """从原始单元格内容中提取 11 位 YouTube video ID。"""
-        text = (value or "").strip()
-        if not text:
-            return ""
-        text = text.replace("\\", "/")
-        patterns = [
-            r"(?:v=|vi=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})",
-            r"^([A-Za-z0-9_-]{11})$",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1)
-        return text
 
     # ------------------------------------------------------------------
     # 内部辅助
@@ -994,7 +1509,7 @@ class YoutubeDownloader:
 
         video_formats = [
             fmt for fmt in formats
-            if fmt.get("container") == "mp4"
+            if fmt.get("container") in {"mp4", "webm", "flv", "mkv", "mov"}
             and fmt.get("type") in {"Video+Audio", "Video Only"}
         ]
         if not video_formats:

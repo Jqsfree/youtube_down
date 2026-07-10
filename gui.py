@@ -1,6 +1,6 @@
-"""主窗口 —— 纯 UI 层。
+"""主窗口 —— 纯 UI 层（CSV 批量下载）。
 
-不直接调用 yt-dlp。所有操作通过 YoutubeDownloader + DownloadWorker 完成。
+不直接调用 yt-dlp。所有操作通过 YoutubeDownloader + BatchDownloadWorker 完成。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from PySide6.QtGui import QShortcut
 
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -30,15 +31,13 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QListWidget,
-    QTreeWidget,
-    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from downloader import YoutubeDownloader, check_environment
 from logger_utils import AppLogger
-from worker import BatchDownloadWorker, DownloadWorker, FetchInfoWorker, ValidateCookieWorker
+from worker import AUTO_FORMAT_ID, BatchDownloadWorker, ValidateCookieWorker
 
 
 class MainWindow(QMainWindow):
@@ -52,14 +51,13 @@ class MainWindow(QMainWindow):
         self._log_path = Path.home() / "Downloads" / f"youtube_downloader_{ts}.log"
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         AppLogger.attach_file(self._log_path)
-        self._worker: DownloadWorker | BatchDownloadWorker | None = None
-        self._fetch_worker: FetchInfoWorker | None = None
+        self._worker: BatchDownloadWorker | None = None
         self._validate_cookie_worker: ValidateCookieWorker | None = None
-        self._video_id: str = ""
-        self._info: dict[str, Any] | None = None
         self._output_dir: Path = Path.home() / "Downloads"
         self._csv_ids: list[str] = []
         self._csv_queue: list[tuple[str, list[str], Path | None]] = []
+        self._csv_cookie_overrides: dict[str, dict[str, str]] = {}
+        self._cookie_persisted: bool = self._downloader._cookiefile_path is not None  # noqa: SLF001
         self._batch_done: int = 0
         self._batch_errors: list[tuple[int, str]] = []
         self._last_fmt_id: str = ""
@@ -70,10 +68,10 @@ class MainWindow(QMainWindow):
 
         spec = self._downloader._cookies_spec  # noqa: SLF001
         ver = Path(__file__).parent / "VERSION"
-        ver_str = ver.read_text().strip() if ver.exists() else "dev"
-        self._base_title = f"YouTube Downloader v{ver_str}"
+        self._app_version = ver.read_text().strip() if ver.exists() else "dev"
+        self._base_title = f"Multi-Platform Downloader v{self._app_version}"
         self._update_window_title()
-        self.resize(900, 720)
+        self.resize(900, 560)
         self.setAcceptDrops(True)
         self._build_ui()
         self._connect_signals()
@@ -106,7 +104,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         """关闭窗口时确保 worker 线程终止。"""
-        self._wait_fetch_worker()
         if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
             self._validate_cookie_worker.wait(3000)
         if self._worker is not None and self._worker.isRunning():
@@ -275,32 +272,25 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ---- Video ID 输入区 ----
-        id_layout = QHBoxLayout()
-        id_layout.addWidget(QLabel("Video ID:"))
-        self._id_input = QLineEdit()
-        self._id_input.setPlaceholderText("输入 YouTube Video ID，例如 dQw4w9WgXcQ")
-        id_layout.addWidget(self._id_input)
-        self._fetch_btn = QPushButton("获取信息")
-        id_layout.addWidget(self._fetch_btn)
-        self._refresh_btn = QPushButton("刷新页面")
-        self._refresh_btn.setToolTip("重新获取当前输入的视频信息和格式")
-        id_layout.addWidget(self._refresh_btn)
-        root.addLayout(id_layout)
-
         # ---- Cookie 导入 ----
         cookie_layout = QHBoxLayout()
         cookie_layout.addWidget(QLabel("Cookie:"))
         self._cookie_label = QLabel("未配置")
         self._cookie_label.setWordWrap(True)
         cookie_layout.addWidget(self._cookie_label, stretch=1)
-        self._import_cookie_btn = QPushButton("导入 Cookie 文件")
+        self._import_cookie_btn = QPushButton("选择临时 Cookie")
         self._import_cookie_btn.setToolTip(
             "选择 Netscape 格式的 cookies.txt。\n"
-            "Chrome/Edge 可用扩展「Get cookies.txt LOCALLY」导出。\n"
-            "导入后请重新点击「获取信息」。"
+            "支持 YouTube 或 Bilibili Cookie；Chrome/Edge 可用扩展「Get cookies.txt LOCALLY」导出。\n"
+            "默认仅本次运行使用；勾选「记住为默认」才会保存。"
         )
         cookie_layout.addWidget(self._import_cookie_btn)
+        self._remember_cookie_checkbox = QCheckBox("记住为默认")
+        self._remember_cookie_checkbox.setToolTip(
+            "不勾选时等同 yt-dlp --cookies /path/cookies.txt 的临时 Cookie；"
+            "勾选后保存为当前平台默认 Cookie。"
+        )
+        cookie_layout.addWidget(self._remember_cookie_checkbox)
         self._clear_cookie_btn = QPushButton("清除")
         self._clear_cookie_btn.setEnabled(False)
         cookie_layout.addWidget(self._clear_cookie_btn)
@@ -310,14 +300,11 @@ class MainWindow(QMainWindow):
         # ---- CSV 批量导入 ----
         csv_layout = QHBoxLayout()
         self._load_csv_btn = QPushButton("Load CSV")
-        self._load_csv_btn.setToolTip("支持 CSV/TSV/TXT，并可按自定义字段名导入")
+        self._load_csv_btn.setToolTip("导入 CSV/TSV/TXT，自动识别链接或 BV/ID 列")
         csv_layout.addWidget(self._load_csv_btn)
-        csv_layout.addWidget(QLabel("字段:"))
-        self._csv_column_input = QLineEdit()
-        self._csv_column_input.setPlaceholderText("如 video_id / id / url")
-        self._csv_column_input.setText("video_id")
-        self._csv_column_input.setMaximumWidth(180)
-        csv_layout.addWidget(self._csv_column_input)
+        self._version_label = QLabel(f"v{self._app_version}")
+        self._version_label.setStyleSheet("color: gray;")
+        csv_layout.addWidget(self._version_label)
         csv_layout.addWidget(QLabel("最小分辨率:"))
         self._min_height_input = QLineEdit()
         self._min_height_input.setPlaceholderText("如 720 / 1080")
@@ -335,32 +322,6 @@ class MainWindow(QMainWindow):
         self._imported_files_list.setMaximumHeight(140)
         imported_files_layout.addWidget(self._imported_files_list)
         root.addWidget(self._imported_files_group)
-
-        # ---- 视频信息区 ----
-        info_group = QGroupBox("视频信息")
-        info_layout = QVBoxLayout(info_group)
-        self._title_label = QLabel("Title: —")
-        self._title_label.setWordWrap(True)
-        info_layout.addWidget(self._title_label)
-        self._uploader_label = QLabel("Uploader: —")
-        info_layout.addWidget(self._uploader_label)
-        self._duration_label = QLabel("Duration: —")
-        info_layout.addWidget(self._duration_label)
-        root.addWidget(info_group)
-
-        # ---- 格式列表 ----
-        fmt_group = QGroupBox("可用格式")
-        fmt_layout = QVBoxLayout(fmt_group)
-        self._format_tree = QTreeWidget()
-        self._format_tree.setHeaderLabels([
-            "Resolution", "Codec", "Container", "FPS", "Size", "Type", "Note",
-        ])
-        self._format_tree.setRootIsDecorated(False)
-        self._format_tree.setSelectionMode(
-            QTreeWidget.SelectionMode.SingleSelection
-        )
-        fmt_layout.addWidget(self._format_tree)
-        root.addWidget(fmt_group)
 
         # ---- 输出目录 ----
         out_layout = QHBoxLayout()
@@ -400,7 +361,7 @@ class MainWindow(QMainWindow):
         stats_layout.addWidget(self._eta_label)
         stats_layout.addStretch()
         prog_layout.addLayout(stats_layout)
-        self._status_label = QLabel("就绪")
+        self._status_label = QLabel("请先 Load CSV 导入视频列表")
         prog_layout.addWidget(self._status_label)
         root.addWidget(prog_group)
 
@@ -439,8 +400,6 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         """连接控件信号到处理槽。"""
-        self._fetch_btn.clicked.connect(self._on_fetch)
-        self._refresh_btn.clicked.connect(self._on_refresh)
         self._import_cookie_btn.clicked.connect(self._on_import_cookie)
         self._clear_cookie_btn.clicked.connect(self._on_clear_cookie)
         self._load_csv_btn.clicked.connect(self._on_load_csv)
@@ -449,8 +408,6 @@ class MainWindow(QMainWindow):
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._open_dir_btn.clicked.connect(self._on_open_dir)
         self._log_toggle_btn.toggled.connect(self._log_group.setVisible)
-        # 键盘快捷键
-        self._id_input.returnPressed.connect(self._on_fetch)
         self._shortcut_download = QShortcut("Ctrl+D", self)
         self._shortcut_download.activated.connect(self._on_download)
         self._shortcut_cancel = QShortcut("Escape", self)
@@ -482,16 +439,17 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        import_column = self._csv_column_input.text().strip() or "video_id"
         all_ids: list[str] = []
         errors: list[str] = []
+        detected_columns: list[str] = []
         self._csv_queue = []
+        self._csv_cookie_overrides = {}
         seen_names: set[str] = set()
 
         for fp in filepaths:
             path = Path(fp)
             try:
-                rows = YoutubeDownloader.load_csv_rows(path, column=import_column)
+                rows = YoutubeDownloader.load_csv_rows(path)
             except FileNotFoundError as exc:
                 errors.append(f"{path.name}: {exc}")
                 continue
@@ -500,10 +458,33 @@ class MainWindow(QMainWindow):
                 continue
 
             if not rows:
+                errors.append(f"{path.name}: 未识别到有效视频 ID/链接")
                 continue
+
+            used_column = rows[0].get("_import_column", "")
+            if used_column:
+                detected_columns.append(f"{path.name}→{used_column}")
 
             ids = [row["video_id"] for row in rows]
             all_ids.extend(ids)
+            for row in rows:
+                override: dict[str, str] = {}
+                cookiefile = (
+                    row.get("cookiefile")
+                    or row.get("cookies_file")
+                    or row.get("cookie_file")
+                    or ""
+                ).strip()
+                if cookiefile:
+                    cookie_path = Path(cookiefile).expanduser()
+                    if not cookie_path.is_absolute():
+                        cookie_path = (path.parent / cookie_path).resolve()
+                    override["cookiefile"] = str(cookie_path)
+                browser = (row.get("cookies_from_browser") or "").strip()
+                if browser:
+                    override["cookies_from_browser"] = browser
+                if override:
+                    self._csv_cookie_overrides[row["video_id"]] = override
             name = self._build_queue_name(path.stem, seen_names)
             seen_names.add(name)
             output_dir = self._resolve_import_output_dir(rows)
@@ -513,24 +494,25 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "文件错误", "\n".join(errors))
 
         if not self._csv_queue:
-            QMessageBox.warning(self, "提示", "CSV 中未找到有效的 video_id")
+            detail = "\n".join(errors) if errors else "请检查 CSV 是否包含 BV/URL/YouTube ID 列"
+            QMessageBox.warning(self, "导入失败", f"未能从文件中识别视频列表。\n\n{detail}")
             return
 
         self._csv_ids = list(dict.fromkeys(all_ids))
         total = sum(len(ids) for _, ids, _ in self._csv_queue)
         parts = " → ".join(f"{name}({len(ids)})" for name, ids, _ in self._csv_queue)
+        col_hint = f" | 列: {', '.join(detected_columns)}" if detected_columns else ""
         self._csv_label.setText(
-            f"队列 {len(self._csv_queue)} 组 / 共 {total} 个 Video ID（依据列: {import_column}）"
+            f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频{col_hint}"
         )
         self._refresh_imported_files_list(self._csv_queue)
         self._log(f"加载队列: {parts}")
 
-        # 取第一个有效视频获取格式（失败自动试下一个）
-        self._download_btn.setEnabled(False)
-        self._fetch_btn.setEnabled(False)
-        self._fetch_btn.setText("获取中...")
-        self._csv_info_try_index = 0
-        self._try_next_csv_video()
+        min_height = self._parse_min_height(self._min_height_input.text())
+        self._download_btn.setEnabled(True)
+        self._status_label.setText(
+            f"已加载 {total} 个视频 — 将按最小分辨率 {min_height}p 逐条自动匹配格式"
+        )
 
     def _refresh_imported_files_list(self, queue: list[tuple[str, list[str], Path | None]]) -> None:
         """刷新已导入文件列表，显示每个源文件名、视频数和目标目录。"""
@@ -541,47 +523,8 @@ class MainWindow(QMainWindow):
         if not queue:
             self._imported_files_list.addItem("暂无导入文件")
 
-    def _try_next_csv_video(self) -> None:
-        """依次尝试 CSV 视频，直到成功获取信息。"""
-        if self._csv_info_try_index >= len(self._csv_ids):
-            QMessageBox.critical(self, "错误", "所有视频均获取失败，无法列出格式")
-            self._fetch_btn.setEnabled(True)
-            self._fetch_btn.setText("获取信息")
-            self._status_label.setText("获取失败")
-            return
-
-        vid = self._csv_ids[self._csv_info_try_index]
-        self._id_input.setText(vid)
-        self._video_id = vid
-
-        self._fetch_worker = FetchInfoWorker(self._downloader, vid)
-        self._fetch_worker.finished.connect(self._on_csv_info_ready)
-        self._fetch_worker.error.connect(self._on_csv_info_error)
-        self._fetch_worker.start()
-
-    def _on_csv_info_ready(self, info: dict) -> None:
-        self._info = info
-        self._show_info(info)
-        self._show_formats(self._video_id, info)
-        self._download_btn.setEnabled(True)
-        self._fetch_btn.setEnabled(True)
-        self._fetch_btn.setText("获取信息")
-        self._status_label.setText("就绪 — 请选择格式后下载")
-
-    def _on_csv_info_error(self, msg: str) -> None:
-        self._csv_info_try_index += 1
-        self._try_next_csv_video()
-
-    def _sort_key(self, fmt: dict[str, Any]) -> int:
-        """按分辨率高度降序排列。"""
-        res = fmt.get("resolution", "")
-        try:
-            return int(res.split("x")[-1])
-        except (ValueError, IndexError):
-            return 0
-
     # ------------------------------------------------------------------
-    # 槽：获取视频信息
+    # Cookie / 窗口
     # ------------------------------------------------------------------
 
     def _update_window_title(self) -> None:
@@ -595,46 +538,48 @@ class MainWindow(QMainWindow):
         src = self._downloader.cookie_source()
         if self._downloader._cookiefile_path:  # noqa: SLF001
             path = self._downloader._cookiefile_path
-            self._cookie_label.setText(f"文件: {path}")
+            platform = self._downloader._cookiefile_platform  # noqa: SLF001
+            label = YoutubeDownloader._platform_label(platform) if platform else "自动"
+            mode = "默认" if self._cookie_persisted else "临时"
+            self._cookie_label.setText(f"{mode}文件 ({label}): {path}")
             self._clear_cookie_btn.setEnabled(True)
         elif src:
             self._cookie_label.setText(f"浏览器: {src.removeprefix('browser:')}")
             self._clear_cookie_btn.setEnabled(False)
         else:
-            self._cookie_label.setText("未配置（可导入 cookies.txt 或登录浏览器）")
+            self._cookie_label.setText(
+                "未配置（可临时选择 cookies.txt；Linux 可尝试浏览器 Cookie，Windows 推荐导出 cookies.txt）"
+            )
             self._clear_cookie_btn.setEnabled(False)
         self._update_window_title()
 
     def _is_busy(self) -> bool:
-        """是否有后台 fetch / 下载 / cookie 验证在进行。"""
+        """是否有后台下载 / cookie 验证在进行。"""
         if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
-            return True
-        if self._fetch_worker is not None and self._fetch_worker.isRunning():
             return True
         if self._worker is not None and self._worker.isRunning():
             return True
         return False
-
-    def _wait_fetch_worker(self, timeout_ms: int = 5000) -> None:
-        if self._fetch_worker is not None and self._fetch_worker.isRunning():
-            self._fetch_worker.wait(timeout_ms)
 
     def _apply_cookie_file(self, filepath: str) -> None:
         """加载 cookie 文件并后台验证（供按钮与拖拽共用）。"""
         if self._is_busy():
             QMessageBox.warning(
                 self, "请稍候",
-                "当前正在获取信息、下载或验证 Cookie，请完成或取消后再导入。",
+                "当前正在下载或验证 Cookie，请完成或取消后再导入。",
             )
             return
         try:
-            self._downloader.set_cookiefile(filepath)
+            persist = self._remember_cookie_checkbox.isChecked()
+            self._downloader.set_cookiefile(filepath, persist=persist)
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "导入失败", str(exc))
             return
+        self._cookie_persisted = persist
         self._update_cookie_ui()
-        self._log(f"已导入 Cookie: {filepath}")
-        self._status_label.setText("Cookie 已导入，正在后台验证...")
+        mode = "默认" if persist else "临时"
+        self._log(f"已选择{mode} Cookie: {filepath}")
+        self._status_label.setText(f"{mode} Cookie 已加载，正在后台验证...")
         self._import_cookie_btn.setEnabled(False)
         self._clear_cookie_btn.setEnabled(False)
         self._start_cookie_validation()
@@ -651,10 +596,10 @@ class MainWindow(QMainWindow):
         self._clear_cookie_btn.setEnabled(self._downloader._cookiefile_path is not None)  # noqa: SLF001
         if ok:
             self._log(f"  {msg}")
-            self._status_label.setText("Cookie 验证通过，请重新获取视频信息")
+            self._status_label.setText("Cookie 验证通过，可直接 Load CSV 并下载")
             QMessageBox.information(
                 self, "Cookie 已导入",
-                f"{msg}\n\n请点击「获取信息」刷新格式列表。",
+                f"{msg}\n\n可导入 CSV 后开始批量下载。",
             )
         else:
             self._log(f"  验证未通过: {msg}")
@@ -668,7 +613,7 @@ class MainWindow(QMainWindow):
         if self._is_busy():
             QMessageBox.warning(
                 self, "请稍候",
-                "当前正在获取信息、下载或验证 Cookie，请完成或取消后再导入。",
+                "当前正在下载或验证 Cookie，请完成或取消后再导入。",
             )
             return
         start_dir = str(Path.home())
@@ -689,96 +634,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "请稍候", "Cookie 验证进行中，请稍后再清除。")
             return
         self._downloader.clear_cookiefile()
+        self._cookie_persisted = False
         self._update_cookie_ui()
         self._log("已清除 Cookie 文件，恢复浏览器自动检测")
         self._status_label.setText("Cookie 已清除")
-
-    # ------------------------------------------------------------------
-    # 槽：获取信息
-    # ------------------------------------------------------------------
-
-    def _on_refresh(self) -> None:
-        """刷新当前输入的视频信息。"""
-        if self._id_input.text().strip():
-            self._on_fetch()
-        else:
-            QMessageBox.information(self, "提示", "先输入 Video ID 再刷新")
-
-    def _on_fetch(self) -> None:
-        """后台获取视频信息（不卡 GUI）。"""
-        video_id = self._id_input.text().strip()
-        if not video_id:
-            QMessageBox.warning(self, "提示", "请输入 Video ID")
-            return
-
-        self._video_id = video_id
-        self._download_btn.setEnabled(False)
-        self._fetch_btn.setEnabled(False)
-        self._fetch_btn.setText("获取中...")
-        self._status_label.setText("正在获取视频信息...")
-
-        self._fetch_worker = FetchInfoWorker(self._downloader, video_id)
-        self._fetch_worker.finished.connect(self._on_fetch_ready)
-        self._fetch_worker.error.connect(self._on_fetch_error)
-        self._fetch_worker.start()
-
-    def _on_fetch_ready(self, info: dict) -> None:
-        self._info = info
-        self._show_info(info)
-        self._show_formats(self._video_id, info)
-        self._download_btn.setEnabled(True)
-        self._fetch_btn.setEnabled(True)
-        self._fetch_btn.setText("获取信息")
-        self._status_label.setText("就绪 — 请选择格式后下载")
-
-    def _on_fetch_error(self, msg: str) -> None:
-        hint = (
-            "\n\n若 Windows 上无法获取格式，可尝试：\n"
-            "1. 浏览器登录 YouTube\n"
-            "2. 用扩展导出 cookies.txt（Get cookies.txt LOCALLY）\n"
-            "3. 点击「导入 Cookie 文件」后重新获取信息"
-        )
-        if self._downloader._cookiefile_path:  # noqa: SLF001
-            hint = ""
-        QMessageBox.critical(self, "获取失败", msg + hint)
-        self._fetch_btn.setEnabled(True)
-        self._fetch_btn.setText("获取信息")
-        self._status_label.setText("获取失败")
-
-    def _show_info(self, info: dict[str, Any]) -> None:
-        """从 info dict 更新视频信息显示。"""
-        title = info.get("title") or "—"
-        uploader = info.get("uploader") or info.get("channel") or "—"
-        duration = info.get("duration") or 0
-        duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "—"
-
-        self._title_label.setText(f"Title: {title}")
-        self._uploader_label.setText(f"Uploader: {uploader}")
-        self._duration_label.setText(f"Duration: {duration_str}")
-
-    def _show_formats(self, video_id: str, info: dict[str, Any]) -> None:
-        """填充格式列表 QTreeWidget。"""
-        self._format_tree.clear()
-        try:
-            min_height = self._parse_min_height(self._min_height_input.text())
-            formats = self._downloader.list_formats(video_id=video_id, info=info, min_height=min_height)
-        except Exception:
-            QMessageBox.warning(self, "错误", "获取格式列表失败")
-            return
-
-        for fmt in sorted(formats, key=self._sort_key, reverse=True):
-            item = QTreeWidgetItem([
-                fmt["resolution"],
-                fmt["codec"],
-                fmt["container"],
-                str(fmt["fps"]) if fmt["fps"] else "—",
-                fmt["filesize_str"],
-                fmt["type"],
-                fmt.get("note", ""),
-            ])
-            self._format_tree.addTopLevelItem(item)
-        for col in range(self._format_tree.columnCount()):
-            self._format_tree.resizeColumnToContents(col)
 
     # ------------------------------------------------------------------
     # 槽：浏览目录
@@ -798,20 +657,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_download(self) -> None:
-        """下载按钮：启动下载（单视频或批量）。"""
-        # 获取选中的格式
-        selected = self._format_tree.selectedItems()
-        if not selected:
-            QMessageBox.warning(self, "提示", "请先选择一个格式")
-            return
-
-        row = self._format_tree.indexOfTopLevelItem(selected[0])
-        try:
-            min_height = self._parse_min_height(self._min_height_input.text())
-            formats = self._downloader.list_formats(info=self._info, min_height=min_height)
-            chosen = formats[row]
-        except Exception as exc:
-            QMessageBox.critical(self, "错误", f"获取格式信息失败: {exc}")
+        """下载按钮：启动 CSV 批量下载。"""
+        if not (self._csv_queue or self._csv_ids):
+            QMessageBox.warning(self, "提示", "请先 Load CSV 导入视频列表")
             return
 
         min_height = self._parse_min_height(self._min_height_input.text())
@@ -823,44 +671,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "目录错误", f"无法创建输出目录: {exc}")
                 return
 
-        # 判断模式：CSV 队列 vs 单视频
-        self._last_fmt_id = chosen["format_id"]
+        self._last_fmt_id = AUTO_FORMAT_ID
         self._last_min_height = min_height
         if self._csv_queue:
-            self._start_queue(chosen["format_id"], output_dir, min_height)
-        elif self._csv_ids:
-            self._start_batch_download(chosen["format_id"], output_dir, self._csv_ids, min_height)
+            self._start_queue(AUTO_FORMAT_ID, output_dir, min_height)
         else:
-            self._start_single_download(chosen["format_id"], output_dir, min_height)
-
-    def _start_single_download(self, format_id: str, output_dir: Path, min_height: int) -> None:
-        """启动单个视频下载。"""
-        # 判断选中格式是否需要合并音频（Video Only → 需要）
-        needs_merge = True
-        if self._info:
-            fmts = self._downloader.list_formats(info=self._info)
-            chosen = next((f for f in fmts if f["format_id"] == format_id), None)
-            if chosen and chosen.get("type") == "Video+Audio":
-                needs_merge = False
-
-        self._worker = DownloadWorker(
-            downloader=self._downloader,
-            video_id=self._video_id,
-            format_id=format_id,
-            output_dir=output_dir,
-            min_height=min_height,
-            needs_audio_merge=needs_merge,
-        )
-        self._worker.progress_changed.connect(self._on_progress)
-        self._worker.status_changed.connect(self._on_status)
-        self._worker.speed_changed.connect(self._on_speed)
-        self._worker.eta_changed.connect(self._on_eta)
-        self._worker.size_changed.connect(self._on_size)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-
-        self._set_downloading_ui(True)
-        self._worker.start()
+            self._start_batch_download(AUTO_FORMAT_ID, output_dir, self._csv_ids, min_height)
 
     def _start_queue(self, format_id: str, base_dir: Path, min_height: int) -> None:
         """启动队列下载：逐个 CSV 依次处理。"""
@@ -893,6 +709,11 @@ class MainWindow(QMainWindow):
             output_dir=output_dir,
             min_height=min_height,
             results_dir=results_dir,
+            cookie_overrides={
+                source: self._csv_cookie_overrides[source]
+                for source in video_ids
+                if source in self._csv_cookie_overrides
+            },
         )
         w: BatchDownloadWorker = self._worker  # type narrowing
         w.all_progress_changed.connect(self._on_batch_progress)
@@ -964,12 +785,9 @@ class MainWindow(QMainWindow):
 
     def _set_downloading_ui(self, downloading: bool) -> None:
         """切换 UI 状态：闲置 / 下载中。"""
-        self._fetch_btn.setEnabled(not downloading)
         self._load_csv_btn.setEnabled(not downloading)
-        self._download_btn.setEnabled(not downloading)
+        self._download_btn.setEnabled(not downloading and bool(self._csv_queue or self._csv_ids))
         self._cancel_btn.setEnabled(downloading)
-        self._id_input.setEnabled(not downloading)
-        self._format_tree.setEnabled(not downloading)
         self._output_input.setEnabled(not downloading)
         self._browse_btn.setEnabled(not downloading)
         if not downloading:
@@ -994,20 +812,6 @@ class MainWindow(QMainWindow):
 
     def _on_size(self, text: str) -> None:
         self._size_label.setText(text)
-
-    def _on_finished(self, path: str) -> None:
-        self._set_downloading_ui(False)
-        self._progress_bar.setValue(100)
-        self._progress_label.setText("100%")
-        self._status_label.setText(f"下载完成 — {path}")
-        AppLogger.get_logger().info("下载完成: %s", path)
-        QMessageBox.information(self, "下载完成", f"文件已保存至:\n{path}")
-
-    def _on_error(self, msg: str) -> None:
-        self._set_downloading_ui(False)
-        AppLogger.log_exception(Exception(msg), "下载失败")
-        QMessageBox.critical(self, "下载失败", msg)
-        self._status_label.setText("下载失败")
 
     # ------------------------------------------------------------------
     # 槽：批量 Worker 回调

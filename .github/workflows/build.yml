@@ -2,8 +2,11 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [main]
+    branches: [main, cursor/win-local-test-70fd]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -12,6 +15,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -29,7 +37,7 @@ jobs:
         run: |
           Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
           Expand-Archive deno.zip -DestinationPath .
-          Move-Item deno.exe deno.exe
+          if (Test-Path deno.exe) { Write-Host "deno.exe ready" } else { Get-ChildItem -Recurse -Filter deno.exe | Select-Object -First 1 | Move-Item -Destination deno.exe }
 
       - name: Download ffmpeg
         run: |
@@ -54,10 +62,36 @@ jobs:
             --collect-all yt_dlp_ejs `
             --hidden-import PySide6.QtCore `
             --hidden-import PySide6.QtWidgets `
+            --hidden-import PySide6.QtGui `
             main.py
 
-      - name: Upload EXE
+      - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YouTubeDownloader
+          name: YouTubeDownloader-v${{ steps.version.outputs.version }}
           path: dist/YouTubeDownloader.exe
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Multi-Platform Downloader v${{ steps.version.outputs.version }}
+          body: |
+            Windows 单文件版（内嵌 ffmpeg / ffprobe / deno）。
+
+            **包含修复**
+            - Cookie 文件无需重启即可使用（Windows）
+            - CSV `csvid` 列识别、无表头单列、GBK 编码
+            - 批量下载强制最低 720p
+            - YouTube + Bilibili 多平台支持
+
+            **使用**
+            1. 下载 `YouTubeDownloader.exe`
+            2. 双击运行（无需安装 Python）
+            3. 高画质或会员视频请导入 `cookies.txt`
+          files: dist/YouTubeDownloader.exe
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          overwrite_files: true
