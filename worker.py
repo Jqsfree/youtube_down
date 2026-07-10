@@ -21,6 +21,8 @@ from PySide6.QtCore import QThread, Signal
 from downloader import ErrorCategory, YoutubeDownloader, _find_tool, classify_error, clean_error
 from logger_utils import AppLogger
 
+AUTO_FORMAT_ID = "auto"
+
 
 def _media_stem(source: str) -> str:
     try:
@@ -455,7 +457,7 @@ class BatchDownloadWorker(QThread):
         def _needs_merge(fmt: dict) -> bool:
             return fmt.get("type") == "Video Only"
 
-        if preferred in available_ids:
+        if preferred not in (AUTO_FORMAT_ID, "", None) and preferred in available_ids:
             try:
                 preferred_fmt = next(f for f in formats if f["format_id"] == preferred)
                 if preferred_fmt.get("type") in {"Video+Audio", "Video Only"}:

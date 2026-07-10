@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 
 from downloader import YoutubeDownloader, check_environment
 from logger_utils import AppLogger
-from worker import BatchDownloadWorker, DownloadWorker, FetchInfoWorker, ValidateCookieWorker
+from worker import AUTO_FORMAT_ID, BatchDownloadWorker, DownloadWorker, FetchInfoWorker, ValidateCookieWorker
 
 
 class MainWindow(QMainWindow):
@@ -555,12 +555,18 @@ class MainWindow(QMainWindow):
         self._refresh_imported_files_list(self._csv_queue)
         self._log(f"加载队列: {parts}")
 
-        # 取第一个有效视频获取格式（失败自动试下一个）
-        self._download_btn.setEnabled(False)
-        self._fetch_btn.setEnabled(False)
-        self._fetch_btn.setText("获取中...")
-        self._csv_info_try_index = 0
-        self._try_next_csv_video()
+        min_height = self._parse_min_height(self._min_height_input.text())
+        self._format_tree.clear()
+        self._title_label.setText("Title: —")
+        self._uploader_label.setText("Uploader: —")
+        self._duration_label.setText("Duration: —")
+        self._info = None
+        self._video_id = ""
+        self._id_input.clear()
+        self._download_btn.setEnabled(True)
+        self._status_label.setText(
+            f"已加载 {total} 个视频 — 将按最小分辨率 {min_height}p 逐条自动匹配格式"
+        )
 
     def _refresh_imported_files_list(self, queue: list[tuple[str, list[str], Path | None]]) -> None:
         """刷新已导入文件列表，显示每个源文件名、视频数和目标目录。"""
@@ -570,37 +576,6 @@ class MainWindow(QMainWindow):
             self._imported_files_list.addItem(f"{name} — {len(ids)} 个视频 → {target}")
         if not queue:
             self._imported_files_list.addItem("暂无导入文件")
-
-    def _try_next_csv_video(self) -> None:
-        """依次尝试 CSV 视频，直到成功获取信息。"""
-        if self._csv_info_try_index >= len(self._csv_ids):
-            QMessageBox.critical(self, "错误", "所有视频均获取失败，无法列出格式")
-            self._fetch_btn.setEnabled(True)
-            self._fetch_btn.setText("获取信息")
-            self._status_label.setText("获取失败")
-            return
-
-        vid = self._csv_ids[self._csv_info_try_index]
-        self._id_input.setText(vid)
-        self._video_id = vid
-
-        self._fetch_worker = FetchInfoWorker(self._downloader, vid)
-        self._fetch_worker.finished.connect(self._on_csv_info_ready)
-        self._fetch_worker.error.connect(self._on_csv_info_error)
-        self._fetch_worker.start()
-
-    def _on_csv_info_ready(self, info: dict) -> None:
-        self._info = info
-        self._show_info(info)
-        self._show_formats(self._video_id, info)
-        self._download_btn.setEnabled(True)
-        self._fetch_btn.setEnabled(True)
-        self._fetch_btn.setText("获取信息")
-        self._status_label.setText("就绪 — 请选择格式后下载")
-
-    def _on_csv_info_error(self, msg: str) -> None:
-        self._csv_info_try_index += 1
-        self._try_next_csv_video()
 
     def _sort_key(self, fmt: dict[str, Any]) -> int:
         """按分辨率高度降序排列。"""
@@ -839,21 +814,6 @@ class MainWindow(QMainWindow):
 
     def _on_download(self) -> None:
         """下载按钮：启动下载（单视频或批量）。"""
-        # 获取选中的格式
-        selected = self._format_tree.selectedItems()
-        if not selected:
-            QMessageBox.warning(self, "提示", "请先选择一个格式")
-            return
-
-        row = self._format_tree.indexOfTopLevelItem(selected[0])
-        try:
-            min_height = self._parse_min_height(self._min_height_input.text())
-            formats = self._downloader.list_formats(info=self._info, min_height=min_height)
-            chosen = formats[row]
-        except Exception as exc:
-            QMessageBox.critical(self, "错误", f"获取格式信息失败: {exc}")
-            return
-
         min_height = self._parse_min_height(self._min_height_input.text())
         output_dir = Path(self._output_input.text())
         if not output_dir.exists():
@@ -863,15 +823,32 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "目录错误", f"无法创建输出目录: {exc}")
                 return
 
-        # 判断模式：CSV 队列 vs 单视频
+        if self._csv_queue or self._csv_ids:
+            self._last_fmt_id = AUTO_FORMAT_ID
+            self._last_min_height = min_height
+            if self._csv_queue:
+                self._start_queue(AUTO_FORMAT_ID, output_dir, min_height)
+            else:
+                self._start_batch_download(AUTO_FORMAT_ID, output_dir, self._csv_ids, min_height)
+            return
+
+        # 单视频：需先获取信息并选择格式
+        selected = self._format_tree.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "提示", "请先选择一个格式")
+            return
+
+        row = self._format_tree.indexOfTopLevelItem(selected[0])
+        try:
+            formats = self._downloader.list_formats(info=self._info, min_height=min_height)
+            chosen = formats[row]
+        except Exception as exc:
+            QMessageBox.critical(self, "错误", f"获取格式信息失败: {exc}")
+            return
+
         self._last_fmt_id = chosen["format_id"]
         self._last_min_height = min_height
-        if self._csv_queue:
-            self._start_queue(chosen["format_id"], output_dir, min_height)
-        elif self._csv_ids:
-            self._start_batch_download(chosen["format_id"], output_dir, self._csv_ids, min_height)
-        else:
-            self._start_single_download(chosen["format_id"], output_dir, min_height)
+        self._start_single_download(chosen["format_id"], output_dir, min_height)
 
     def _start_single_download(self, format_id: str, output_dir: Path, min_height: int) -> None:
         """启动单个视频下载。"""
