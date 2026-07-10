@@ -1125,7 +1125,7 @@ class YoutubeDownloader:
         msg = f"Cookie 验证失败: {detail}"
         if hint_text:
             msg += f"\n{hint_text}"
-        msg += "\n\nCookie 文件已加载，仍可直接点击「获取信息」测试目标视频。"
+        msg += "\n\nCookie 文件已加载，可导入 CSV 后开始批量下载。"
         return False, msg
 
     def redetect_browser(self) -> bool:
