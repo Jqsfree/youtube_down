@@ -111,7 +111,12 @@ def test_batch_cookie_retry_respects_min_height(tmp_path: Path) -> None:
             return "22"
 
         def download(self, video_id: str, format_id: str, output_dir: Path, **kwargs):
-            self.calls.append((video_id, format_id, kwargs.get("min_height", 0)))
+            self.calls.append((
+                video_id,
+                format_id,
+                kwargs.get("expected_height"),
+                kwargs.get("min_height", 0),
+            ))
             return output_dir / f"{video_id}.mp4"
 
     downloader = FakeDownloader()
@@ -128,6 +133,7 @@ def test_batch_cookie_retry_respects_min_height(tmp_path: Path) -> None:
     assert downloader.calls
     assert downloader.calls[0][1] == "22"
     assert downloader.calls[0][2] == 720
+    assert downloader.calls[0][3] == 0
 
 
 def test_prefers_cookies_false_on_windows_without_file(monkeypatch: pytest.MonkeyPatch) -> None:

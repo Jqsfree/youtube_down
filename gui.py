@@ -49,7 +49,6 @@ class MainWindow(QMainWindow):
         ("1080p", 1080),
         ("1440p", 1440),
         ("2160p (4K)", 2160),
-        ("自动（尽量最高 ≥720p）", 720),
         ("自定义", None),
     )
 
@@ -72,6 +71,7 @@ class MainWindow(QMainWindow):
         self._batch_errors: list[tuple[int, str]] = []
         self._last_fmt_id: str = ""
         self._last_min_height: int = 720
+        self._last_strict_quality: bool = True
         self._batch_total: int = 0
         self._batch_video_ids: list[str] = []
         self._queue_results: list[tuple[int, int, int, str]] = []  # (success, fail, skipped, csv)
@@ -321,7 +321,7 @@ class MainWindow(QMainWindow):
             self._quality_combo.addItem(label)
         self._quality_combo.setCurrentIndex(0)
         self._quality_combo.setToolTip(
-            "批量下载时逐条自动匹配不低于所选清晰度的最佳格式"
+            "严格下载所选清晰度；仅 1080p 缺失时向下兼容 720p，其他档位不兼容"
         )
         self._quality_combo.setMinimumWidth(150)
         csv_layout.addWidget(self._quality_combo)
@@ -529,10 +529,10 @@ class MainWindow(QMainWindow):
         self._refresh_imported_files_list(self._csv_queue)
         self._log(f"加载队列: {parts}")
 
-        min_height = self._get_min_height()
+        min_height, strict_quality = self._get_quality_settings()
         self._download_btn.setEnabled(True)
         self._status_label.setText(
-            f"已加载 {total} 个视频 — 将按 {self._quality_label(min_height)} 逐条自动匹配格式"
+            f"已加载 {total} 个视频 — 将按 {self._quality_label(min_height, strict_quality)} 逐条匹配格式"
         )
 
     def _refresh_imported_files_list(self, queue: list[tuple[str, list[str], Path | None]]) -> None:
@@ -683,7 +683,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先 Load CSV 导入视频列表")
             return
 
-        min_height = self._get_min_height()
+        min_height, strict_quality = self._get_quality_settings()
         output_dir = Path(self._output_input.text())
         if not output_dir.exists():
             try:
@@ -694,12 +694,17 @@ class MainWindow(QMainWindow):
 
         self._last_fmt_id = AUTO_FORMAT_ID
         self._last_min_height = min_height
+        self._last_strict_quality = strict_quality
         if self._csv_queue:
-            self._start_queue(AUTO_FORMAT_ID, output_dir, min_height)
+            self._start_queue(AUTO_FORMAT_ID, output_dir, min_height, strict_quality)
         else:
-            self._start_batch_download(AUTO_FORMAT_ID, output_dir, self._csv_ids, min_height)
+            self._start_batch_download(
+                AUTO_FORMAT_ID, output_dir, self._csv_ids, min_height, strict_quality,
+            )
 
-    def _start_queue(self, format_id: str, base_dir: Path, min_height: int) -> None:
+    def _start_queue(
+        self, format_id: str, base_dir: Path, min_height: int, strict_quality: bool,
+    ) -> None:
         """启动队列下载：逐个 CSV 依次处理。"""
         if not self._csv_queue:
             return
@@ -708,7 +713,9 @@ class MainWindow(QMainWindow):
         output_dir.mkdir(parents=True, exist_ok=True)
         self._output_input.setText(str(output_dir))
         self._log(f"队列开始: {name} ({len(ids)} 个)")
-        self._start_batch_download(format_id, output_dir, ids, min_height, results_dir=base_dir)
+        self._start_batch_download(
+            format_id, output_dir, ids, min_height, strict_quality, results_dir=base_dir,
+        )
 
     def _start_batch_download(
         self,
@@ -716,6 +723,7 @@ class MainWindow(QMainWindow):
         output_dir: Path,
         video_ids: list[str],
         min_height: int,
+        strict_quality: bool,
         results_dir: Path | None = None,
     ) -> None:
         """启动单组批量下载。"""
@@ -729,6 +737,7 @@ class MainWindow(QMainWindow):
             format_id=format_id,
             output_dir=output_dir,
             min_height=min_height,
+            strict_quality=strict_quality,
             results_dir=results_dir,
             cookie_overrides={
                 source: self._csv_cookie_overrides[source]
@@ -764,25 +773,32 @@ class MainWindow(QMainWindow):
         if not is_custom and preset is not None:
             self._min_height_input.setText(str(preset))
 
-    def _get_min_height(self) -> int:
-        """从清晰度下拉或自定义输入解析目标分辨率。"""
+    def _get_quality_settings(self) -> tuple[int, bool]:
+        """从清晰度下拉解析目标分辨率（仅严格档位）。"""
         index = self._quality_combo.currentIndex()
         _, preset = self._QUALITY_PRESETS[index]
-        if preset is not None:
-            return preset
-        return self._parse_min_height(self._min_height_input.text())
+        if preset is None:
+            return self._parse_min_height(self._min_height_input.text()), True
+        return preset, True
+
+    def _get_min_height(self) -> int:
+        """从清晰度下拉或自定义输入解析目标分辨率。"""
+        target_height, _ = self._get_quality_settings()
+        return target_height
 
     @staticmethod
-    def _quality_label(min_height: int) -> str:
+    def _quality_label(min_height: int, strict_quality: bool) -> str:
         """生成状态栏用的清晰度描述。"""
-        return f"不低于 {min_height}p 的最佳格式"
+        if strict_quality:
+            return f"严格 {min_height}p（仅 1080 缺失时兼容 720）"
+        return f"严格 {min_height}p"
 
     @staticmethod
     def _parse_min_height(value: str) -> int:
-        """解析最小分辨率阈值，非法时回退到 720。"""
+        """解析最小分辨率阈值，非法时回退到 720；且最低为 720。"""
         text = (value or "").strip().lower().replace("p", "")
         try:
-            return max(0, int(text)) if text else 720
+            return max(720, int(text)) if text else 720
         except ValueError:
             return 720
 
@@ -926,7 +942,8 @@ class MainWindow(QMainWindow):
             self._queue_results.append((success, fail, skipped, csv_path))
             fmt_id = self._worker._format_id if self._worker else self._last_fmt_id  # noqa: SLF001
             min_height = self._last_min_height
-            self._start_queue(fmt_id, self._output_dir, min_height)
+            strict_quality = self._last_strict_quality
+            self._start_queue(fmt_id, self._output_dir, min_height, strict_quality)
             return
 
         # 队列全部完成（或单批次）→ 汇总弹窗

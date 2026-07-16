@@ -2,27 +2,48 @@ from downloader import YoutubeDownloader
 from gui import MainWindow
 
 
-def test_resolve_format_prefers_minimum_height():
+def test_resolve_format_prefers_exact_height_in_strict_mode():
     formats = [
         {"format_id": "1", "resolution": "480p", "container": "mp4", "type": "Video+Audio"},
         {"format_id": "2", "resolution": "720p", "container": "mp4", "type": "Video+Audio"},
         {"format_id": "3", "resolution": "1080p", "container": "mp4", "type": "Video+Audio"},
     ]
 
-    chosen = YoutubeDownloader.resolve_format_id(formats, min_height=720)
+    chosen = YoutubeDownloader.resolve_format_id(formats, target_height=720, strict=True)
 
-    assert chosen == "3"
+    assert chosen == "2"
 
 
-def test_resolve_format_falls_back_to_720_for_1080p_goal():
+def test_resolve_format_falls_back_when_exact_height_missing():
     formats = [
         {"format_id": "1", "resolution": "480p", "container": "mp4", "type": "Video+Audio"},
         {"format_id": "2", "resolution": "720p", "container": "mp4", "type": "Video+Audio"},
     ]
 
-    chosen = YoutubeDownloader.resolve_format_id(formats, min_height=1080)
+    chosen = YoutubeDownloader.resolve_format_id(formats, target_height=1080, strict=True)
 
     assert chosen == "2"
+
+
+def test_resolve_format_strict_does_not_upward_compat():
+    formats = [
+        {"format_id": "1", "resolution": "480p", "container": "mp4", "type": "Video+Audio"},
+        {"format_id": "2", "resolution": "1080p", "container": "mp4", "type": "Video+Audio"},
+        {"format_id": "3", "resolution": "1440p", "container": "mp4", "type": "Video+Audio"},
+    ]
+
+    # 选择 720p 时，不向上兼容
+    chosen = YoutubeDownloader.resolve_format_id(formats, target_height=720, strict=True)
+    assert chosen is None
+
+
+def test_resolve_format_strict_non_1080_has_no_fallback():
+    formats = [
+        {"format_id": "3", "resolution": "1440p", "container": "mp4", "type": "Video+Audio"},
+    ]
+
+    chosen = YoutubeDownloader.resolve_format_id(formats, target_height=720, strict=True)
+    assert chosen is None
 
 
 def test_parse_min_height_uses_custom_value():
@@ -31,19 +52,26 @@ def test_parse_min_height_uses_custom_value():
     assert MainWindow._parse_min_height("invalid") == 720
 
 
-def test_get_min_height_uses_quality_preset():
+def test_get_quality_settings_uses_strict_preset():
     window = MainWindow.__new__(MainWindow)
     window._QUALITY_PRESETS = MainWindow._QUALITY_PRESETS
     window._quality_combo = type("Combo", (), {"currentIndex": lambda self: 1})()
-    assert window._get_min_height() == 1080
+    assert window._get_quality_settings() == (1080, True)
 
 
-def test_get_min_height_uses_custom_input():
+def test_get_quality_settings_uses_4k_preset():
     window = MainWindow.__new__(MainWindow)
     window._QUALITY_PRESETS = MainWindow._QUALITY_PRESETS
-    window._quality_combo = type("Combo", (), {"currentIndex": lambda self: 5})()
+    window._quality_combo = type("Combo", (), {"currentIndex": lambda self: 3})()
+    assert window._get_quality_settings() == (2160, True)
+
+
+def test_get_quality_settings_uses_custom_input():
+    window = MainWindow.__new__(MainWindow)
+    window._QUALITY_PRESETS = MainWindow._QUALITY_PRESETS
+    window._quality_combo = type("Combo", (), {"currentIndex": lambda self: 4})()
     window._min_height_input = type("Input", (), {"text": lambda self: "900"})()
-    assert window._get_min_height() == 900
+    assert window._get_quality_settings() == (900, True)
 
 
 def test_list_formats_filters_below_min_height():
@@ -89,12 +117,34 @@ def test_list_formats_returns_descending_by_height():
         f"格式应按高度降序排列，实际: {heights}"
 
 
-def test_worker_resolve_format_uses_auto_mode():
+def test_worker_resolve_format_uses_strict_auto_mode():
     from worker import AUTO_FORMAT_ID, BatchDownloadWorker
 
     worker = BatchDownloadWorker.__new__(BatchDownloadWorker)
     worker._format_id = AUTO_FORMAT_ID
     worker._min_height = 720
+    worker._strict_quality = True
+    downloader = YoutubeDownloader.__new__(YoutubeDownloader)
+
+    info = {
+        "formats": [
+            {"format_id": "1", "resolution": "480p", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "filesize": 1000},
+            {"format_id": "2", "resolution": "720p", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "filesize": 2000},
+            {"format_id": "3", "resolution": "1080p", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "filesize": 3000},
+        ]
+    }
+
+    worker._downloader = downloader
+    assert worker._resolve_format(info) == ("2", False, 720)
+
+
+def test_worker_resolve_format_1080_falls_back_to_720():
+    from worker import AUTO_FORMAT_ID, BatchDownloadWorker
+
+    worker = BatchDownloadWorker.__new__(BatchDownloadWorker)
+    worker._format_id = AUTO_FORMAT_ID
+    worker._min_height = 1080
+    worker._strict_quality = True
     downloader = YoutubeDownloader.__new__(YoutubeDownloader)
 
     info = {
@@ -105,7 +155,7 @@ def test_worker_resolve_format_uses_auto_mode():
     }
 
     worker._downloader = downloader
-    assert worker._resolve_format(info) == ("best", False)
+    assert worker._resolve_format(info) == ("2", False, 720)
 
 
 def test_worker_resolve_format_rejects_below_threshold():
@@ -114,6 +164,7 @@ def test_worker_resolve_format_rejects_below_threshold():
     worker = BatchDownloadWorker.__new__(BatchDownloadWorker)
     worker._format_id = "1"
     worker._min_height = 720
+    worker._strict_quality = True
     downloader = YoutubeDownloader.__new__(YoutubeDownloader)
 
     info = {
@@ -124,4 +175,4 @@ def test_worker_resolve_format_rejects_below_threshold():
     }
 
     worker._downloader = downloader
-    assert worker._resolve_format(info) == ("2", False)
+    assert worker._resolve_format(info) == ("2", False, 720)

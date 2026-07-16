@@ -817,6 +817,8 @@ class YoutubeDownloader:
         use_cookies: bool = True,
         needs_audio_merge: bool = True,
         min_height: int = 0,
+        expected_height: int | None = None,
+        strict_quality: bool = False,
         cookiefile_override: str | Path | None = None,
         cookies_from_browser_override: str | None = None,
     ) -> Path:
@@ -847,9 +849,10 @@ class YoutubeDownloader:
             if cancelled:
                 raise yt_dlp.utils.DownloadError("下载已取消")
 
+        selector_min_height = min_height if format_id == "best" else 0
         fmt_str = self.build_format_selector(
             format_id,
-            min_height=min_height,
+            min_height=selector_min_height,
             needs_audio_merge=needs_audio_merge,
         )
         opts = self._make_opts(
@@ -927,8 +930,7 @@ class YoutubeDownloader:
                         f" 实际 {actual_duration:.0f}s (可能是合并中断)"
                     )
 
-            # 校验下载后视频分辨率不低于最低要求
-            if min_height and min_height > 0:
+            if expected_height is not None or (min_height and min_height > 0):
                 height_result = subprocess.run(
                     [_find_tool("ffprobe"), "-v", "error",
                      "-select_streams", "v:0", "-show_entries",
@@ -939,7 +941,14 @@ class YoutubeDownloader:
                 if height_str:
                     try:
                         actual_height = int(height_str)
-                        if actual_height < min_height:
+                        if expected_height is not None:
+                            tolerance = max(8, int(expected_height * 0.02))
+                            if abs(actual_height - expected_height) > tolerance:
+                                raise yt_dlp.utils.DownloadError(
+                                    f"下载视频分辨率 ({actual_height}p)"
+                                    f" 与目标档位 ({expected_height}p) 不符"
+                                )
+                        elif actual_height < min_height:
                             raise yt_dlp.utils.DownloadError(
                                 f"下载视频分辨率 ({actual_height}p)"
                                 f" 低于最低要求 ({min_height}p)"
@@ -949,6 +958,8 @@ class YoutubeDownloader:
                             "无法解析视频高度用于分辨率校验: height_str=%s, file=%s",
                             height_str, path.name,
                         )
+                    except yt_dlp.utils.DownloadError:
+                        raise
 
             return path
 
@@ -1499,13 +1510,35 @@ class YoutubeDownloader:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def resolve_format_id(formats: list[dict[str, Any]], min_height: int = 720) -> str | None:
-        """按目标清晰度选择格式：低于 720p 直接排除；低于 1080p 可回退到 720p；1080p 及以上优先选更高。"""
-        def _height(resolution: str) -> int:
+    def format_height(fmt: dict[str, Any]) -> int:
+        """从格式条目解析视频高度（像素）。"""
+        height = fmt.get("height")
+        if height:
             try:
-                return int(resolution.split("x")[-1].replace("p", ""))
-            except (ValueError, IndexError):
-                return 0
+                return int(height)
+            except (TypeError, ValueError):
+                pass
+        resolution = fmt.get("resolution") or ""
+        try:
+            return int(resolution.split("x")[-1].replace("p", ""))
+        except (ValueError, IndexError):
+            return 0
+
+    @staticmethod
+    def resolve_format_id(
+        formats: list[dict[str, Any]],
+        target_height: int = 720,
+        *,
+        min_height: int | None = None,
+        strict: bool = True,
+    ) -> str | None:
+        """按目标清晰度选择格式。
+
+        strict=True 时优先精确匹配目标档位；仅当该档位不存在时，
+        才回退到最接近的可用分辨率。strict=False 时选择不低于目标的最佳格式。
+        """
+        if min_height is not None:
+            target_height = min_height
 
         video_formats = [
             fmt for fmt in formats
@@ -1515,21 +1548,76 @@ class YoutubeDownloader:
         if not video_formats:
             return None
 
-        if min_height <= 720:
-            candidates = [fmt for fmt in video_formats if _height(fmt.get("resolution", "")) >= 720]
+        def _pick_best(candidates: list[dict[str, Any]]) -> str | None:
+            if not candidates:
+                return None
+            candidates.sort(
+                key=lambda fmt: (
+                    0 if fmt.get("type") == "Video+Audio" else 1,
+                    -(fmt.get("filesize") or 0),
+                )
+            )
+            return candidates[0].get("format_id")
+
+        heights = {YoutubeDownloader.format_height(fmt) for fmt in video_formats}
+        heights.discard(0)
+        if not heights:
+            return None
+
+        if strict:
+            # 严格档位：只下载所选清晰度。
+            # 特例：1080 缺失时，允许向下兼容 720；其他档位不兼容。
+            target_height = max(720, target_height)
+            exact = [
+                fmt for fmt in video_formats
+                if YoutubeDownloader.format_height(fmt) == target_height
+            ]
+            chosen = _pick_best(exact)
+            if chosen:
+                return chosen
+
+            if target_height == 1080:
+                fallback_720 = [
+                    fmt for fmt in video_formats
+                    if YoutubeDownloader.format_height(fmt) == 720
+                ]
+                return _pick_best(fallback_720)
+
+            return None
+
+        if target_height <= 720:
+            candidates = [
+                fmt for fmt in video_formats
+                if YoutubeDownloader.format_height(fmt) >= 720
+            ]
             if candidates:
-                candidates.sort(key=lambda fmt: _height(fmt.get("resolution", "")), reverse=True)
+                candidates.sort(
+                    key=lambda fmt: YoutubeDownloader.format_height(fmt),
+                    reverse=True,
+                )
                 return candidates[0].get("format_id", None)
             return None
 
-        candidates = [fmt for fmt in video_formats if _height(fmt.get("resolution", "")) >= min_height]
+        candidates = [
+            fmt for fmt in video_formats
+            if YoutubeDownloader.format_height(fmt) >= target_height
+        ]
         if candidates:
-            candidates.sort(key=lambda fmt: _height(fmt.get("resolution", "")), reverse=True)
+            candidates.sort(
+                key=lambda fmt: YoutubeDownloader.format_height(fmt),
+                reverse=True,
+            )
             return candidates[0].get("format_id", None)
 
-        fallback = [fmt for fmt in video_formats if _height(fmt.get("resolution", "")) >= 720]
+        fallback = [
+            fmt for fmt in video_formats
+            if YoutubeDownloader.format_height(fmt) >= 720
+        ]
         if fallback:
-            fallback.sort(key=lambda fmt: _height(fmt.get("resolution", "")), reverse=True)
+            fallback.sort(
+                key=lambda fmt: YoutubeDownloader.format_height(fmt),
+                reverse=True,
+            )
             return fallback[0].get("format_id", None)
 
         return None

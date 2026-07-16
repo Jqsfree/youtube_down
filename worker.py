@@ -267,6 +267,7 @@ class BatchDownloadWorker(QThread):
         format_id: str,
         output_dir: Path,
         min_height: int = 720,
+        strict_quality: bool = True,
         results_dir: Path | None = None,
         cookie_overrides: dict[str, dict[str, str]] | None = None,
         parent: QThread | None = None,
@@ -278,6 +279,7 @@ class BatchDownloadWorker(QThread):
         self._output_dir = output_dir
         self._results_dir = results_dir or output_dir
         self._min_height = min_height
+        self._strict_quality = strict_quality
         self._last_results_csv = ""
         self._last_skipped_csv = ""
         self._last_failed_csv = ""
@@ -446,39 +448,75 @@ class BatchDownloadWorker(QThread):
         self.video_finished.emit(index, "续传跳过（已完成）", False)
         self.status_changed.emit(f"[{index + 1}/{total}] 续传跳过: {video_id}")
 
-    def _resolve_format(self, info: dict[str, Any]) -> tuple[str | None, bool]:
+    def _resolve_format(self, info: dict[str, Any]) -> tuple[str | None, bool, int | None]:
         """为当前视频匹配最佳 format_id + 是否需要合并音频。
 
         Returns:
-            (format_id, needs_audio_merge)
+            (format_id, needs_audio_merge, expected_height)
             format_id 为 None 表示低于阈值应跳过。
         """
         preferred = self._format_id
-        if preferred in (AUTO_FORMAT_ID, "", None):
-            return ("best", False)
-
-        formats = self._downloader.list_formats(
-            info=info,
-            min_height=self._min_height,
-        )
+        formats = self._downloader.list_formats(info=info)
         available_ids = {f["format_id"] for f in formats}
 
         def _needs_merge(fmt: dict) -> bool:
             return fmt.get("type") == "Video Only"
 
+        def _expected_height(fmt: dict | None) -> int | None:
+            if fmt is None:
+                return None
+            height = YoutubeDownloader.format_height(fmt)
+            return height or None
+
+        if preferred in (AUTO_FORMAT_ID, "", None):
+            if not self._strict_quality:
+                return ("best", False, None)
+
+            result = self._downloader.resolve_format_id(
+                formats,
+                target_height=self._min_height,
+                strict=True,
+            )
+            if result is None:
+                return (None, False, None)
+            result_fmt = next((f for f in formats if f["format_id"] == result), None)
+            return (
+                result,
+                _needs_merge(result_fmt) if result_fmt else False,
+                _expected_height(result_fmt),
+            )
+
         if preferred not in (AUTO_FORMAT_ID, "", None) and preferred in available_ids:
             try:
                 preferred_fmt = next(f for f in formats if f["format_id"] == preferred)
-                if preferred_fmt.get("type") in {"Video+Audio", "Video Only"}:
-                    return (preferred, _needs_merge(preferred_fmt))
+                preferred_height = YoutubeDownloader.format_height(preferred_fmt)
+                if (
+                    not self._strict_quality
+                    or preferred_height == self._min_height
+                    or preferred_height == 0
+                ):
+                    if preferred_fmt.get("type") in {"Video+Audio", "Video Only"}:
+                        return (
+                            preferred,
+                            _needs_merge(preferred_fmt),
+                            _expected_height(preferred_fmt),
+                        )
             except StopIteration:
                 pass
 
-        result = self._downloader.resolve_format_id(formats, min_height=self._min_height)
+        result = self._downloader.resolve_format_id(
+            formats,
+            target_height=self._min_height,
+            strict=self._strict_quality,
+        )
         if result is None:
-            return (None, False)
+            return (None, False, None)
         result_fmt = next((f for f in formats if f["format_id"] == result), None)
-        return (result, _needs_merge(result_fmt) if result_fmt else False)
+        return (
+            result,
+            _needs_merge(result_fmt) if result_fmt else False,
+            _expected_height(result_fmt),
+        )
 
     def _make_progress_cb(self, index: int, total: int) -> Callable[[dict[str, Any]], None]:
         """创建进度回调（闭包捕获 index/total）。"""
@@ -538,7 +576,7 @@ class BatchDownloadWorker(QThread):
                 cookies_from_browser_override=cookie_args.get("cookies_from_browser"),
             )
             title = info.get("title", "") or ""
-            fmt, merge = self._resolve_format(info)
+            fmt, merge, expected_height = self._resolve_format(info)
 
             if fmt is None:
                 msg = f"低于 {self._min_height}p，跳过下载: {video_id}"
@@ -550,7 +588,9 @@ class BatchDownloadWorker(QThread):
                 output_dir=self._output_dir,
                 progress_callback=on_progress, use_cookies=use_cookies,
                 needs_audio_merge=merge,
-                min_height=self._min_height,
+                min_height=0 if expected_height is not None else self._min_height,
+                expected_height=expected_height,
+                strict_quality=self._strict_quality,
                 cookiefile_override=cookie_args.get("cookiefile"),
                 cookies_from_browser_override=cookie_args.get("cookies_from_browser"),
             )
@@ -565,7 +605,7 @@ class BatchDownloadWorker(QThread):
                     self.status_changed.emit(f"限流，{wait}s 后重试...")
                     time.sleep(wait)
                     try:
-                        fmt, merge = self._resolve_format(
+                        fmt, merge, expected_height = self._resolve_format(
                             self._downloader.get_info(video_id, use_cookies=False)
                         )
                         if fmt is None:
@@ -576,7 +616,9 @@ class BatchDownloadWorker(QThread):
                             progress_callback=on_progress,
                             use_cookies=False,
                             needs_audio_merge=merge,
-                            min_height=self._min_height,
+                            min_height=0 if expected_height is not None else self._min_height,
+                            expected_height=expected_height,
+                            strict_quality=self._strict_quality,
                         )
                         self.video_finished.emit(index, str(path), use_cookies)
                         return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)
