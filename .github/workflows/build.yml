@@ -49,15 +49,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest pyinstaller
 
-      - name: Run unit tests
-        shell: bash
-        run: python -m pytest tests/ -q
-
       - name: Install system tools (Linux)
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y \
+            ffmpeg \
+            libegl1 \
+            libgl1 \
+            libxkbcommon0 \
+            libdbus-1-3 \
+            libxcb-cursor0 \
+            libxcb-xinerama0
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
 
@@ -82,6 +85,12 @@ jobs:
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
           Move-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
           Move-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
+
+      - name: Run unit tests
+        shell: bash
+        run: python -m pytest tests/ -q
+        env:
+          QT_QPA_PLATFORM: offscreen
 
       - name: Smoke test
         shell: bash
