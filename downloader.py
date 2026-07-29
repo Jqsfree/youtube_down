@@ -563,19 +563,25 @@ class YoutubeDownloader:
         min_height: int = 0,
         needs_audio_merge: bool = True,
     ) -> str:
-        """构建 yt-dlp format 字符串，避免无约束的 /best 回退到低画质。"""
+        """构建 yt-dlp format 字符串，避免无约束的 /best 回退到低画质。
+
+        合并音频时优先 m4a/AAC：bestaudio 默认常选 opus，封装进 mp4 后
+        多数 Windows 播放器会表现为“有画面无声音”。
+        """
         height = f"[height>={min_height}]" if min_height > 0 else ""
+        # 优先 AAC/m4a，再回退任意 bestaudio
+        ba = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio"
         if format_id == "best":
             if min_height > 0:
                 return (
-                    f"bestvideo[height>={min_height}]+bestaudio/"
-                    f"bestvideo[height>={min_height}]+bestaudio"
+                    f"bestvideo[height>={min_height}]+{ba}/"
+                    f"bestvideo[height>={min_height}]+{ba}"
                 )
-            return "bestvideo+bestaudio/bestvideo+bestaudio"
+            return f"bestvideo+{ba}/bestvideo+{ba}"
         if needs_audio_merge:
-            primary = f"{format_id}+bestaudio"
+            primary = f"{format_id}+{ba}"
             if min_height > 0:
-                return f"{primary}/bestvideo{height}+bestaudio"
+                return f"{primary}/bestvideo{height}+{ba}"
             return primary
         return format_id
 
@@ -806,6 +812,21 @@ class YoutubeDownloader:
         )
         return result.returncode == 0 and result.stdout.strip() == "video"
 
+    @staticmethod
+    def _audio_codec(path: Path) -> str | None:
+        """返回首个音轨 codec_name；无音轨时返回 None。"""
+        result = subprocess.run(
+            [
+                _find_tool("ffprobe"), "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        codec = (result.stdout or "").strip()
+        return codec or None
+
     def download(
         self,
         video_id: str,
@@ -862,6 +883,8 @@ class YoutubeDownloader:
             outtmpl=output_template,
             progress_hooks=[_progress_hook],
             merge_output_format="mp4",
+            # 与官方 mp4 preset 一致：优先 AAC，避免 opus-in-mp4 兼容问题
+            format_sort=["acodec:aac", "vcodec:h264"],
             concurrent_fragment_downloads=8,
             buffersize=4 * 1024 * 1024,
             file_access_retries=5,
@@ -905,6 +928,12 @@ class YoutubeDownloader:
                 if not self._has_video_stream(path):
                     raise yt_dlp.utils.DownloadError(
                         f"下载结果只有音频或缺少视频轨: {path}"
+                    )
+
+                audio_codec = self._audio_codec(path)
+                if needs_audio_merge and not audio_codec:
+                    raise yt_dlp.utils.DownloadError(
+                        f"下载结果缺少音轨（合并失败）: {path}"
                     )
 
                 # 校验文件是有效媒体（ffprobe 解析 + 时长比对）
@@ -1571,6 +1600,7 @@ class YoutubeDownloader:
         """从格式条目解析清晰度档位高度（像素）。
 
         竖屏视频（如 720x1280）按短边计档（720p），避免被当成 1280p 而误跳过。
+        若只有 height、缺少 width，仍优先从 resolution 的 WxH 取短边。
         """
         def _as_int(value: Any) -> int:
             try:
@@ -1578,15 +1608,13 @@ class YoutubeDownloader:
             except (TypeError, ValueError):
                 return 0
 
-        h = _as_int(fmt.get("height"))
-        w = _as_int(fmt.get("width"))
-        if h > 0 and w > 0:
-            return min(h, w)
-        if h > 0:
-            return h
-
-        resolution = (fmt.get("resolution") or "").strip().lower()
-        if "x" in resolution:
+        def _from_resolution(resolution: str) -> int:
+            resolution = (resolution or "").strip().lower()
+            if "x" not in resolution:
+                try:
+                    return int(resolution.replace("p", "").strip())
+                except (ValueError, AttributeError):
+                    return 0
             try:
                 left, right = resolution.replace("p", "").split("x", 1)
                 dims = [_as_int(left), _as_int(right)]
@@ -1594,16 +1622,24 @@ class YoutubeDownloader:
                     return min(dims)
             except (ValueError, IndexError):
                 pass
-        try:
-            return int(resolution.replace("p", "").strip())
-        except (ValueError, AttributeError):
-            pass
+            return 0
 
-        note = str(fmt.get("note") or fmt.get("format_note") or "").lower()
-        m = re.search(r"(\d{3,4})\s*p", note)
-        if m:
-            return int(m.group(1))
-        return 0
+        h = _as_int(fmt.get("height"))
+        w = _as_int(fmt.get("width"))
+        if h > 0 and w > 0:
+            tier = min(h, w)
+        else:
+            tier = _from_resolution(str(fmt.get("resolution") or ""))
+            if tier <= 0 and h > 0:
+                tier = h
+
+        if tier <= 0:
+            note = str(fmt.get("note") or fmt.get("format_note") or "").lower()
+            m = re.search(r"(\d{3,4})\s*p", note)
+            if m:
+                tier = int(m.group(1))
+
+        return tier
 
     @staticmethod
     def resolve_format_id(
@@ -1623,7 +1659,7 @@ class YoutubeDownloader:
 
         video_formats = [
             fmt for fmt in formats
-            if fmt.get("container") in {"mp4", "webm", "flv", "mkv", "mov"}
+            if fmt.get("container") in {"mp4", "webm", "flv", "mkv", "mov", "m4s", "fmp4"}
             and fmt.get("type") in {"Video+Audio", "Video Only"}
         ]
         if not video_formats:

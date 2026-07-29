@@ -58,17 +58,23 @@ def test_browser_cookie_broken_does_not_block_cookiefile(
 def test_build_format_selector_avoids_unbounded_best_fallback() -> None:
     selector = YoutubeDownloader.build_format_selector("22", min_height=720, needs_audio_merge=True)
 
-    assert "22+bestaudio" in selector
+    assert "22+bestaudio[ext=m4a]" in selector
     assert "height>=720" in selector
-    assert selector.endswith("bestaudio") or "bestvideo[height>=720]+bestaudio" in selector
+    assert "bestaudio" in selector
     assert "/best[" not in selector
     assert not selector.endswith("/best")
+
+
+def test_build_format_selector_prefers_m4a_audio() -> None:
+    selector = YoutubeDownloader.build_format_selector("136", needs_audio_merge=True)
+    assert selector.startswith("136+bestaudio[ext=m4a]")
+    assert "bestaudio[acodec^=mp4a]" in selector
 
 
 def test_build_format_selector_best_mode_requires_video() -> None:
     selector = YoutubeDownloader.build_format_selector("best", min_height=720)
 
-    assert "bestvideo[height>=720]+bestaudio" in selector
+    assert "bestvideo[height>=720]+bestaudio[ext=m4a]" in selector
     assert "/best[" not in selector
     assert not selector.endswith("/best")
 

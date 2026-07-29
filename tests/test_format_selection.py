@@ -14,6 +14,40 @@ def test_format_height_uses_short_side_for_portrait():
     ) == 720
 
 
+def test_format_height_uses_resolution_when_width_missing():
+    # height 只有长边、width 缺失时，不能直接把 1280 当成档位
+    assert YoutubeDownloader.format_height(
+        {"format_id": "136", "height": 1280, "width": 0, "resolution": "720x1280"}
+    ) == 720
+    assert YoutubeDownloader.resolve_format_id(
+        [{
+            "format_id": "136",
+            "height": 1280,
+            "width": 0,
+            "resolution": "720x1280",
+            "container": "mp4",
+            "type": "Video Only",
+        }],
+        target_height=720,
+        strict=True,
+    ) == "136"
+
+
+def test_resolve_format_accepts_m4s_container():
+    formats = [
+        {
+            "format_id": "dash720",
+            "resolution": "1280x720",
+            "width": 1280,
+            "height": 720,
+            "container": "m4s",
+            "type": "Video Only",
+            "filesize": 1000,
+        },
+    ]
+    assert YoutubeDownloader.resolve_format_id(formats, target_height=720, strict=True) == "dash720"
+
+
 def test_resolve_format_accepts_portrait_720():
     formats = [
         {

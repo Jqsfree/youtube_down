@@ -144,8 +144,9 @@ jobs:
             | Windows | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
 
             ## 本版修复
-            - 竖屏 720p（如 `720x1280`）按短边计档，不再误判为非 720 而跳过
-            - 下载后分辨率校验同样按短边，避免竖屏下载成功后被误判失败
+            - 竖屏/横屏按短边计档；缺 width 时从 resolution 解析，避免有 720 却误跳过
+            - 合并音频优先 m4a/AAC，避免 opus 进 mp4 后 Windows 播放器无声
+            - 格式选择兼容 m4s/fmp4 容器
 
             ## 使用
             1. 下载 `YouTubeDownloader-Windows.exe`
