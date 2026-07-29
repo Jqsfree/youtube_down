@@ -87,11 +87,13 @@ jobs:
           if (-not (Test-Path deno.exe)) {
             Get-ChildItem -Recurse -Filter deno.exe | Select-Object -First 1 | Move-Item -Destination deno.exe
           }
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          # BtbN builds are more reliable than gyan.dev on CI
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath .
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
-          Move-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
-          Move-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
+          Copy-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
+          Copy-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
+          if (-not (Test-Path ffmpeg.exe)) { throw "ffmpeg.exe missing after extract" }
 
       - name: Smoke test
         shell: bash
