@@ -434,22 +434,18 @@ class MainWindow(QMainWindow):
             return
         try:
             persist = self._remember_cookie_checkbox.isChecked()
-            self._downloader.set_cookiefile(filepath, persist=persist)
-            # Prefer selected platform when auto-detect ambiguous
-            detected = self._downloader._cookiefile_platform  # noqa: SLF001
-            if detected is None:
-                self._downloader._cookiefile_platform = self._selected_platform.value  # noqa: SLF001
-                self._downloader._platform_cookiefiles[self._selected_platform.value] = Path(filepath)  # noqa: SLF001
-                if persist:
-                    YoutubeDownloader._persist_platform_cookiefile(
-                        self._selected_platform.value, Path(filepath)
-                    )
+            # Windows 路径规范化；按当前选中平台校验域名并入库
+            self._downloader.set_cookiefile(
+                filepath,
+                persist=persist,
+                preferred_platform=self._selected_platform.value,
+            )
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "导入失败", str(exc))
             return
         self._cookie_persisted = self._remember_cookie_checkbox.isChecked()
         self._refresh_cookie_ui()
-        self._log(f"已导入 Cookie: {filepath}")
+        self._log(f"已导入 Cookie ({self._selected_platform.label}): {filepath}")
         self._status_label.setText("Cookie 已加载，正在后台验证...")
         self._import_cookie_btn.setEnabled(False)
         self._clear_cookie_btn.setEnabled(False)
@@ -483,10 +479,12 @@ class MainWindow(QMainWindow):
             self,
             f"选择 {self._selected_platform.label} Cookie 文件",
             str(Path.home()),
-            "Cookie 文件 (*.txt *.cookies);;所有文件 (*.*)",
+            # 空格分隔扩展名；;; 分隔过滤器。末项用 * 兼容无扩展名文件（勿用 *.*）
+            "Cookie 文件 (*.txt *.cookies);;所有文件 (*)",
         )
         if filepath:
             self._apply_cookie_file(filepath)
+
 
     def _on_clear_cookie(self) -> None:
         if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():

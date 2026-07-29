@@ -50,6 +50,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Unit tests failed."
 }
 
+Write-Step "Cookie import (Windows encodings)"
+python scripts\test_cookie_win_import.py
+if ($LASTEXITCODE -ne 0) {
+    throw "Cookie import functional test failed."
+}
+
 if (-not $SkipNetwork) {
     Write-Step "Run smoke test (get_info)"
     python smoke_test.py

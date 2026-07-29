@@ -48,6 +48,17 @@ _PLATFORM_LABELS = platform_labels()
 
 # Netscape cookies.txt 常见文件头
 _NETSCAPE_MARKERS = ("# netscape", "# http cookie file")
+# Windows 记事本「Unicode」常导出 UTF-16；部分扩展带 BOM / GBK
+_COOKIE_ENCODINGS = (
+    "utf-8-sig",
+    "utf-8",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "gbk",
+    "cp936",
+    "latin-1",
+)
 
 # CSV 列名别名（含中文表头）
 _CSV_COLUMN_ALIASES: tuple[str, ...] = (
@@ -1047,13 +1058,46 @@ class YoutubeDownloader:
         return ""
 
     @staticmethod
+    def _read_cookie_text(path: Path) -> str:
+        """按多编码尝试读取 cookies.txt（兼容 Windows UTF-16 / BOM / GBK）。"""
+        raw = path.read_bytes()
+        if not raw:
+            return ""
+        # BOM 快速路径
+        if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+            return raw.decode("utf-16")
+        if raw.startswith(b"\xef\xbb\xbf"):
+            return raw.decode("utf-8-sig")
+        last_err: Exception | None = None
+        for encoding in _COOKIE_ENCODINGS:
+            try:
+                text = raw.decode(encoding)
+            except UnicodeDecodeError as exc:
+                last_err = exc
+                continue
+            # 拒绝仍含大量 NUL 的误解码（典型 UTF-16 被当成 latin-1）
+            if "\x00" in text[:4096] and encoding not in {"utf-16", "utf-16-le", "utf-16-be"}:
+                continue
+            if (
+                any(m in text[:4096].lower() for m in _NETSCAPE_MARKERS)
+                or "\t" in text
+                or YoutubeDownloader._cookie_platform_from_text(text) is not None
+            ):
+                return text
+        # 最后回退：尽量给出可读文本
+        try:
+            return raw.decode("utf-8", errors="replace")
+        except Exception as exc:  # pragma: no cover
+            raise OSError(f"无法解码 Cookie 文件: {last_err or exc}") from exc
+
+    @staticmethod
     def is_netscape_cookie_file(path: str | Path) -> bool:
         """快速判断是否为 Netscape cookies.txt（本地校验，不访问网络）。"""
         cookie_path = Path(path)
         if not cookie_path.is_file() or cookie_path.stat().st_size == 0:
             return False
         try:
-            head = cookie_path.read_text(encoding="utf-8", errors="replace")[:4096].lower()
+            head = YoutubeDownloader._read_cookie_text(cookie_path)[:4096].lower()
         except OSError:
             return False
         return any(m in head for m in _NETSCAPE_MARKERS) or "\t" in head
@@ -1067,11 +1111,13 @@ class YoutubeDownloader:
         if cookie_path.stat().st_size == 0:
             return False, "文件为空"
         try:
-            text = cookie_path.read_text(encoding="utf-8", errors="replace")
+            text = YoutubeDownloader._read_cookie_text(cookie_path)
         except OSError as exc:
             return False, f"无法读取文件: {exc}"
         lower = text.lower()
-        if not YoutubeDownloader.is_netscape_cookie_file(cookie_path):
+        if not (
+            any(m in lower[:4096] for m in _NETSCAPE_MARKERS) or "\t" in text
+        ):
             return False, (
                 "不是 Netscape cookies.txt 格式。\n"
                 "请使用扩展「Get cookies.txt LOCALLY」导出，勿使用 JSON 格式。"
@@ -1091,16 +1137,26 @@ class YoutubeDownloader:
             msg += "；未检测到 SESSDATA，可能不是登录 Cookie"
         return True, msg
 
-    def set_cookiefile(self, path: str | Path, *, persist: bool = True) -> None:
-        """设置 Netscape 格式 cookie 文件（优先于浏览器 Cookie）。"""
+    def set_cookiefile(
+        self,
+        path: str | Path,
+        *,
+        persist: bool = True,
+        preferred_platform: str | None = None,
+    ) -> None:
+        """设置 Netscape 格式 cookie 文件（优先于浏览器 Cookie）。
+
+        preferred_platform: GUI 当前选中平台；有值时按该平台校验域名并入库。
+        """
         cookie_path = Path(path).expanduser().resolve()
         if not cookie_path.is_file():
             raise ValueError(f"文件不存在: {cookie_path}")
         try:
-            text = cookie_path.read_text(encoding="utf-8", errors="replace")
+            text = self._read_cookie_text(cookie_path)
         except OSError as exc:
             raise ValueError(f"无法读取文件: {exc}") from exc
-        platform = self._cookie_platform_from_text(text)
+        detected = self._cookie_platform_from_text(text)
+        platform = preferred_platform or detected
         ok, msg = self.validate_cookie_file(cookie_path, platform=platform)
         if not ok:
             raise ValueError(msg)
@@ -1116,6 +1172,7 @@ class YoutubeDownloader:
             # Keep legacy config for YouTube so existing installs continue to work.
             if platform in (None, "youtube"):
                 self._persist_cookiefile(cookie_path)
+
 
     def clear_cookiefile(self, *, persist: bool = True) -> None:
         """清除 cookie 文件，恢复自动检测浏览器 Cookie。"""
