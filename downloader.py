@@ -764,13 +764,22 @@ class YoutubeDownloader:
                 continue
 
             if min_height is not None:
+                w = fmt.get("width") or 0
+                try:
+                    w_i = int(w) if w else 0
+                except (TypeError, ValueError):
+                    w_i = 0
                 res_height = height or _height(resolution)
+                if w_i > 0 and res_height > 0:
+                    res_height = min(int(res_height), w_i)
                 if res_height < min_height:
                     continue
 
             results.append({
                 "format_id": fmt.get("format_id", ""),
                 "resolution": resolution,
+                "height": int(height) if height else _height(resolution),
+                "width": fmt.get("width") or 0,
                 "codec": fmt.get("vcodec") or fmt.get("acodec") or "—",
                 "container": fmt.get("ext") or "—",
                 "fps": fmt.get("fps"),
@@ -923,13 +932,16 @@ class YoutubeDownloader:
                 height_result = subprocess.run(
                     [_find_tool("ffprobe"), "-v", "error",
                      "-select_streams", "v:0", "-show_entries",
-                     "stream=height", "-of", "csv=p=0", str(path)],
+                     "stream=width,height", "-of", "csv=p=0", str(path)],
                     capture_output=True, text=True, timeout=10,
                 )
                 height_str = height_result.stdout.strip()
                 if height_str:
                     try:
-                        actual_height = int(height_str)
+                        parts = [p.strip() for p in height_str.split(",") if p.strip()]
+                        dims = [int(p) for p in parts[:2]]
+                        # 竖屏按短边计档（与 format_height 一致）
+                        actual_height = min(dims) if len(dims) >= 2 else dims[0]
                         if expected_height is not None:
                             tolerance = max(8, int(expected_height * 0.02))
                             if abs(actual_height - expected_height) > tolerance:
@@ -1556,18 +1568,42 @@ class YoutubeDownloader:
 
     @staticmethod
     def format_height(fmt: dict[str, Any]) -> int:
-        """从格式条目解析视频高度（像素）。"""
-        height = fmt.get("height")
-        if height:
+        """从格式条目解析清晰度档位高度（像素）。
+
+        竖屏视频（如 720x1280）按短边计档（720p），避免被当成 1280p 而误跳过。
+        """
+        def _as_int(value: Any) -> int:
             try:
-                return int(height)
+                return int(value) if value not in (None, "", "none") else 0
             except (TypeError, ValueError):
+                return 0
+
+        h = _as_int(fmt.get("height"))
+        w = _as_int(fmt.get("width"))
+        if h > 0 and w > 0:
+            return min(h, w)
+        if h > 0:
+            return h
+
+        resolution = (fmt.get("resolution") or "").strip().lower()
+        if "x" in resolution:
+            try:
+                left, right = resolution.replace("p", "").split("x", 1)
+                dims = [_as_int(left), _as_int(right)]
+                if dims[0] > 0 and dims[1] > 0:
+                    return min(dims)
+            except (ValueError, IndexError):
                 pass
-        resolution = fmt.get("resolution") or ""
         try:
-            return int(resolution.split("x")[-1].replace("p", ""))
-        except (ValueError, IndexError):
-            return 0
+            return int(resolution.replace("p", "").strip())
+        except (ValueError, AttributeError):
+            pass
+
+        note = str(fmt.get("note") or fmt.get("format_note") or "").lower()
+        m = re.search(r"(\d{3,4})\s*p", note)
+        if m:
+            return int(m.group(1))
+        return 0
 
     @staticmethod
     def resolve_format_id(

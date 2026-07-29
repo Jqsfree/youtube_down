@@ -2,16 +2,58 @@ from downloader import YoutubeDownloader
 from gui import MainWindow
 
 
-def test_resolve_format_prefers_exact_height_in_strict_mode():
+def test_format_height_uses_short_side_for_portrait():
+    assert YoutubeDownloader.format_height(
+        {"width": 720, "height": 1280, "resolution": "720x1280"}
+    ) == 720
+    assert YoutubeDownloader.format_height(
+        {"resolution": "720x1280", "container": "mp4", "type": "Video Only"}
+    ) == 720
+    assert YoutubeDownloader.format_height(
+        {"width": 1280, "height": 720, "resolution": "1280x720"}
+    ) == 720
+
+
+def test_resolve_format_accepts_portrait_720():
     formats = [
-        {"format_id": "1", "resolution": "480p", "container": "mp4", "type": "Video+Audio"},
-        {"format_id": "2", "resolution": "720p", "container": "mp4", "type": "Video+Audio"},
-        {"format_id": "3", "resolution": "1080p", "container": "mp4", "type": "Video+Audio"},
+        {
+            "format_id": "v",
+            "resolution": "720x1280",
+            "width": 720,
+            "height": 1280,
+            "container": "mp4",
+            "type": "Video Only",
+        },
     ]
+    assert YoutubeDownloader.resolve_format_id(formats, target_height=720, strict=True) == "v"
 
-    chosen = YoutubeDownloader.resolve_format_id(formats, target_height=720, strict=True)
 
-    assert chosen == "2"
+def test_worker_resolve_format_does_not_skip_portrait_720():
+    from worker import AUTO_FORMAT_ID, BatchDownloadWorker
+
+    worker = BatchDownloadWorker.__new__(BatchDownloadWorker)
+    worker._format_id = AUTO_FORMAT_ID
+    worker._min_height = 720
+    worker._strict_quality = True
+    downloader = YoutubeDownloader.__new__(YoutubeDownloader)
+    info = {
+        "formats": [
+            {
+                "format_id": "v",
+                "resolution": "720x1280",
+                "width": 720,
+                "height": 1280,
+                "ext": "mp4",
+                "vcodec": "avc1",
+                "acodec": "none",
+                "filesize": 5000,
+            },
+        ]
+    }
+    worker._downloader = downloader
+    fmt_id, _merge, expected = worker._resolve_format(info)
+    assert fmt_id == "v"
+    assert expected == 720
 
 
 def test_resolve_format_falls_back_when_exact_height_missing():

@@ -18,14 +18,6 @@ jobs:
             platform: windows
             artifact_name: YouTubeDownloader-Windows.exe
             pyinstaller_name: YouTubeDownloader-Windows
-          - os: ubuntu-latest
-            platform: linux
-            artifact_name: YouTubeDownloader-Linux
-            pyinstaller_name: YouTubeDownloader-Linux
-          - os: macos-latest
-            platform: macos
-            artifact_name: YouTubeDownloader-macOS
-            pyinstaller_name: YouTubeDownloader-macOS
 
     runs-on: ${{ matrix.os }}
 
@@ -48,28 +40,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest pyinstaller
-
-      - name: Install system tools (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg \
-            libegl1 \
-            libgl1 \
-            libxkbcommon0 \
-            libdbus-1-3 \
-            libxcb-cursor0 \
-            libxcb-xinerama0
-          curl -fsSL https://deno.land/install.sh | sh
-          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
-
-      - name: Install system tools (macOS)
-        if: matrix.platform == 'macos'
-        run: |
-          brew install ffmpeg
-          curl -fsSL https://deno.land/install.sh | sh
-          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
 
       - name: Run unit tests
         shell: bash
@@ -123,47 +93,6 @@ jobs:
             --hidden-import theme `
             main.py
 
-      - name: Build binary (Linux)
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          pyinstaller --onefile --windowed \
-            --name "${{ matrix.pyinstaller_name }}" \
-            --add-data "VERSION:." \
-            --collect-all yt_dlp \
-            --collect-all yt_dlp_ejs \
-            --hidden-import PySide6.QtCore \
-            --hidden-import PySide6.QtWidgets \
-            --hidden-import PySide6.QtGui \
-            --hidden-import platforms \
-            --hidden-import platforms.youtube \
-            --hidden-import platforms.bilibili \
-            --hidden-import platforms.tiktok \
-            --hidden-import theme \
-            main.py
-          # Bundle system ffmpeg/ffprobe next to artifact for release zip convenience
-          cp "$(command -v ffmpeg)" dist/ffmpeg || true
-          cp "$(command -v ffprobe)" dist/ffprobe || true
-
-      - name: Build binary (macOS)
-        if: matrix.platform == 'macos'
-        shell: bash
-        run: |
-          pyinstaller --onefile --windowed \
-            --name "${{ matrix.pyinstaller_name }}" \
-            --add-data "VERSION:." \
-            --collect-all yt_dlp \
-            --collect-all yt_dlp_ejs \
-            --hidden-import PySide6.QtCore \
-            --hidden-import PySide6.QtWidgets \
-            --hidden-import PySide6.QtGui \
-            --hidden-import platforms \
-            --hidden-import platforms.youtube \
-            --hidden-import platforms.bilibili \
-            --hidden-import platforms.tiktok \
-            --hidden-import theme \
-            main.py
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -194,11 +123,10 @@ jobs:
         run: |
           mkdir -p staged
           find release-assets -type f \( -name 'YouTubeDownloader-*' -o -name '*.exe' \) -print
-          # Flatten unique binaries into staged/
           while IFS= read -r -d '' f; do
             base="$(basename "$f")"
             cp "$f" "staged/$base"
-          done < <(find release-assets -type f \( -name 'YouTubeDownloader-Windows.exe' -o -name 'YouTubeDownloader-Linux' -o -name 'YouTubeDownloader-macOS' \) -print0)
+          done < <(find release-assets -type f -name 'YouTubeDownloader-Windows.exe' -print0)
           ls -la staged
           echo "files=$(find staged -type f | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
@@ -208,24 +136,20 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: Multi-Platform Downloader v${{ steps.version.outputs.version }}
           body: |
-            三平台下载器 v${{ steps.version.outputs.version }}（YouTube / Bilibili / TikTok）
+            Windows 下载器 v${{ steps.version.outputs.version }}（YouTube / Bilibili / TikTok）
 
             ## 下载
             | 平台 | 文件 |
             |------|------|
             | Windows | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
-            | Linux | `YouTubeDownloader-Linux`（需系统已安装 ffmpeg） |
-            | macOS | `YouTubeDownloader-macOS`（需系统已安装 ffmpeg） |
 
-            ## 本版亮点
-            - 左栏分平台 Cookie + 右栏队列表 GUI
-            - 可持久化主题（Light / Dark / Nord + 强调色）
-            - TikTok 走 yt-dlp；严格清晰度档位
-            - 批量结果 CSV 微秒级唯一文件名，避免多组队列互相覆盖
+            ## 本版修复
+            - 竖屏 720p（如 `720x1280`）按短边计档，不再误判为非 720 而跳过
+            - 下载后分辨率校验同样按短边，避免竖屏下载成功后被误判失败
 
             ## 使用
-            1. 下载对应平台二进制
-            2. 运行（Windows 双击即可；Linux/macOS 可能需要 `chmod +x`）
+            1. 下载 `YouTubeDownloader-Windows.exe`
+            2. 双击运行
             3. 会员/风控视频请按平台导入 Cookie
           files: staged/*
           draft: false
