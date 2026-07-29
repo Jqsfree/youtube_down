@@ -71,6 +71,13 @@ jobs:
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
 
+      - name: Run unit tests
+        shell: bash
+        run: python -m pytest tests/ -q
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      # After tests: local ffmpeg.exe would otherwise shadow PATH in tool-resolution tests.
       - name: Install deno + ffmpeg (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -85,12 +92,6 @@ jobs:
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
           Move-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
           Move-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
-
-      - name: Run unit tests
-        shell: bash
-        run: python -m pytest tests/ -q
-        env:
-          QT_QPA_PLATFORM: offscreen
 
       - name: Smoke test
         shell: bash
