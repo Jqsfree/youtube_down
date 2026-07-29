@@ -1,8 +1,8 @@
-name: Build Windows EXE
+name: Build Multi-Platform
 
 on:
   push:
-    branches: [main, cursor/win-local-test-70fd]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -10,7 +10,24 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            artifact_name: YouTubeDownloader-Windows.exe
+            pyinstaller_name: YouTubeDownloader-Windows
+          - os: ubuntu-latest
+            platform: linux
+            artifact_name: YouTubeDownloader-Linux
+            pyinstaller_name: YouTubeDownloader-Linux
+          - os: macos-latest
+            platform: macos
+            artifact_name: YouTubeDownloader-macOS
+            pyinstaller_name: YouTubeDownloader-macOS
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -27,33 +44,57 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        shell: bash
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt pytest pyinstaller
 
       - name: Run unit tests
-        run: python -m pytest tests/ -v
+        shell: bash
+        run: python -m pytest tests/ -q
 
-      - name: Install deno
+      - name: Install system tools (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+
+      - name: Install system tools (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew install ffmpeg
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+
+      - name: Install deno + ffmpeg (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
           Expand-Archive deno.zip -DestinationPath .
-          if (Test-Path deno.exe) { Write-Host "deno.exe ready" } else { Get-ChildItem -Recurse -Filter deno.exe | Select-Object -First 1 | Move-Item -Destination deno.exe }
-
-      - name: Download ffmpeg
-        run: |
+          if (-not (Test-Path deno.exe)) {
+            Get-ChildItem -Recurse -Filter deno.exe | Select-Object -First 1 | Move-Item -Destination deno.exe
+          }
           Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath .
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
           Move-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
           Move-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
 
-      - name: Smoke test (env check + get_info)
+      - name: Smoke test
+        shell: bash
         run: python smoke_test.py
+        env:
+          QT_QPA_PLATFORM: offscreen
 
-      - name: Build EXE
+      - name: Build EXE (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
         run: |
           pyinstaller --onefile --windowed `
-            --name "YouTubeDownloader" `
+            --name "${{ matrix.pyinstaller_name }}" `
             --add-data "VERSION;." `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
@@ -63,14 +104,91 @@ jobs:
             --hidden-import PySide6.QtCore `
             --hidden-import PySide6.QtWidgets `
             --hidden-import PySide6.QtGui `
+            --hidden-import platforms `
+            --hidden-import platforms.youtube `
+            --hidden-import platforms.bilibili `
+            --hidden-import platforms.tiktok `
+            --hidden-import theme `
             main.py
 
-      - name: Upload EXE artifact
+      - name: Build binary (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          pyinstaller --onefile --windowed \
+            --name "${{ matrix.pyinstaller_name }}" \
+            --add-data "VERSION:." \
+            --collect-all yt_dlp \
+            --collect-all yt_dlp_ejs \
+            --hidden-import PySide6.QtCore \
+            --hidden-import PySide6.QtWidgets \
+            --hidden-import PySide6.QtGui \
+            --hidden-import platforms \
+            --hidden-import platforms.youtube \
+            --hidden-import platforms.bilibili \
+            --hidden-import platforms.tiktok \
+            --hidden-import theme \
+            main.py
+          # Bundle system ffmpeg/ffprobe next to artifact for release zip convenience
+          cp "$(command -v ffmpeg)" dist/ffmpeg || true
+          cp "$(command -v ffprobe)" dist/ffprobe || true
+
+      - name: Build binary (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          pyinstaller --onefile --windowed \
+            --name "${{ matrix.pyinstaller_name }}" \
+            --add-data "VERSION:." \
+            --collect-all yt_dlp \
+            --collect-all yt_dlp_ejs \
+            --hidden-import PySide6.QtCore \
+            --hidden-import PySide6.QtWidgets \
+            --hidden-import PySide6.QtGui \
+            --hidden-import platforms \
+            --hidden-import platforms.youtube \
+            --hidden-import platforms.bilibili \
+            --hidden-import platforms.tiktok \
+            --hidden-import theme \
+            main.py
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YouTubeDownloader-v${{ steps.version.outputs.version }}
-          path: dist/YouTubeDownloader.exe
+          name: ${{ matrix.pyinstaller_name }}-v${{ steps.version.outputs.version }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
           retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "version=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: false
+
+      - name: Stage release files
+        id: stage
+        run: |
+          mkdir -p staged
+          find release-assets -type f \( -name 'YouTubeDownloader-*' -o -name '*.exe' \) -print
+          # Flatten unique binaries into staged/
+          while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            cp "$f" "staged/$base"
+          done < <(find release-assets -type f \( -name 'YouTubeDownloader-Windows.exe' -o -name 'YouTubeDownloader-Linux' -o -name 'YouTubeDownloader-macOS' \) -print0)
+          ls -la staged
+          echo "files=$(find staged -type f | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -78,20 +196,28 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: Multi-Platform Downloader v${{ steps.version.outputs.version }}
           body: |
-            Windows 单文件版（内嵌 ffmpeg / ffprobe / deno）。
+            三平台下载器 v${{ steps.version.outputs.version }}（YouTube / Bilibili / TikTok）
 
-            **包含修复**
-            - Cookie 文件无需重启即可使用（Windows）
-            - CSV `csvid` 列识别、无表头单列、GBK 编码
-            - 批量下载强制最低 720p
-            - YouTube + Bilibili 多平台支持
+            ## 下载
+            | 平台 | 文件 |
+            |------|------|
+            | Windows | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
+            | Linux | `YouTubeDownloader-Linux`（需系统已安装 ffmpeg） |
+            | macOS | `YouTubeDownloader-macOS`（需系统已安装 ffmpeg） |
 
-            **使用**
-            1. 下载 `YouTubeDownloader.exe`
-            2. 双击运行（无需安装 Python）
-            3. 高画质或会员视频请导入 `cookies.txt`
-          files: dist/YouTubeDownloader.exe
+            ## 本版亮点
+            - 左栏分平台 Cookie + 右栏队列表 GUI
+            - 可持久化主题（Light / Dark / Nord + 强调色）
+            - TikTok 走 yt-dlp；严格清晰度档位
+            - 批量结果 CSV 微秒级唯一文件名，避免多组队列互相覆盖
+
+            ## 使用
+            1. 下载对应平台二进制
+            2. 运行（Windows 双击即可；Linux/macOS 可能需要 `chmod +x`）
+            3. 会员/风控视频请按平台导入 Cookie
+          files: staged/*
           draft: false
-          prerelease: true
+          prerelease: false
           generate_release_notes: true
+          make_latest: true
           overwrite_files: true

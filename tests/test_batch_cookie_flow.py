@@ -103,3 +103,31 @@ def test_batch_passes_csv_cookie_override_on_retry(tmp_path: Path) -> None:
         and kwargs.get("cookiefile_override") == str(cookie_path)
         for name, used, kwargs in downloader.calls
     )
+
+
+def test_batch_results_csv_unique_across_rapid_runs(tmp_path: Path) -> None:
+    """Sequential batches sharing results_dir must not overwrite each other."""
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    paths: list[str] = []
+    for i in range(3):
+        downloader = FakeDownloader()
+        worker = BatchDownloadWorker(
+            downloader=downloader,
+            video_ids=[f"dQw4w9WgXc{i}"],
+            format_id="22",
+            output_dir=tmp_path / f"out{i}",
+            results_dir=results_dir,
+        )
+        (tmp_path / f"out{i}").mkdir()
+        finished: list[str] = []
+        worker.all_finished.connect(lambda *_a, f=finished: f.append(_a[3] if len(_a) > 3 else ""))
+        # Capture path via attribute after run
+        worker.run()
+        paths.append(worker._last_results_csv)  # noqa: SLF001
+
+    assert len(paths) == 3
+    assert len(set(paths)) == 3
+    for p in paths:
+        assert Path(p).is_file()
+        assert Path(p).stat().st_size > 0

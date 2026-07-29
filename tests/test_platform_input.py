@@ -35,6 +35,23 @@ def test_parse_b23_short_link_keeps_url_for_yt_dlp():
     assert media.url == "https://b23.tv/abc123"
 
 
+def test_parse_tiktok_url_extracts_video_id():
+    media = YoutubeDownloader.parse_input(
+        "https://www.tiktok.com/@scout2015/video/6718339390858298630"
+    )
+
+    assert media.platform == "tiktok"
+    assert media.media_id == "6718339390858298630"
+    assert "tiktok.com" in media.url
+
+
+def test_parse_tiktok_short_link():
+    media = YoutubeDownloader.parse_input("https://vm.tiktok.com/ZMabcdef/")
+
+    assert media.platform == "tiktok"
+    assert media.url.startswith("https://")
+
+
 def test_make_opts_uses_matching_platform_cookiefile(tmp_path: Path):
     youtube_cookie = tmp_path / "youtube.txt"
     youtube_cookie.write_text(
@@ -57,6 +74,16 @@ def test_make_opts_uses_matching_platform_cookiefile(tmp_path: Path):
     opts = dl._make_opts(use_cookies=True, media=media)
 
     assert opts["cookiefile"] == str(bilibili_cookie.resolve())
+
+
+def test_make_opts_adds_tiktok_headers():
+    dl = YoutubeDownloader(cookies_from_browser="")
+    media = YoutubeDownloader.parse_input(
+        "https://www.tiktok.com/@scout2015/video/6718339390858298630"
+    )
+    opts = dl._make_opts(use_cookies=False, media=media)
+
+    assert opts["http_headers"]["Referer"] == "https://www.tiktok.com/"
 
 
 def test_make_opts_prefers_temporary_cookiefile_override(tmp_path: Path):

@@ -1,4 +1,4 @@
-"""YouTube Downloader — 程序入口。
+"""Multi-Platform Downloader — 程序入口。
 
 用法::
 
@@ -12,11 +12,13 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from gui import MainWindow
+from theme import apply_theme
 
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")  # 跨平台一致的风格
+    app.setStyle("Fusion")
+    apply_theme(app)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

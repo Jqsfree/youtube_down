@@ -21,6 +21,9 @@ from PySide6.QtCore import QThread, Signal
 from downloader import ErrorCategory, YoutubeDownloader, _find_tool, classify_error, clean_error
 from logger_utils import AppLogger
 
+# DownloaderFacade is the architectural name; concrete class remains YoutubeDownloader.
+DownloaderFacade = YoutubeDownloader
+
 AUTO_FORMAT_ID = "auto"
 
 
@@ -300,8 +303,17 @@ class BatchDownloadWorker(QThread):
         # ── 打开增量写入的 CSV ──
         import csv as _csv
         from datetime import datetime as _dt
-        timestamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
         csv_path = str(self._results_dir / f"batch_results_{timestamp}.csv")
+        # Avoid clobbering another batch that started in the same second.
+        if Path(csv_path).exists():
+            n = 1
+            while True:
+                alt = self._results_dir / f"batch_results_{timestamp}_{n}.csv"
+                if not alt.exists():
+                    csv_path = str(alt)
+                    break
+                n += 1
         self._last_results_csv = csv_path
         _csv_file = open(csv_path, "w", newline="", encoding="utf-8")
         _csv_writer = _csv.DictWriter(_csv_file, fieldnames=[
@@ -634,7 +646,7 @@ class BatchDownloadWorker(QThread):
         import csv as csv_module
         from datetime import datetime
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         csv_path = str(self._results_dir / f"batch_results_{timestamp}.csv")
 
         try:

@@ -1,11 +1,13 @@
-"""YouTube 下载核心封装 —— 对 yt-dlp 的唯一调用入口。
+"""多平台下载核心封装 —— 对 yt-dlp 的唯一调用入口。
 
 GUI 层不允许直接 import yt_dlp。所有视频信息获取和下载操作
-必须通过本模块的 YoutubeDownloader 类完成。
+必须通过本模块的 YoutubeDownloader（即 DownloaderFacade）完成。
 
 批量下载采用两阶段策略：
   1. 默认无 Cookie（快速，覆盖绝大多数公开视频）
   2. 仅对需要登录/年龄验证的视频启用 Cookie 重试
+
+平台差异（YouTube / Bilibili / TikTok）由 platforms/ 插件提供。
 """
 
 from __future__ import annotations
@@ -20,27 +22,29 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import yt_dlp
 
 from logger_utils import AppLogger
+from platforms.base import MediaInput
+from platforms.bilibili import extract_bilibili_id
+from platforms.facade import (
+    PLATFORM_BY_KEY,
+    get_platform,
+    platform_cookie_config_names,
+    platform_cookie_domains,
+    platform_labels,
+)
 
 _COOKIE_CONFIG_DIR = Path.home() / ".youtube_downloader"
 _COOKIE_CONFIG = _COOKIE_CONFIG_DIR / "cookiefile.txt"
 _PLATFORM_COOKIE_CONFIGS = {
-    "youtube": _COOKIE_CONFIG_DIR / "youtube_cookiefile.txt",
-    "bilibili": _COOKIE_CONFIG_DIR / "bilibili_cookiefile.txt",
+    key: _COOKIE_CONFIG_DIR / name
+    for key, name in platform_cookie_config_names().items()
 }
-_PLATFORM_COOKIE_DOMAINS = {
-    "youtube": ("youtube.com", "youtu.be"),
-    "bilibili": ("bilibili.com", "b23.tv"),
-}
-_PLATFORM_LABELS = {
-    "youtube": "YouTube",
-    "bilibili": "Bilibili",
-    "generic": "Generic",
-}
+_PLATFORM_COOKIE_DOMAINS = platform_cookie_domains()
+_PLATFORM_LABELS = platform_labels()
 
 # Netscape cookies.txt 常见文件头
 _NETSCAPE_MARKERS = ("# netscape", "# http cookie file")
@@ -50,6 +54,7 @@ _CSV_COLUMN_ALIASES: tuple[str, ...] = (
     "video_id", "videoid", "video-id", "media_id", "source", "id",
     "csvid", "csv_id", "video", "link",
     "youtube_id", "youtubeid", "bvid", "bv", "aid", "av",
+    "tiktok", "tiktok_id", "aweme_id", "awemeid",
     "url", "video_url", "source_url", "watch", "uri",
     "视频链接", "视频地址", "视频id", "视频_id", "视频", "链接", "地址",
     "bv号", "bv_id", "网址", "url地址", "播放链接", "分享链接", "视频url",
@@ -149,20 +154,6 @@ class EnvItem:
     message: str
     fatal: bool = False  # 致命缺失 → 不允许跳过
     install_kind: str = ""  # "pip" | "binary" | ""
-
-
-@dataclass(frozen=True)
-class MediaInput:
-    """Normalized media source resolved from a user-provided ID or URL."""
-
-    platform: str
-    original: str
-    media_id: str
-    url: str
-
-    @property
-    def label(self) -> str:
-        return _PLATFORM_LABELS.get(self.platform, self.platform)
 
 
 def check_environment() -> tuple[bool, list[EnvItem]]:
@@ -389,45 +380,43 @@ class YoutubeDownloader:
 
     @staticmethod
     def parse_input(value: str) -> MediaInput:
-        """解析 YouTube / Bilibili ID 或 URL，返回 yt-dlp 可直接使用的 URL。"""
+        """解析 YouTube / Bilibili / TikTok ID 或 URL，返回 yt-dlp 可直接使用的 URL。"""
         text = (value or "").strip()
         if not text:
             raise ValueError("请输入视频链接或 ID")
         text = text.replace("\\", "/")
         normalized = text
-        if re.match(r"^(www\.|m\.|b23\.tv|bilibili\.com|youtube\.com|youtu\.be)", normalized, re.I):
+        if re.match(
+            r"^(www\.|m\.|b23\.tv|bilibili\.com|youtube\.com|youtu\.be|"
+            r"tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)",
+            normalized,
+            re.I,
+        ):
             normalized = f"https://{normalized}"
 
         parsed = urlparse(normalized)
         host = parsed.netloc.lower()
-        path = parsed.path or ""
 
-        if host.endswith("youtu.be"):
-            media_id = path.strip("/").split("/")[0]
-            if media_id:
-                return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
-        if "youtube.com" in host:
-            query = parse_qs(parsed.query)
-            media_id = (query.get("v") or [""])[0]
-            if not media_id:
-                match = re.search(r"/(?:shorts|embed|v)/([A-Za-z0-9_-]{11})", path)
-                media_id = match.group(1) if match else ""
-            if media_id:
-                return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+        # Prefer URL-host matches first (TikTok/Bili/YouTube plugins).
+        for plugin in (
+            PLATFORM_BY_KEY["tiktok"],
+            PLATFORM_BY_KEY["bilibili"],
+            PLATFORM_BY_KEY["youtube"],
+        ):
+            if host:
+                media = plugin.try_parse(text, normalized, parsed)
+                if media is not None:
+                    return media
 
-        if "bilibili.com" in host or host.endswith("b23.tv"):
-            media_id = YoutubeDownloader._extract_bilibili_id(normalized) or normalized
-            return MediaInput("bilibili", text, media_id, normalized)
-
-        bili_id = YoutubeDownloader._extract_bilibili_id(text)
-        if bili_id:
-            url_id = bili_id
-            return MediaInput("bilibili", text, bili_id, f"https://www.bilibili.com/video/{url_id}")
-
-        yt_match = re.search(r"^([A-Za-z0-9_-]{11})$", text)
-        if yt_match:
-            media_id = yt_match.group(1)
-            return MediaInput("youtube", text, media_id, f"https://www.youtube.com/watch?v={media_id}")
+        # Bare IDs without scheme/host.
+        for plugin in (
+            PLATFORM_BY_KEY["bilibili"],
+            PLATFORM_BY_KEY["tiktok"],
+            PLATFORM_BY_KEY["youtube"],
+        ):
+            media = plugin.try_parse(text, normalized, parsed)
+            if media is not None:
+                return media
 
         if parsed.scheme in {"http", "https"} and host:
             return MediaInput("generic", text, normalized, normalized)
@@ -437,14 +426,7 @@ class YoutubeDownloader:
 
     @staticmethod
     def _extract_bilibili_id(value: str) -> str:
-        bv_match = re.search(r"\b(BV[0-9A-Za-z]{10})\b", value, flags=re.I)
-        if bv_match:
-            raw = bv_match.group(1)
-            return "BV" + raw[2:]
-        av_match = re.search(r"\bav(\d+)\b", value, flags=re.I)
-        if av_match:
-            return f"av{av_match.group(1)}"
-        return ""
+        return extract_bilibili_id(value)
 
     @staticmethod
     def _platform_label(platform: str) -> str:
@@ -626,15 +608,11 @@ class YoutubeDownloader:
         if ffmpeg_path:
             opts["ffmpeg_location"] = str(Path(ffmpeg_path).parent)
         _configure_js_runtimes(opts)
-        if media and media.platform == "bilibili":
-            opts["http_headers"] = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-                "Referer": "https://www.bilibili.com/",
-            }
+        if media:
+            plugin = get_platform(media.platform)
+            headers = plugin.http_headers() if plugin else None
+            if headers:
+                opts["http_headers"] = headers
         cookiefile = (
             Path(cookiefile_override).expanduser().resolve()
             if cookiefile_override else self._cookiefile_for_platform(media.platform if media else None)
@@ -1107,7 +1085,7 @@ class YoutubeDownloader:
                 return False, f"文件中未找到 {domains} 的 Cookie（请从已登录 {label} 的浏览器导出）"
             detected = platform
         elif detected is None:
-            return False, "文件中未找到 youtube.com 或 bilibili.com 的 Cookie"
+            return False, "文件中未找到 youtube.com / bilibili.com / tiktok.com 的 Cookie"
         msg = f"格式校验通过 ({YoutubeDownloader._platform_label(detected)})"
         if detected == "bilibili" and "sessdata" not in lower:
             msg += "；未检测到 SESSDATA，可能不是登录 Cookie"
@@ -1161,16 +1139,18 @@ class YoutubeDownloader:
         using_file = bool(self._cookiefile_path)
         platform = self._cookiefile_platform or "youtube"
         label = self._platform_label(platform)
-        if platform == "youtube" and using_file and not _resolve_tool("deno") and not _resolve_tool("node"):
-            return False, (
-                "未检测到 deno 或 node.js。\n"
-                "Cookie 模式需要 JS 运行时才能通过 YouTube 验证。\n"
-                "请运行: powershell -ExecutionPolicy Bypass -File scripts\\setup_dev.ps1\n"
-                "或: winget install Denoland.Deno\n"
-                "安装后重启应用再试。"
-            )
 
-        test_source = "dQw4w9WgXcQ" if platform == "youtube" else "BV1GJ411x7h7"
+        plugin = get_platform(platform)
+        if plugin and using_file and plugin.requires_js_runtime_for_cookie_file():
+            if not _resolve_tool("deno") and not _resolve_tool("node"):
+                return False, (
+                    "未检测到 deno 或 node.js。\n"
+                    "Cookie 模式需要 JS 运行时才能通过 YouTube 验证。\n"
+                    "请运行: powershell -ExecutionPolicy Bypass -File scripts\\setup_dev.ps1\n"
+                    "或: winget install Denoland.Deno\n"
+                    "安装后重启应用再试。"
+                )
+        test_source = plugin.probe_source if plugin else "dQw4w9WgXcQ"
         cookie_err: Exception | None = None
         try:
             info = self.get_info(test_source, use_cookies=True)
@@ -1375,11 +1355,19 @@ class YoutubeDownloader:
         if not text:
             return 0
         lower = text.lower()
-        if "://" in text or "youtu" in lower or "bilibili" in lower or "b23.tv" in lower:
+        if (
+            "://" in text
+            or "youtu" in lower
+            or "bilibili" in lower
+            or "b23.tv" in lower
+            or "tiktok" in lower
+        ):
             return 3
         if re.search(r"\bBV[0-9A-Za-z]{10}\b", text, flags=re.I):
             return 3
         if re.search(r"\bav\d+\b", text, flags=re.I):
+            return 2
+        if re.fullmatch(r"\d{15,25}", text):
             return 2
         if re.fullmatch(r"[A-Za-z0-9_-]{11}", text):
             return 2
