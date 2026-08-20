@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -46,7 +46,8 @@ from downloader import YoutubeDownloader, check_environment
 from logger_utils import AppLogger
 from platforms.base import Platform
 from theme import PRESETS, apply_theme, load_palette, preset_names, save_palette, with_accent
-from worker import AUTO_FORMAT_ID, BatchDownloadWorker, ValidateCookieWorker
+from worker import AUTO_FORMAT_ID, BatchDownloadWorker, ValidateCookieWorker, YtdlpUpdateWorker
+from yt_dlp_updater import load_state, overlay_enabled, should_auto_check
 
 _PLATFORM_KEYS = (Platform.YOUTUBE, Platform.BILIBILI, Platform.TIKTOK)
 
@@ -72,6 +73,8 @@ class MainWindow(QMainWindow):
         AppLogger.attach_file(self._log_path)
         self._worker: BatchDownloadWorker | None = None
         self._validate_cookie_worker: ValidateCookieWorker | None = None
+        self._ytdlp_update_worker: YtdlpUpdateWorker | None = None
+        self._ytdlp_check_interactive: bool = False
         self._output_dir: Path = Path.home() / "Downloads"
         self._csv_ids: list[str] = []
         self._csv_queue: list[tuple[str, list[str], Path | None]] = []
@@ -82,6 +85,7 @@ class MainWindow(QMainWindow):
         self._last_fmt_id: str = ""
         self._last_min_height: int = 720
         self._last_strict_quality: bool = True
+        self._last_brutal_mode: bool = False
         self._batch_total: int = 0
         self._batch_video_ids: list[str] = []
         self._current_video_id: str = ""
@@ -115,12 +119,17 @@ class MainWindow(QMainWindow):
         AppLogger.get_logger().info("应用启动")
         for i in env_items:
             icon = "✗" if i.status == "error" else ("⚠" if i.status == "warning" else "✓")
-            self._log(f"  {icon} {i.name} {i.version}")
+            extra = f" {i.message}" if i.message else ""
+            self._log(f"  {icon} {i.name} {i.version}{extra}")
         self.statusBar().showMessage(
             f"{py_platform.system()} · 主题 {self._palette.name} · 请导入 CSV 或粘贴链接"
         )
+        if overlay_enabled():
+            QTimer.singleShot(1500, self._maybe_auto_check_ytdlp)
 
     def closeEvent(self, event: Any) -> None:
+        if self._ytdlp_update_worker is not None and self._ytdlp_update_worker.isRunning():
+            self._ytdlp_update_worker.wait(3000)
         if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
             self._validate_cookie_worker.wait(3000)
         if self._worker is not None and self._worker.isRunning():
@@ -237,9 +246,18 @@ class MainWindow(QMainWindow):
         layout.addLayout(theme_row)
 
         layout.addStretch(1)
+        ver_row = QHBoxLayout()
         ver = QLabel(f"v{self._app_version}")
         ver.setObjectName("mutedLabel")
-        layout.addWidget(ver)
+        self._ytdlp_update_btn = QPushButton("更新 yt-dlp")
+        if overlay_enabled():
+            self._ytdlp_update_btn.setToolTip("从 PyPI 更新 yt-dlp（需重启后生效）")
+        else:
+            self._ytdlp_update_btn.setEnabled(False)
+            self._ytdlp_update_btn.setToolTip("仅发布版 EXE 支持热更新")
+        ver_row.addWidget(ver)
+        ver_row.addWidget(self._ytdlp_update_btn)
+        layout.addLayout(ver_row)
         return frame
 
     def _build_main(self) -> QWidget:
@@ -283,6 +301,11 @@ class MainWindow(QMainWindow):
         self._browse_btn = QPushButton("浏览…")
         opts.addWidget(self._output_input, stretch=1)
         opts.addWidget(self._browse_btn)
+        self._brutal_checkbox = QCheckBox("暴力下载（8 线程）")
+        self._brutal_checkbox.setToolTip(
+            "更高重试、更短间隔、最多 8 条并行；可能加剧限流，建议配合 Cookie 文件"
+        )
+        opts.addWidget(self._brutal_checkbox)
         layout.addLayout(opts)
 
         self._csv_label = QLabel("")
@@ -367,6 +390,7 @@ class MainWindow(QMainWindow):
         self._quality_combo.currentIndexChanged.connect(self._on_quality_changed)
         self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self._accent_btn.clicked.connect(self._on_pick_accent)
+        self._ytdlp_update_btn.clicked.connect(self._on_check_ytdlp_update)
         self._shortcut_download = QShortcut("Ctrl+D", self)
         self._shortcut_download.activated.connect(self._on_download)
         self._shortcut_cancel = QShortcut("Escape", self)
@@ -393,6 +417,87 @@ class MainWindow(QMainWindow):
         save_palette(self._palette, custom_accent=True)
         apply_theme(QApplication.instance(), self._palette)
         self._log(f"强调色: {color.name()}")
+
+    def _batch_running(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
+
+    def _ytdlp_worker_running(self) -> bool:
+        return self._ytdlp_update_worker is not None and self._ytdlp_update_worker.isRunning()
+
+    def _maybe_auto_check_ytdlp(self) -> None:
+        if not overlay_enabled() or self._batch_running():
+            return
+        if not should_auto_check(load_state()):
+            return
+        self._start_ytdlp_check(interactive=False)
+
+    def _on_check_ytdlp_update(self) -> None:
+        if not overlay_enabled():
+            return
+        if self._batch_running() or self._ytdlp_worker_running():
+            QMessageBox.information(self, "yt-dlp 更新", "请等待当前下载或更新完成后再试")
+            return
+        self._start_ytdlp_check(interactive=True)
+
+    def _start_ytdlp_check(self, interactive: bool) -> None:
+        self._ytdlp_check_interactive = interactive
+        self._ytdlp_update_btn.setEnabled(False)
+        worker = YtdlpUpdateWorker("check")
+        worker.check_done.connect(self._on_ytdlp_check_done)
+        worker.finished.connect(worker.deleteLater)
+        self._ytdlp_update_worker = worker
+        worker.start()
+        self._log("正在检查 yt-dlp 更新…")
+
+    def _on_ytdlp_check_done(self, available: bool, current: str, latest: str, error: str) -> None:
+        self._ytdlp_update_worker = None
+        if overlay_enabled() and not self._batch_running():
+            self._ytdlp_update_btn.setEnabled(True)
+        if error:
+            if self._ytdlp_check_interactive:
+                QMessageBox.warning(self, "yt-dlp 更新", error)
+            else:
+                self._log(f"yt-dlp 检查失败: {error}")
+            return
+        if not available:
+            msg = f"已是最新（{current or '?'}）"
+            self._log(msg)
+            if self._ytdlp_check_interactive:
+                QMessageBox.information(self, "yt-dlp 更新", msg)
+            return
+        if self._batch_running():
+            self._log(f"发现 yt-dlp {latest}，下载任务结束后可手动更新")
+            return
+        reply = QMessageBox.question(
+            self,
+            "yt-dlp 更新",
+            f"发现新版本\n当前: {current or '?'}\n最新: {latest}\n\n下载并在下次启动启用？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_ytdlp_apply()
+
+    def _start_ytdlp_apply(self) -> None:
+        if self._batch_running() or self._ytdlp_worker_running():
+            QMessageBox.information(self, "yt-dlp 更新", "请等待当前下载或更新完成后再试")
+            return
+        self._ytdlp_update_btn.setEnabled(False)
+        worker = YtdlpUpdateWorker("apply")
+        worker.apply_done.connect(self._on_ytdlp_apply_done)
+        worker.finished.connect(worker.deleteLater)
+        self._ytdlp_update_worker = worker
+        worker.start()
+        self._log("正在下载 yt-dlp…")
+
+    def _on_ytdlp_apply_done(self, ok: bool, message: str) -> None:
+        self._ytdlp_update_worker = None
+        if overlay_enabled() and not self._batch_running():
+            self._ytdlp_update_btn.setEnabled(True)
+        self._log(message)
+        if ok:
+            QMessageBox.information(self, "yt-dlp 更新", message)
+        else:
+            QMessageBox.warning(self, "yt-dlp 更新失败", message)
 
     # ------------------------------------------------------------------
     # Cookie / platform
@@ -660,12 +765,16 @@ class MainWindow(QMainWindow):
         self._last_min_height = min_height
         self._last_strict_quality = strict_quality
         self._output_dir = output_dir
+        brutal = self._brutal_checkbox.isChecked()
+        self._last_brutal_mode = brutal
+        self._log(f"暴力下载={'开' if brutal else '关'}")
         if not self._csv_queue and self._csv_ids:
             self._csv_queue = [("batch", list(self._csv_ids), None)]
-        self._start_queue(AUTO_FORMAT_ID, output_dir, min_height, strict_quality)
+        self._start_queue(AUTO_FORMAT_ID, output_dir, min_height, strict_quality, brutal)
 
     def _start_queue(
         self, format_id: str, base_dir: Path, min_height: int, strict_quality: bool,
+        brutal_mode: bool = False,
     ) -> None:
         if not self._csv_queue:
             return
@@ -675,7 +784,8 @@ class MainWindow(QMainWindow):
         self._output_input.setText(str(output_dir))
         self._log(f"队列开始: {name} ({len(ids)} 个)")
         self._start_batch_download(
-            format_id, output_dir, ids, min_height, strict_quality, results_dir=base_dir,
+            format_id, output_dir, ids, min_height, strict_quality,
+            results_dir=base_dir, brutal_mode=brutal_mode,
         )
 
     def _start_batch_download(
@@ -686,6 +796,7 @@ class MainWindow(QMainWindow):
         min_height: int,
         strict_quality: bool,
         results_dir: Path | None = None,
+        brutal_mode: bool = False,
     ) -> None:
         self._batch_errors.clear()
         self._batch_done = 0
@@ -704,6 +815,7 @@ class MainWindow(QMainWindow):
                 for source in video_ids
                 if source in self._csv_cookie_overrides
             },
+            brutal_mode=brutal_mode,
         )
         w = self._worker
         w.all_progress_changed.connect(self._on_batch_progress)
@@ -739,6 +851,13 @@ class MainWindow(QMainWindow):
         self._output_input.setEnabled(not downloading)
         self._browse_btn.setEnabled(not downloading)
         self._import_cookie_btn.setEnabled(not downloading)
+        self._brutal_checkbox.setEnabled(not downloading)
+        if overlay_enabled():
+            updating = (
+                self._ytdlp_update_worker is not None
+                and self._ytdlp_update_worker.isRunning()
+            )
+            self._ytdlp_update_btn.setEnabled(not downloading and not updating)
         if not downloading:
             self._worker = None
 
@@ -861,7 +980,10 @@ class MainWindow(QMainWindow):
         if self._csv_queue:
             self._queue_results.append((success, fail, skipped, csv_path))
             fmt_id = self._worker._format_id if self._worker else self._last_fmt_id  # noqa: SLF001
-            self._start_queue(fmt_id, self._output_dir, self._last_min_height, self._last_strict_quality)
+            self._start_queue(
+                fmt_id, self._output_dir, self._last_min_height, self._last_strict_quality,
+                self._last_brutal_mode,
+            )
             return
 
         if self._queue_results:

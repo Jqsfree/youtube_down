@@ -74,7 +74,9 @@ def test_build_format_selector_prefers_m4a_audio() -> None:
 def test_build_format_selector_best_mode_requires_video() -> None:
     selector = YoutubeDownloader.build_format_selector("best", min_height=720)
 
-    assert "bestvideo[height>=720]+bestaudio[ext=m4a]" in selector
+    assert "bestvideo[height=720][width>=720]+bestaudio[ext=m4a]" in selector
+    assert "bestvideo[width=720][height>=720]+bestaudio[ext=m4a]" in selector
+    assert "bestvideo[height>=720]+" not in selector
     assert "/best[" not in selector
     assert not selector.endswith("/best")
 

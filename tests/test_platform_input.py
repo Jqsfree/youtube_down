@@ -124,3 +124,15 @@ def test_make_opts_uses_temporary_browser_override():
     )
 
     assert opts["cookiesfrombrowser"] == ("firefox", "default-release")
+
+
+def test_make_opts_applies_ydl_opt_overrides():
+    dl = YoutubeDownloader(
+        cookies_from_browser="",
+        ydl_opt_overrides={"sleep_interval": 0, "concurrent_fragment_downloads": 16},
+    )
+    media = YoutubeDownloader.parse_input("dQw4w9WgXcQ")
+    opts = dl._make_opts(use_cookies=False, media=media)
+
+    assert opts["sleep_interval"] == 0
+    assert opts["concurrent_fragment_downloads"] == 16

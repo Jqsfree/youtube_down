@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import sys
 
+from yt_dlp_updater import install_overlay_finder
+
+install_overlay_finder()
+
 from PySide6.QtWidgets import QApplication
 
 from gui import MainWindow

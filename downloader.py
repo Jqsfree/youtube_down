@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import yt_dlp
 
 from logger_utils import AppLogger
+from yt_dlp_updater import overlay_source_label
 from platforms.base import MediaInput
 from platforms.bilibili import extract_bilibili_id
 from platforms.facade import (
@@ -175,7 +176,7 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
     try:
         import yt_dlp as _ydl
         ver = str(_ydl.version.__version__) if hasattr(_ydl, 'version') else "?"
-        items.append(EnvItem("yt-dlp", "ok", ver, "", fatal=True))
+        items.append(EnvItem("yt-dlp", "ok", ver, overlay_source_label(), fatal=True))
     except ImportError:
         items.append(EnvItem(
             "yt-dlp", "error", "", "未安装: pip install yt-dlp",
@@ -295,6 +296,21 @@ _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
     ]),
 ]
 
+# 暴力下载：更高重试、更短 sleep、分片并发上限 8
+BRUTAL_YDL_OPTS: dict[str, Any] = {
+    "concurrent_fragment_downloads": 8,
+    "retries": 20,
+    "fragment_retries": 10,
+    "extractor_retries": 15,
+    "file_access_retries": 10,
+    "sleep_interval": 1,
+    "max_sleep_interval": 3,
+    "sleep_interval_requests": 0.5,
+}
+
+BRUTAL_MAX_WORKERS = 8
+BRUTAL_EXTRA_RETRIES = 2
+
 
 @dataclass
 class ErrorCategory:
@@ -339,6 +355,11 @@ def needs_cookie_retry(exc: Exception) -> bool:
     return classify_error(exc).retry_cookie
 
 
+def is_brutal_retryable(category: ErrorCategory) -> bool:
+    """暴力模式下可对单条额外重试的错误类别。"""
+    return category.code in {"NETWORK_ERROR", "RATE_LIMIT", "UNKNOWN"}
+
+
 class YoutubeDownloader:
     """封装所有 yt-dlp 交互。
 
@@ -353,6 +374,7 @@ class YoutubeDownloader:
         self,
         cookies_from_browser: str | None = None,
         cookiefile: str | Path | None = None,
+        ydl_opt_overrides: dict[str, Any] | None = None,
     ) -> None:
         """初始化下载器。
 
@@ -361,6 +383,8 @@ class YoutubeDownloader:
                 None 时自动检测，'' 时不使用 cookie。
             cookiefile: Netscape 格式 cookie 文件路径。
                 比 cookiesfrombrowser 更可靠，优先使用。
+            ydl_opt_overrides: 覆盖 yt-dlp 默认选项（CLI 快节奏用）。
+                GUI 不要传，保持原 sleep/重试。
         """
         self._cancelled: bool = False
         self._cancel_lock = threading.Lock()
@@ -370,6 +394,7 @@ class YoutubeDownloader:
         self._platform_cookiefiles: dict[str, Path] = {}
         self._cookies_spec: str | None = cookies_from_browser
         self._browser_cookie_broken: bool = False  # 浏览器 Cookie 不可用（如 Windows Chrome 锁库）
+        self._ydl_opt_overrides: dict[str, Any] = dict(ydl_opt_overrides or {})
         if cookiefile:
             self.set_cookiefile(cookiefile, persist=False)
         elif cookies_from_browser == "":
@@ -384,6 +409,32 @@ class YoutubeDownloader:
                 self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
         else:
             self._cookies_spec = cookies_from_browser
+        self._cancel_coordinator: YoutubeDownloader | None = None
+
+    def clone_for_worker(self, brutal: bool = False) -> YoutubeDownloader:
+        """复制 Cookie 配置供并行 worker 使用（独立 yt-dlp 锁）。"""
+        overrides = dict(self._ydl_opt_overrides)
+        if brutal:
+            overrides.update(BRUTAL_YDL_OPTS)
+        clone = YoutubeDownloader(cookies_from_browser="", ydl_opt_overrides=overrides)
+        clone._cookiefile_path = self._cookiefile_path
+        clone._cookiefile_platform = self._cookiefile_platform
+        clone._platform_cookiefiles = dict(self._platform_cookiefiles)
+        clone._cookies_spec = self._cookies_spec
+        clone._browser_cookie_broken = self._browser_cookie_broken
+        clone._cancel_coordinator = self
+        return clone
+
+    def _is_cancelled(self) -> bool:
+        owner = self._cancel_coordinator or self
+        with owner._cancel_lock:
+            return owner._cancelled
+
+    def uses_browser_cookies_only(self) -> bool:
+        """是否仅依赖浏览器 Cookie（无 cookie 文件）。"""
+        if self._cookiefile_path or self._platform_cookiefiles:
+            return False
+        return bool(self._cookies_spec) and not self._browser_cookie_broken
 
     # ------------------------------------------------------------------
     # 浏览器检测
@@ -573,10 +624,24 @@ class YoutubeDownloader:
         ba = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio"
         if format_id == "best":
             if min_height > 0:
-                return (
-                    f"bestvideo[height>={min_height}]+{ba}/"
-                    f"bestvideo[height>={min_height}]+{ba}"
+                # 精确目标档：横屏 height=N（如 1280x720），竖屏 width=N（如 720x1280）。
+                # 不能用 height>=N：会选到 1080/4K，竖屏还会把 608x1080 当成 1080p。
+                # +ba 不能直接嵌入带 / 的 ba，否则会回退成纯音频。
+                h = min_height
+                videos = (
+                    f"bestvideo[height={h}][width>={h}]",
+                    f"bestvideo[width={h}][height>={h}]",
                 )
+                parts: list[str] = []
+                for video in videos:
+                    parts.extend(
+                        (
+                            f"{video}+bestaudio[ext=m4a]",
+                            f"{video}+bestaudio[acodec^=mp4a]",
+                            f"{video}+bestaudio",
+                        )
+                    )
+                return "/".join(parts)
             return f"bestvideo+{ba}/bestvideo+{ba}"
         if needs_audio_merge:
             primary = f"{format_id}+{ba}"
@@ -642,6 +707,9 @@ class YoutubeDownloader:
                 parts = cookies_spec.split(":")
                 opts["cookiesfrombrowser"] = tuple(parts)  # type: ignore[assignment]
         opts.update(extra)  # extra 中的 extractor_args 会覆盖默认值
+        overrides = getattr(self, "_ydl_opt_overrides", None)
+        if overrides:
+            opts.update(overrides)
         return opts
 
     # ------------------------------------------------------------------
@@ -840,6 +908,7 @@ class YoutubeDownloader:
         strict_quality: bool = False,
         cookiefile_override: str | Path | None = None,
         cookies_from_browser_override: str | None = None,
+        brutal: bool = False,
     ) -> Path:
         """下载指定格式的视频。
 
@@ -852,8 +921,9 @@ class YoutubeDownloader:
             needs_audio_merge: Video Only 格式才需要合并音频，
                 Video+Audio 格式传 False 避免双音轨。
         """
-        with self._cancel_lock:
-            self._cancelled = False
+        owner = self._cancel_coordinator or self
+        with owner._cancel_lock:
+            owner._cancelled = False
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_template = str(output_dir / "%(id)s.%(ext)s")
@@ -863,9 +933,7 @@ class YoutubeDownloader:
         def _progress_hook(d: dict[str, Any]) -> None:
             if progress_callback:
                 progress_callback(d)
-            with self._cancel_lock:
-                cancelled = self._cancelled
-            if cancelled:
+            if self._is_cancelled():
                 raise yt_dlp.utils.DownloadError("下载已取消")
 
         selector_min_height = min_height if format_id == "best" else 0
@@ -874,23 +942,30 @@ class YoutubeDownloader:
             min_height=selector_min_height,
             needs_audio_merge=needs_audio_merge,
         )
+        download_extras: dict[str, Any] = {
+            "format": fmt_str,
+            "outtmpl": output_template,
+            "progress_hooks": [_progress_hook],
+            "merge_output_format": "mp4",
+            "format_sort": ["acodec:aac", "vcodec:h264"],
+            "buffersize": 4 * 1024 * 1024,
+            "keep_fragments": False,
+            "prefer_ffmpeg": True,
+        }
+        if brutal:
+            download_extras.update(BRUTAL_YDL_OPTS)
+        else:
+            download_extras.update({
+                "concurrent_fragment_downloads": 16,
+                "file_access_retries": 5,
+                "fragment_retries": 5,
+            })
         opts = self._make_opts(
             use_cookies=use_cookies,
             media=media,
             cookiefile_override=cookiefile_override,
             cookies_from_browser_override=cookies_from_browser_override,
-            format=fmt_str,
-            outtmpl=output_template,
-            progress_hooks=[_progress_hook],
-            merge_output_format="mp4",
-            # 与官方 mp4 preset 一致：优先 AAC，避免 opus-in-mp4 兼容问题
-            format_sort=["acodec:aac", "vcodec:h264"],
-            concurrent_fragment_downloads=8,
-            buffersize=4 * 1024 * 1024,
-            file_access_retries=5,
-            fragment_retries=5,
-            keep_fragments=False,
-            prefer_ffmpeg=True,
+            **download_extras,
         )
 
         with self._yt_dlp_lock:
@@ -1007,9 +1082,10 @@ class YoutubeDownloader:
                 path.unlink(missing_ok=True)
 
     def cancel(self) -> None:
-        """取消当前下载（线程安全）。"""
-        with self._cancel_lock:
-            self._cancelled = True
+        """取消当前下载（线程安全；协调器会取消所有 clone）。"""
+        owner = self._cancel_coordinator or self
+        with owner._cancel_lock:
+            owner._cancelled = True
 
     # ------------------------------------------------------------------
     # Cookie 管理

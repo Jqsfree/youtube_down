@@ -40,6 +40,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest pyinstaller
+          pip install -U yt-dlp yt-dlp-ejs
 
       - name: Run unit tests
         shell: bash
@@ -91,6 +92,7 @@ jobs:
             --hidden-import platforms.bilibili `
             --hidden-import platforms.tiktok `
             --hidden-import theme `
+            --hidden-import yt_dlp_updater `
             main.py
 
       - name: Upload artifact
