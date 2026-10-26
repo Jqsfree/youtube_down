@@ -66,8 +66,9 @@ def media_id_from_stem(stem: str) -> str:
 
 def output_dir_for(out_root: Path, rel: str) -> Path:
     path = out_root
-    for part in Path(rel).parts:
-        path = path / safe_segment(part)
+    for part in re.split(r"[\\/]+", rel):
+        if part:
+            path = path / safe_segment(part)
     return path
 
 
