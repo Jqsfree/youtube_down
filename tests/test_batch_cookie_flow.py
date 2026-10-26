@@ -105,29 +105,65 @@ def test_batch_passes_csv_cookie_override_on_retry(tmp_path: Path) -> None:
     )
 
 
-def test_batch_results_csv_unique_across_rapid_runs(tmp_path: Path) -> None:
-    """Sequential batches sharing results_dir must not overwrite each other."""
-    results_dir = tmp_path / "results"
-    results_dir.mkdir()
-    paths: list[str] = []
+def test_batches_share_single_overview(tmp_path: Path) -> None:
+    """Sequential batches sharing an output root write one overview, no per-batch CSVs."""
+    from batch_io import OVERVIEW_NAME, OverviewStore
+
+    paths: set[str] = set()
     for i in range(3):
+        out = tmp_path / f"out{i}"
+        out.mkdir()
         downloader = FakeDownloader()
         worker = BatchDownloadWorker(
             downloader=downloader,
             video_ids=[f"dQw4w9WgXc{i}"],
             format_id="22",
-            output_dir=tmp_path / f"out{i}",
-            results_dir=results_dir,
+            output_dir=out,
+            results_dir=tmp_path,
+            row_numbers={f"dQw4w9WgXc{i}": 7},
         )
-        (tmp_path / f"out{i}").mkdir()
-        finished: list[str] = []
-        worker.all_finished.connect(lambda *_a, f=finished: f.append(_a[3] if len(_a) > 3 else ""))
-        # Capture path via attribute after run
         worker.run()
-        paths.append(worker._last_results_csv)  # noqa: SLF001
+        paths.add(str(worker.overview_path))
+        stems = [kw.get("filename_stem") for name, _, kw in downloader.calls if name == "download"]
+        assert stems == [f"0007_dQw4w9WgXc{i}"]
 
-    assert len(paths) == 3
-    assert len(set(paths)) == 3
-    for p in paths:
-        assert Path(p).is_file()
-        assert Path(p).stat().st_size > 0
+    assert paths == {str(tmp_path / OVERVIEW_NAME)}
+    rows = OverviewStore(tmp_path).rows()
+    assert sorted(r["来源文件"] for r in rows) == ["out0", "out1", "out2"]
+    assert all(r["状态"] == "成功" and r["行号"] == "7" for r in rows)
+    assert not list(tmp_path.rglob("batch_results_*.csv"))
+    assert not list(tmp_path.rglob("failed_videos_*.csv"))
+
+
+def test_legacy_batch_results_still_resume(tmp_path: Path) -> None:
+    from batch_io import OverviewStore
+
+    (tmp_path / "batch_results_20250101.csv").write_text(
+        "video_id,status\ndQw4w9WgXcQ,success\n", encoding="utf-8",
+    )
+    downloader = FakeDownloader()
+    worker = BatchDownloadWorker(
+        downloader=downloader,
+        video_ids=["dQw4w9WgXcQ"],
+        format_id="22",
+        output_dir=tmp_path / "list",
+        results_dir=tmp_path,
+    )
+
+    worker.run()
+
+    assert downloader.calls == []
+    rows = OverviewStore(tmp_path).rows()
+    assert [(r["来源文件"], r["状态"]) for r in rows] == [("list", "成功")]
+
+
+def test_existing_candidates_match_old_and_row_prefixed_names(tmp_path: Path) -> None:
+    from worker import _existing_candidates
+
+    (tmp_path / "dQw4w9WgXcQ.mp4").write_bytes(b"x")
+    (tmp_path / "0004_dQw4w9WgXcQ.mp4").write_bytes(b"x")
+    (tmp_path / "0004_other000000.mp4").write_bytes(b"x")
+
+    names = [p.name for p in _existing_candidates("dQw4w9WgXcQ", tmp_path)]
+
+    assert names == ["0004_dQw4w9WgXcQ.mp4", "dQw4w9WgXcQ.mp4"]

@@ -909,6 +909,7 @@ class YoutubeDownloader:
         cookiefile_override: str | Path | None = None,
         cookies_from_browser_override: str | None = None,
         brutal: bool = False,
+        filename_stem: str | None = None,
     ) -> Path:
         """下载指定格式的视频。
 
@@ -920,13 +921,14 @@ class YoutubeDownloader:
             use_cookies: 是否使用浏览器 Cookie。
             needs_audio_merge: Video Only 格式才需要合并音频，
                 Video+Audio 格式传 False 避免双音轨。
+            filename_stem: 输出文件名（不含扩展名）；为空时用媒体 ID。
         """
         owner = self._cancel_coordinator or self
         with owner._cancel_lock:
             owner._cancelled = False
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        output_template = str(output_dir / "%(id)s.%(ext)s")
+        output_template = str(output_dir / f"{filename_stem or '%(id)s'}.%(ext)s")
         media = self.parse_input(video_id)
         url = media.url
 
@@ -1558,7 +1560,7 @@ class YoutubeDownloader:
         rows: list[dict[str, str]] = []
         seen: set[str] = set()
         target_key = YoutubeDownloader._normalize_column_key(target_column)
-        for row in raw_rows:
+        for row_no, row in enumerate(raw_rows, start=1):
             raw_value = row.get(target_column, "") or ""
             media_value = raw_value
             if target_key in {"aid", "av"} and raw_value.strip().isdigit():
@@ -1575,6 +1577,7 @@ class YoutubeDownloader:
             record["platform"] = media.platform
             record["source_url"] = media.url
             record["media_id"] = media.media_id
+            record["_row"] = str(row_no)
             cookiefile = (
                 record.get("cookiefile")
                 or record.get("cookies_file")
@@ -1595,7 +1598,7 @@ class YoutubeDownloader:
         reader = csv.reader(handle, delimiter=delimiter)
         rows: list[dict[str, str]] = []
         seen: set[str] = set()
-        for line in reader:
+        for row_no, line in enumerate(reader, start=1):
             if not line:
                 continue
             for raw_value in line:
@@ -1614,6 +1617,7 @@ class YoutubeDownloader:
                     "platform": media.platform,
                     "source_url": media.url,
                     "media_id": media.media_id,
+                    "_row": str(row_no),
                 })
         return rows
 

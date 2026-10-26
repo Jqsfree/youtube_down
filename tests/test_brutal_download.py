@@ -153,13 +153,7 @@ def test_brutal_parallel_uses_thread_pool(tmp_path: Path, downloader_no_init: Yo
 
         mock_pool.submit.side_effect = submit
         with patch("worker.as_completed", side_effect=lambda futs: list(futs)):
-            worker._run_brutal_parallel(
-                [(0, "a"), (1, "b")],
-                2,
-                MagicMock(),
-                MagicMock(),
-                [],
-            )
+            worker._run_brutal_parallel([(0, "a"), (1, "b")], 2, [])
 
     mock_pool_cls.assert_called_once_with(max_workers=BRUTAL_MAX_WORKERS)
     assert sorted(calls) == [0, 1]

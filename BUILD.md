@@ -57,7 +57,7 @@ CANCELLED         用户取消 → 不重试
 UNKNOWN           未分类 → 不重试
 ```
 
-所有结果写入 `batch_results_*.csv`，包含 `error_category`、`cookie_used`。
+所有结果写入输出根目录的 `下载总览.csv`（含 `错误类型`、`错误信息`），输出目录镜像输入层级，文件名为 `<原表行号>_<媒体ID>`。
 
 ## 项目结构
 

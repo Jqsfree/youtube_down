@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """独立批量下载：Cookie 直下、自适应节流、跳过已完成文件。
 
-不依赖 GUI。续传读取输出目录里已有 mp4。
+不依赖 GUI。输入可为表格文件、文件夹（递归）或直接的链接/ID；
+输出目录镜像输入层级，文件名为 ``<原表行号>_<媒体ID>``，结果写入输出根的 ``下载总览.csv``。
 
 示例::
 
     python scripts/download_cli.py -o ~/Downloads/out list.csv
+    python scripts/download_cli.py -o ~/Downloads/out ~/lists/        # 整个文件夹
     python scripts/download_cli.py -o ~/Downloads/out --cookies ~/cookies.txt list.csv
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import http.client
 import json
 import random
@@ -23,7 +24,7 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,6 +34,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from batch_io import (  # noqa: E402
+    INPUT_EXTS,
+    PASTE_SOURCE,
+    InputFile,
+    OverviewStore,
+    discover_inputs,
+    filename_stem,
+    media_id_from_stem,
+    media_stem,
+    output_dir_for,
+    parse_pasted_text,
+)
 from downloader import (  # noqa: E402
     BRUTAL_YDL_OPTS,
     YoutubeDownloader,
@@ -102,10 +115,6 @@ _SKIP_NODE_CONTAINS = (
 )
 
 _VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".flv")
-_RESULTS_FIELDS = [
-    "video_id", "platform", "source_url", "title", "status",
-    "error_category", "error_message", "cookie_used", "output_dir",
-]
 _DEBUG_LOG_PATH = Path("/home/jqs/projects/vid_download/.cursor/debug-136086.log")
 _DEBUG_SESSION_ID = "136086"
 
@@ -154,8 +163,16 @@ def _probe_short_side(path: Path) -> int | None:
 
 
 def collect_completed_ids(*dirs: Path, min_height: int = 0) -> set[str]:
-    """已有有效媒体文件的 video_id（需能解析视频轨，且短边 >= min_height）。"""
-    done: set[str] = set()
+    """已有有效媒体文件的 video_id（需能解析视频轨，且短边 >= min_height）。
+
+    同时识别旧命名 ``{id}.ext`` 与行号命名 ``NNNN_{id}.ext``。
+    """
+    return set(collect_completed_files(*dirs, min_height=min_height))
+
+
+def collect_completed_files(*dirs: Path, min_height: int = 0) -> dict[str, Path]:
+    """同 collect_completed_ids，返回 {video_id: 文件路径}。"""
+    done: dict[str, Path] = {}
     for folder in dirs:
         if folder is None or not folder.exists() or folder.is_file():
             continue
@@ -167,8 +184,15 @@ def collect_completed_ids(*dirs: Path, min_height: int = 0) -> set[str]:
                 continue
             if min_height > 0 and short < min_height:
                 continue
-            done.add(path.stem)
+            done.setdefault(path.stem, path)
+            done.setdefault(media_id_from_stem(path.stem), path)
     return done
+
+
+def _remove_media_files(output_dir: Path, *stems: str) -> None:
+    for stem in stems:
+        for ext in _VIDEO_EXTS:
+            (output_dir / f"{stem}{ext}").unlink(missing_ok=True)
 
 
 def check_exit_ip(proxy: str = "http://127.0.0.1:7897") -> tuple[str, str]:
@@ -360,6 +384,7 @@ def _download_one(
     fragment_workers: int = 16,
     run_id: str = "run-unknown",
     brutal: bool = False,
+    stem: str | None = None,
 ) -> dict[str, str]:
     # #region agent log
     _debug_log(
@@ -378,9 +403,8 @@ def _download_one(
     # #endregion
     # 续传判定未通过的同名旧文件（损坏/低清）须先删，否则 yt-dlp 会直接复用它
     _vid = YoutubeDownloader._normalize_video_id(video_id) or video_id
-    for ext in _VIDEO_EXTS:
-        stale = output_dir / f"{_vid}{ext}"
-        stale.unlink(missing_ok=True)
+    stale_stems = (_vid, stem) if stem else (_vid,)
+    _remove_media_files(output_dir, *stale_stems)
     dl = _make_downloader(
         cookiefile, use_pot=use_pot, fragment_workers=fragment_workers, brutal=brutal,
     )
@@ -392,6 +416,7 @@ def _download_one(
                 video_id=video_id,
                 format_id="best",
                 output_dir=output_dir,
+                filename_stem=stem,
                 use_cookies=True,
                 needs_audio_merge=True,
                 min_height=min_height,
@@ -429,9 +454,7 @@ def _download_one(
             # #endregion
             # 下载后校验失败时文件已落盘，删除以免被续传当成已完成
             if any(k in msg for k in ("低于最低要求", "与目标档位", "缺少音轨", "缺少视频轨", "时长异常", "无法解析为有效媒体")):
-                vid = YoutubeDownloader._normalize_video_id(video_id) or video_id
-                for ext in _VIDEO_EXTS:
-                    (output_dir / f"{vid}{ext}").unlink(missing_ok=True)
+                _remove_media_files(output_dir, *stale_stems)
             if "低于最低要求" in msg or ("低于" in msg and str(min_height) in msg):
                 return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
             if "requested format is not available" in msg.lower():
@@ -464,46 +487,73 @@ def _result(
     }
 
 
-def _iter_sources(args: argparse.Namespace) -> list[str]:
-    sources: list[str] = []
+@dataclass
+class Job:
+    """一条待下载记录：source 为总览里的来源文件（相对路径），row_no 为原表行号。"""
+
+    src: str
+    source: str
+    row_no: int
+    out_dir: Path
+
+    @property
+    def media_id(self) -> str:
+        try:
+            return media_stem(YoutubeDownloader.parse_input(self.src).media_id)
+        except Exception:
+            return media_stem(self.src)
+
+    @property
+    def stem(self) -> str:
+        return filename_stem(self.row_no, self.media_id)
+
+
+def _rel_for(inp: InputFile, input_root: Path | None) -> str:
+    if input_root is None:
+        return inp.rel
+    try:
+        return inp.path.resolve().relative_to(input_root).with_suffix("").as_posix()
+    except ValueError:
+        return inp.rel
+
+
+def _iter_sources(args: argparse.Namespace, output_dir: Path) -> list[Job]:
+    input_root = args.input_root.expanduser().resolve() if args.input_root else None
+    jobs: list[Job] = []
+    pasted: list[str] = []
     for item in args.sources:
         path = Path(item).expanduser()
-        if path.is_file() and path.suffix.lower() in {".csv", ".tsv", ".txt"}:
-            sources.extend(YoutubeDownloader.load_csv(path))
-        else:
-            sources.append(item)
-    seen: set[str] = set()
-    unique: list[str] = []
-    for src in sources:
-        vid = YoutubeDownloader._normalize_video_id(src) or src
-        if vid in seen:
+        if not (path.is_dir() or (path.is_file() and path.suffix.lower() in INPUT_EXTS)):
+            pasted.append(item)
             continue
-        seen.add(vid)
-        unique.append(src)
+        inputs, errors = discover_inputs(path)
+        for err in errors:
+            print(f"跳过输入: {err}", file=sys.stderr, flush=True)
+        for inp in inputs:
+            rel = _rel_for(inp, input_root)
+            out_dir = output_dir_for(output_dir, rel)
+            for index, row in enumerate(inp.rows, start=1):
+                row_no = int(row.get("_row") or index)
+                jobs.append(Job(row["video_id"], rel, row_no, out_dir))
+
+    valid, invalid = parse_pasted_text("\n".join(pasted))
+    for token in invalid:
+        print(f"跳过无效来源: {token}", file=sys.stderr, flush=True)
+    paste_dir = output_dir_for(output_dir, PASTE_SOURCE)
+    jobs.extend(
+        Job(src, PASTE_SOURCE, index, paste_dir)
+        for index, src in enumerate(valid, start=1)
+    )
+
+    seen: set[tuple[str, str]] = set()
+    unique: list[Job] = []
+    for job in jobs:
+        key = (job.source, job.media_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(job)
     return unique
-
-
-def _open_results_csv(results_dir: Path) -> tuple[Path, csv.DictWriter, Any]:
-    results_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    csv_path = results_dir / f"batch_results_{stamp}.csv"
-    handle = csv_path.open("w", newline="", encoding="utf-8")
-    writer = csv.DictWriter(handle, fieldnames=_RESULTS_FIELDS, extrasaction="ignore")
-    writer.writeheader()
-    handle.flush()
-    return csv_path, writer, handle
-
-
-def _write_failed_csv(results_dir: Path, rows: list[dict[str, str]]) -> str:
-    if not rows:
-        return ""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = results_dir / f"failed_videos_{stamp}.csv"
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=_RESULTS_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    return str(path)
 
 
 class AdaptivePacer:
@@ -560,13 +610,22 @@ class AdaptivePacer:
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cookie 直下批量下载（自适应节流、可续传）")
-    parser.add_argument("sources", nargs="+", help="CSV/TXT 或视频 URL/ID")
-    parser.add_argument("-o", "--output-dir", type=Path, required=True, help="视频输出目录")
+    parser.add_argument("sources", nargs="+", help="CSV/TSV/TXT、包含它们的文件夹，或视频 URL/ID")
+    parser.add_argument(
+        "-o", "--output-dir", type=Path, required=True,
+        help="输出根目录（镜像输入层级，并写入 下载总览.csv）",
+    )
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=None,
+        help="计算输出镜像路径的输入根；默认传文件夹时以该文件夹为根，传文件时用文件名",
+    )
     parser.add_argument(
         "--results-dir",
         type=Path,
         default=None,
-        help="batch_results CSV 目录，默认与输出目录相同",
+        help="浏览器 Cookie 缓存目录，默认与输出目录相同",
     )
     parser.add_argument(
         "--workers", type=int, default=1,
@@ -696,22 +755,50 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.pot:
         print("PO Token 模式已启用（需已安装 bgutil-ytdlp-pot-provider 等插件）", flush=True)
 
-    sources = _iter_sources(args)
+    sources = _iter_sources(args, output_dir)
     if not sources:
         print("没有可下载的视频", file=sys.stderr)
         return 2
 
-    skip: set[str] = set()
-    if not args.no_skip_existing:
-        skip = collect_completed_ids(
-            output_dir, results_dir, output_dir.parent, min_height=args.min_height,
+    overview = OverviewStore(output_dir)
+
+    def _record(job: Job, result: dict[str, str]) -> None:
+        try:
+            media = YoutubeDownloader.parse_input(job.src)
+            platform, url = media.platform, media.url
+        except Exception:
+            platform, url = "", job.src
+        overview.upsert(
+            source=job.source,
+            row_no=job.row_no,
+            media_id=job.media_id,
+            platform=platform,
+            url=url,
+            title=result.get("title") or "",
+            status=result["status"],
+            category=result.get("error_category", ""),
+            message=result.get("error_message", ""),
+            output_file=result.get("path") or "",
         )
-    pending = []
-    for src in sources:
-        vid = YoutubeDownloader._normalize_video_id(src) or src
-        if vid in skip:
-            continue
-        pending.append(src)
+
+    pending: list[Job] = []
+    existing_cache: dict[Path, dict[str, Path]] = {}
+    legacy_existing: dict[str, Path] = {}
+    if not args.no_skip_existing:
+        # 旧版平铺布局：视频直接在输出根目录
+        legacy_existing = collect_completed_files(output_dir, min_height=args.min_height)
+    for job in sources:
+        if not args.no_skip_existing:
+            if job.out_dir not in existing_cache:
+                existing_cache[job.out_dir] = collect_completed_files(
+                    job.out_dir, min_height=args.min_height,
+                )
+            found = existing_cache[job.out_dir].get(job.media_id) or legacy_existing.get(job.media_id)
+            if found:
+                if overview.status_of(job.source, job.media_id) != "success":
+                    _record(job, {"status": "success", "path": str(found)})
+                continue
+        pending.append(job)
 
     print(
         f"总计 {len(sources)}，已完成/跳过 {len(sources) - len(pending)}，"
@@ -742,7 +829,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "sleep_max": args.sleep_max,
                 "fragment_workers": args.fragment_workers,
                 "pending_count": len(pending),
-                "pending_first3": pending[:3],
+                "pending_first3": [job.src for job in pending[:3]],
             },
         )
         # #endregion
@@ -757,13 +844,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"Cookie 准备失败: {exc}", file=sys.stderr)
         return 4
 
-    csv_path, writer, handle = _open_results_csv(results_dir)
-    csv_lock = threading.Lock()
-    print(f"结果 CSV: {csv_path}", flush=True)
+    print(f"下载总览: {overview.path}", flush=True)
 
     pacer = AdaptivePacer(args.sleep_min, args.sleep_max)
     ok = fail = skip_n = 0
-    failed_rows: list[dict[str, str]] = []
     workers = max(1, args.workers)
     pending_iter = iter(pending)
     total = len(pending)
@@ -781,23 +865,6 @@ def main(argv: Iterable[str] | None = None) -> int:
     tried_nodes: set[str] = set()
     recoveries = 0
     auto_recover = not args.no_auto_recover
-
-    def _write_row(src: str, result: dict[str, str]) -> None:
-        media = YoutubeDownloader.parse_input(src)
-        row = {
-            "video_id": result.get("video_id") or media.media_id,
-            "platform": media.platform,
-            "source_url": media.url,
-            "title": result.get("title") or "",
-            "status": result["status"],
-            "error_category": result["error_category"],
-            "error_message": result["error_message"],
-            "cookie_used": result["cookie_used"],
-            "output_dir": result["output_dir"],
-        }
-        with csv_lock:
-            writer.writerow(row)
-            handle.flush()
 
     def _maybe_refresh_cookies() -> None:
         nonlocal cookiefile, downloads_since_cookie_refresh
@@ -817,24 +884,25 @@ def main(argv: Iterable[str] | None = None) -> int:
             except Exception as exc:
                 print(f"Cookie 刷新失败: {exc}", flush=True)
 
-    def _download_job(src: str) -> dict[str, str]:
+    def _download_job(job: Job) -> dict[str, str]:
         with cookie_lock:
             cf = cookiefile
+        job.out_dir.mkdir(parents=True, exist_ok=True)
         return _download_one(
-            src, output_dir, cf, args.min_height,
+            job.src, job.out_dir, cf, args.min_height,
             use_pot=args.pot, fragment_workers=args.fragment_workers, run_id=run_id,
-            brutal=args.brutal,
+            brutal=args.brutal, stem=job.stem,
         )
 
     def _submit(pool: ThreadPoolExecutor, inflight: dict) -> None:
         if stop_bot:
             return
         try:
-            src = next(pending_iter)
+            job = next(pending_iter)
         except StopIteration:
             return
-        fut = pool.submit(_download_job, src)
-        inflight[fut] = src
+        fut = pool.submit(_download_job, job)
+        inflight[fut] = job
 
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -843,7 +911,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 _submit(pool, inflight)
             while inflight:
                 fut = next(as_completed(inflight))
-                src = inflight.pop(fut)
+                job = inflight.pop(fut)
+                src = job.src
                 done_n += 1
                 downloads_since_cookie_refresh += 1
                 try:
@@ -851,7 +920,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 except Exception as exc:
                     result = _result(
                         YoutubeDownloader._normalize_video_id(src) or src,
-                        output_dir, "failed", "UNKNOWN", clean_error(exc),
+                        job.out_dir, "failed", "UNKNOWN", clean_error(exc),
                     )
                 status = result["status"]
                 err = (result.get("error_message") or "").lower()
@@ -874,18 +943,6 @@ def main(argv: Iterable[str] | None = None) -> int:
                 else:
                     fail += 1
                     mark = "FAIL"
-                    media = YoutubeDownloader.parse_input(src)
-                    failed_rows.append({
-                        "video_id": result.get("video_id") or media.media_id,
-                        "platform": media.platform,
-                        "source_url": media.url,
-                        "title": "",
-                        "status": status,
-                        "error_category": result["error_category"],
-                        "error_message": result["error_message"],
-                        "cookie_used": "true",
-                        "output_dir": str(output_dir),
-                    })
                     if is_bot or is_rate:
                         bot_streak += 1
                         recovered = False
@@ -963,10 +1020,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                     else:
                         bot_streak = 0
 
-                vid = result.get("video_id") or src
                 extra = result.get("error_message") or result.get("path") or ""
-                print(f"[{done_n}/{total}] {mark} {vid} {extra[:120]}", flush=True)
-                _write_row(src, result)
+                print(f"[{done_n}/{total}] {mark} {job.source}#{job.row_no} {job.media_id} {extra[:120]}", flush=True)
+                _record(job, result)
 
                 if bot_streak >= 2:
                     stop_bot = True
@@ -983,13 +1039,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                 _maybe_refresh_cookies()
                 pacer.wait()
                 _submit(pool, inflight)
-    finally:
-        handle.close()
+    except KeyboardInterrupt:
+        print("已中断，重跑同一命令可续传", flush=True)
 
-    failed_path = _write_failed_csv(results_dir, failed_rows)
-    if failed_path:
-        print(f"失败列表: {failed_path}", flush=True)
-    print(f"完成 success={ok} failed={fail} skipped={skip_n} csv={csv_path}", flush=True)
+    print(f"完成 success={ok} failed={fail} skipped={skip_n} 总览={overview.path}", flush=True)
     return 0 if fail == 0 else 1
 
 

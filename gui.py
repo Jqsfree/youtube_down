@@ -8,15 +8,14 @@ from __future__ import annotations
 
 import os
 import platform as py_platform
-import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QShortcut
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QIcon, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -34,18 +34,35 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSplitter,
+    QStackedWidget,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from batch_io import (
+    PASTE_SOURCE,
+    InputFile,
+    OverviewStore,
+    discover_inputs,
+    output_dir_for,
+    parse_pasted_text,
+)
 from downloader import YoutubeDownloader, check_environment
 from logger_utils import AppLogger
 from platforms.base import Platform
-from theme import PRESETS, apply_theme, load_palette, preset_names, save_palette, with_accent
+from theme import (
+    PRESETS,
+    apply_theme,
+    load_palette,
+    preset_names,
+    save_palette,
+    theme_preview,
+    with_accent,
+)
 from worker import AUTO_FORMAT_ID, BatchDownloadWorker, ValidateCookieWorker, YtdlpUpdateWorker
 from yt_dlp_updater import load_state, overlay_enabled, should_auto_check
 
@@ -77,8 +94,10 @@ class MainWindow(QMainWindow):
         self._ytdlp_check_interactive: bool = False
         self._output_dir: Path = Path.home() / "Downloads"
         self._csv_ids: list[str] = []
-        self._csv_queue: list[tuple[str, list[str], Path | None]] = []
+        # (来源相对路径, 来源列表, CSV 指定的输出目录, {来源: 原表行号})
+        self._csv_queue: list[tuple[str, list[str], Path | None, dict[str, int]]] = []
         self._csv_cookie_overrides: dict[str, dict[str, str]] = {}
+        self._overview: OverviewStore | None = None
         self._cookie_persisted: bool = bool(self._downloader._platform_cookiefiles)  # noqa: SLF001
         self._batch_done: int = 0
         self._batch_errors: list[tuple[int, str, str]] = []
@@ -166,121 +185,215 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_sidebar())
-        splitter.addWidget(self._build_main())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([240, 740])
-        outer.addWidget(splitter)
+        self._pages = QStackedWidget()
+        self._pages.addWidget(self._build_main())
+        self._pages.addWidget(self._build_cookie_page())
+        self._pages.addWidget(self._build_settings_page())
+        outer.addWidget(self._build_nav())
+        outer.addWidget(self._pages, stretch=1)
         self.setStatusBar(QStatusBar())
 
-    def _build_sidebar(self) -> QWidget:
+    def _build_nav(self) -> QWidget:
         frame = QFrame()
         frame.setObjectName("sidebar")
-        frame.setMinimumWidth(200)
-        frame.setMaximumWidth(320)
+        frame.setFixedWidth(176)
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 18, 12, 12)
+        layout.setSpacing(4)
 
-        title = QLabel("平台 / Cookie")
-        title.setObjectName("titleLabel")
-        layout.addWidget(title)
+        app_title = QLabel("视频批量下载")
+        app_title.setObjectName("appTitle")
+        layout.addWidget(app_title)
+        subtitle = QLabel("YouTube · Bilibili · TikTok")
+        subtitle.setObjectName("mutedLabel")
+        layout.addWidget(subtitle)
+        layout.addSpacing(18)
 
-        hint = QLabel("选择平台后导入 Netscape cookies.txt")
-        hint.setObjectName("mutedLabel")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self._nav_buttons: list[QPushButton] = []
+        for index, text in enumerate(("下载任务", "平台 Cookie", "设置")):
+            btn = QPushButton(text)
+            btn.setObjectName("navBtn")
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.clicked.connect(lambda _=False, i=index: self._pages.setCurrentIndex(i))
+            layout.addWidget(btn)
+            self._nav_buttons.append(btn)
+        self._nav_buttons[0].setChecked(True)
 
+        layout.addStretch(1)
+        ver = QLabel(f"v{self._app_version}")
+        ver.setObjectName("mutedLabel")
+        layout.addWidget(ver)
+        return frame
+
+    @staticmethod
+    def _page(title: str, hint: str = "") -> tuple[QWidget, QVBoxLayout]:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 18, 24, 16)
+        layout.setSpacing(12)
+        header = QLabel(title)
+        header.setObjectName("titleLabel")
+        layout.addWidget(header)
+        if hint:
+            hint_label = QLabel(hint)
+            hint_label.setObjectName("mutedLabel")
+            hint_label.setWordWrap(True)
+            layout.addWidget(hint_label)
+        return page, layout
+
+    def _build_cookie_page(self) -> QWidget:
+        page, layout = self._page(
+            "平台 Cookie",
+            "公开视频无需 Cookie；遇到登录、年龄或机器人验证时才会使用。"
+            "选择平台后导入 Netscape 格式的 cookies.txt。",
+        )
         self._platform_buttons: dict[str, QPushButton] = {}
         self._cookie_labels: dict[str, QLabel] = {}
 
+        card, card_layout = self._card(spacing=6)
         for plat in _PLATFORM_KEYS:
-            card = QFrame()
-            card.setObjectName("platformCard")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(8, 8, 8, 8)
-            card_layout.setSpacing(4)
-
+            row = QFrame()
+            row.setObjectName("platformCard")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 2, 0, 2)
             btn = QPushButton(plat.label)
+            btn.setObjectName("platformBtn")
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
+            btn.setMinimumWidth(150)
             btn.clicked.connect(lambda checked=False, p=plat: self._on_select_platform(p))
             self._platform_buttons[plat.value] = btn
-            card_layout.addWidget(btn)
-
             status = QLabel()
             status.setObjectName("cookieMissing")
             self._cookie_labels[plat.value] = status
-            card_layout.addWidget(status)
-            layout.addWidget(card)
-
+            row_layout.addWidget(btn)
+            row_layout.addWidget(status, stretch=1)
+            card_layout.addWidget(row)
         self._platform_buttons[Platform.YOUTUBE.value].setChecked(True)
 
-        remember_row = QHBoxLayout()
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        self._import_cookie_btn = QPushButton("导入 Cookie")
+        self._import_cookie_btn.setObjectName("primaryBtn")
+        self._clear_cookie_btn = QPushButton("清除")
+        self._clear_cookie_btn.setObjectName("dangerBtn")
         self._remember_cookie_checkbox = QCheckBox("记住为默认")
         self._remember_cookie_checkbox.setToolTip("勾选后保存为该平台默认 Cookie")
-        remember_row.addWidget(self._remember_cookie_checkbox)
-        layout.addLayout(remember_row)
-
-        btn_row = QHBoxLayout()
-        self._import_cookie_btn = QPushButton("导入 Cookie")
-        self._clear_cookie_btn = QPushButton("清除")
-        btn_row.addWidget(self._import_cookie_btn)
-        btn_row.addWidget(self._clear_cookie_btn)
-        layout.addLayout(btn_row)
-
-        theme_label = QLabel("主题")
-        theme_label.setObjectName("sectionLabel")
-        layout.addWidget(theme_label)
-
-        theme_row = QHBoxLayout()
-        self._theme_combo = QComboBox()
-        self._theme_combo.addItems(preset_names())
-        idx = self._theme_combo.findText(self._palette.name)
-        self._theme_combo.setCurrentIndex(max(0, idx))
-        self._accent_btn = QPushButton("强调色")
-        theme_row.addWidget(self._theme_combo, stretch=1)
-        theme_row.addWidget(self._accent_btn)
-        layout.addLayout(theme_row)
-
+        action_row.addWidget(self._import_cookie_btn)
+        action_row.addWidget(self._clear_cookie_btn)
+        action_row.addSpacing(8)
+        action_row.addWidget(self._remember_cookie_checkbox)
+        action_row.addStretch(1)
+        card_layout.addSpacing(6)
+        card_layout.addLayout(action_row)
+        layout.addWidget(card)
         layout.addStretch(1)
-        ver_row = QHBoxLayout()
-        ver = QLabel(f"v{self._app_version}")
-        ver.setObjectName("mutedLabel")
+        return page
+
+    def _build_settings_page(self) -> QWidget:
+        page, layout = self._page("设置")
+
+        look = QLabel("外观")
+        look.setObjectName("sectionLabel")
+        layout.addWidget(look)
+        theme_card, theme_layout = self._card(spacing=10)
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        self._theme_buttons: dict[str, QToolButton] = {}
+        for index, name in enumerate(preset_names()):
+            btn = QToolButton()
+            btn.setObjectName("themeSwatch")
+            btn.setText(name)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            btn.setIcon(QIcon(theme_preview(PRESETS[name])))
+            btn.setIconSize(QSize(132, 76))
+            btn.clicked.connect(lambda _=False, n=name: self._on_theme_changed(n))
+            grid.addWidget(btn, index // 4, index % 4)
+            self._theme_buttons[name] = btn
+        if self._palette.name in self._theme_buttons:
+            self._theme_buttons[self._palette.name].setChecked(True)
+        theme_layout.addLayout(grid)
+        accent_row = QHBoxLayout()
+        self._accent_btn = QPushButton("自定义强调色…")
+        accent_row.addWidget(self._accent_btn)
+        accent_row.addStretch(1)
+        theme_layout.addLayout(accent_row)
+        layout.addWidget(theme_card)
+
+        about = QLabel("下载引擎")
+        about.setObjectName("sectionLabel")
+        layout.addWidget(about)
+        engine_card, engine_layout = self._card()
+        engine_row = QHBoxLayout()
+        engine_label = QLabel(f"应用版本 v{self._app_version} · yt-dlp 可在线热更新（仅发布版 EXE）")
+        engine_label.setObjectName("mutedLabel")
         self._ytdlp_update_btn = QPushButton("更新 yt-dlp")
         if overlay_enabled():
             self._ytdlp_update_btn.setToolTip("从 PyPI 更新 yt-dlp（需重启后生效）")
         else:
             self._ytdlp_update_btn.setEnabled(False)
             self._ytdlp_update_btn.setToolTip("仅发布版 EXE 支持热更新")
-        ver_row.addWidget(ver)
-        ver_row.addWidget(self._ytdlp_update_btn)
-        layout.addLayout(ver_row)
-        return frame
+        engine_row.addWidget(engine_label, stretch=1)
+        engine_row.addWidget(self._ytdlp_update_btn)
+        engine_layout.addLayout(engine_row)
+        layout.addWidget(engine_card)
+        layout.addStretch(1)
+        return page
+
+    @staticmethod
+    def _card(spacing: int = 8) -> tuple[QFrame, QVBoxLayout]:
+        card = QFrame()
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(spacing)
+        return card, card_layout
 
     def _build_main(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 18, 24, 16)
+        layout.setSpacing(12)
 
-        header = QLabel("任务队列")
+        header_row = QHBoxLayout()
+        header = QLabel("下载任务")
         header.setObjectName("titleLabel")
-        layout.addWidget(header)
+        self._csv_label = QLabel("")
+        self._csv_label.setObjectName("mutedLabel")
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        header_row.addWidget(self._csv_label)
+        layout.addLayout(header_row)
 
+        # 输入卡片：粘贴框 + 导入按钮 + 下载选项
+        input_card, input_layout = self._card(spacing=10)
         url_row = QHBoxLayout()
-        self._url_edit = QLineEdit()
-        self._url_edit.setPlaceholderText("粘贴 YouTube / Bilibili / TikTok 链接或 ID…")
+        url_row.setSpacing(10)
+        self._url_edit = QPlainTextEdit()
+        self._url_edit.setObjectName("urlEdit")
+        self._url_edit.setPlaceholderText(
+            "粘贴 YouTube / Bilibili / TikTok 链接或 ID，可一次多条（换行、逗号、空格分隔）…"
+        )
         self._add_url_btn = QPushButton("加入队列")
+        self._add_url_btn.setObjectName("primaryBtn")
         self._load_csv_btn = QPushButton("加载 CSV")
+        self._load_folder_btn = QPushButton("加载文件夹")
+        self._load_folder_btn.setToolTip("递归读取文件夹内所有 CSV/TSV/TXT，输出目录保持相同层级")
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(6)
+        btn_col.addWidget(self._add_url_btn)
+        btn_col.addWidget(self._load_csv_btn)
+        btn_col.addWidget(self._load_folder_btn)
         url_row.addWidget(self._url_edit, stretch=1)
-        url_row.addWidget(self._add_url_btn)
-        url_row.addWidget(self._load_csv_btn)
-        layout.addLayout(url_row)
+        url_row.addLayout(btn_col)
+        input_layout.addLayout(url_row)
+        self._url_edit.setFixedHeight(btn_col.sizeHint().height())
 
         opts = QHBoxLayout()
+        opts.setSpacing(8)
         opts.addWidget(QLabel("清晰度"))
         self._quality_combo = QComboBox()
         for label, _ in self._QUALITY_PRESETS:
@@ -295,26 +408,21 @@ class MainWindow(QMainWindow):
         self._min_height_input.setVisible(False)
         opts.addWidget(self._quality_combo)
         opts.addWidget(self._min_height_input)
+        opts.addSpacing(8)
 
         opts.addWidget(QLabel("输出"))
         self._output_input = QLineEdit(str(self._output_dir))
         self._browse_btn = QPushButton("浏览…")
         opts.addWidget(self._output_input, stretch=1)
         opts.addWidget(self._browse_btn)
+        opts.addSpacing(8)
         self._brutal_checkbox = QCheckBox("暴力下载（8 线程）")
         self._brutal_checkbox.setToolTip(
             "更高重试、更短间隔、最多 8 条并行；可能加剧限流，建议配合 Cookie 文件"
         )
         opts.addWidget(self._brutal_checkbox)
-        layout.addLayout(opts)
-
-        self._csv_label = QLabel("")
-        self._csv_label.setObjectName("mutedLabel")
-        layout.addWidget(self._csv_label)
-
-        queue_label = QLabel("下载队列")
-        queue_label.setObjectName("sectionLabel")
-        layout.addWidget(queue_label)
+        input_layout.addLayout(opts)
+        layout.addWidget(input_card)
 
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(["平台", "ID/URL", "状态", "进度"])
@@ -323,36 +431,52 @@ class MainWindow(QMainWindow):
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header_view.setHighlightSections(False)
         self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(32)
+        self._table.setShowGrid(False)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
+        self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self._table, stretch=2)
 
-        # Per-video progress (compact)
-        stats = QHBoxLayout()
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setRange(0, 100)
+        # 进度卡片：当前视频 + 总进度 + 操作按钮
+        progress_card, progress_layout = self._card(spacing=8)
+        status_row = QHBoxLayout()
+        self._status_label = QLabel("请加载 CSV 或粘贴链接")
+        self._status_label.setObjectName("statusLabel")
         self._progress_label = QLabel("0%")
         self._speed_label = QLabel("—")
         self._eta_label = QLabel("ETA: —")
         self._size_label = QLabel("— / —")
-        stats.addWidget(self._progress_bar, stretch=1)
-        stats.addWidget(self._progress_label)
-        stats.addWidget(self._size_label)
-        stats.addWidget(self._speed_label)
-        stats.addWidget(self._eta_label)
-        layout.addLayout(stats)
+        status_row.addWidget(self._status_label, stretch=1)
+        for stat in (self._size_label, self._speed_label, self._eta_label, self._progress_label):
+            stat.setObjectName("statLabel")
+            status_row.addSpacing(10)
+            status_row.addWidget(stat)
+        progress_layout.addLayout(status_row)
 
-        self._status_label = QLabel("请加载 CSV 或粘贴链接")
-        layout.addWidget(self._status_label)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setTextVisible(False)
+        progress_layout.addWidget(self._progress_bar)
+
+        self._batch_progress_bar = QProgressBar()
+        self._batch_progress_bar.setObjectName("batchProgress")
+        self._batch_progress_bar.setRange(0, 100)
+        self._batch_progress_bar.setFormat("总进度 %p%")
+        progress_layout.addWidget(self._batch_progress_bar)
 
         action_row = QHBoxLayout()
-        self._download_btn = QPushButton("开始")
+        action_row.setSpacing(8)
+        self._download_btn = QPushButton("开始下载")
         self._download_btn.setObjectName("primaryBtn")
         self._download_btn.setEnabled(False)
         self._cancel_btn = QPushButton("取消")
+        self._cancel_btn.setObjectName("dangerBtn")
         self._cancel_btn.setEnabled(False)
         self._open_dir_btn = QPushButton("打开目录")
         self._log_toggle_btn = QPushButton("收起日志")
@@ -361,19 +485,15 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self._open_dir_btn)
         action_row.addStretch(1)
         action_row.addWidget(self._log_toggle_btn)
-        layout.addLayout(action_row)
-
-        self._batch_progress_bar = QProgressBar()
-        self._batch_progress_bar.setRange(0, 100)
-        self._batch_progress_bar.setFormat("总进度 %p%")
-        layout.addWidget(self._batch_progress_bar)
+        progress_layout.addLayout(action_row)
+        layout.addWidget(progress_card)
 
         self._log_view = QPlainTextEdit()
         self._log_view.setObjectName("logPanel")
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(2000)
         self._log_view.setMinimumHeight(100)
-        self._log_view.setMaximumHeight(180)
+        self._log_view.setMaximumHeight(170)
         layout.addWidget(self._log_view, stretch=1)
         return panel
 
@@ -381,6 +501,7 @@ class MainWindow(QMainWindow):
         self._import_cookie_btn.clicked.connect(self._on_import_cookie)
         self._clear_cookie_btn.clicked.connect(self._on_clear_cookie)
         self._load_csv_btn.clicked.connect(self._on_load_csv)
+        self._load_folder_btn.clicked.connect(self._on_load_folder)
         self._add_url_btn.clicked.connect(self._on_add_url)
         self._browse_btn.clicked.connect(self._on_browse)
         self._download_btn.clicked.connect(self._on_download)
@@ -388,7 +509,6 @@ class MainWindow(QMainWindow):
         self._open_dir_btn.clicked.connect(self._on_open_dir)
         self._log_toggle_btn.clicked.connect(self._on_toggle_log)
         self._quality_combo.currentIndexChanged.connect(self._on_quality_changed)
-        self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self._accent_btn.clicked.connect(self._on_pick_accent)
         self._ytdlp_update_btn.clicked.connect(self._on_check_ytdlp_update)
         self._shortcut_download = QShortcut("Ctrl+D", self)
@@ -618,53 +738,93 @@ class MainWindow(QMainWindow):
         if filepaths:
             self._process_imported_files(filepaths)
 
+    def _on_load_folder(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "选择包含 CSV/TSV/TXT 的文件夹")
+        if not directory:
+            return
+        inputs, errors = discover_inputs(Path(directory))
+        self._load_inputs(inputs, errors)
+
     def _on_add_url(self) -> None:
-        text = self._url_edit.text().strip()
+        text = self._url_edit.toPlainText().strip()
         if not text:
             return
-        try:
-            media = YoutubeDownloader.parse_input(text)
-        except ValueError as exc:
-            QMessageBox.warning(self, "无效输入", str(exc))
+        valid, invalid = parse_pasted_text(text)
+        if invalid:
+            preview = "\n".join(invalid[:10])
+            more = f"\n… 共 {len(invalid)} 条" if len(invalid) > 10 else ""
+            QMessageBox.warning(self, "部分输入无效", f"以下内容无法识别，已忽略：\n{preview}{more}")
+        if not valid:
             return
-        source = media.original if "://" in media.original else media.media_id
-        if source not in self._csv_ids:
+        added = 0
+        for source in valid:
+            if source in self._csv_ids:
+                continue
             self._csv_ids.append(source)
-        self._csv_queue = [("paste", list(self._csv_ids), None)]
-        self._append_queue_row(media.label, source, "等待中", 0)
+            try:
+                label = YoutubeDownloader.parse_input(source).label
+            except ValueError:
+                label = "?"
+            self._append_queue_row(label, source, "等待中", 0)
+            added += 1
+        row_numbers = {source: index for index, source in enumerate(self._csv_ids, start=1)}
+        self._csv_queue = [(PASTE_SOURCE, list(self._csv_ids), None, row_numbers)]
         self._url_edit.clear()
         self._download_btn.setEnabled(True)
         self._csv_label.setText(f"队列 {len(self._csv_ids)} 个视频")
         self._status_label.setText(
-            f"已加入 {media.label} — {self._quality_label(*self._get_quality_settings())}"
+            f"已加入 {added} 个 — {self._quality_label(*self._get_quality_settings())}"
         )
-        self._log(f"加入队列: {media.label} {source}")
+        self._log(f"加入队列: {added} 个（共 {len(self._csv_ids)}）")
+
+    def _status_item(self, status: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(status)
+        color = {
+            "完成": self._palette.success,
+            "失败": self._palette.danger,
+            "下载中": self._palette.accent,
+        }.get(status)
+        if color:
+            item.setForeground(QColor(color))
+        return item
 
     def _append_queue_row(self, platform_name: str, vid: str, status: str, progress: int) -> None:
         # Update existing row if same ID
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 1)
             if item and item.text() == vid:
-                self._table.setItem(row, 2, QTableWidgetItem(status))
+                self._table.setItem(row, 2, self._status_item(status))
                 self._table.setItem(row, 3, QTableWidgetItem(f"{progress}%"))
                 return
         row = self._table.rowCount()
         self._table.insertRow(row)
         self._table.setItem(row, 0, QTableWidgetItem(platform_name))
         self._table.setItem(row, 1, QTableWidgetItem(vid))
-        self._table.setItem(row, 2, QTableWidgetItem(status))
+        self._table.setItem(row, 2, self._status_item(status))
         self._table.setItem(row, 3, QTableWidgetItem(f"{progress}%"))
 
     def _set_row_status(self, video_id: str, status: str, progress: int | None = None) -> None:
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 1)
             if item and item.text() == video_id:
-                self._table.setItem(row, 2, QTableWidgetItem(status))
+                self._table.setItem(row, 2, self._status_item(status))
                 if progress is not None:
                     self._table.setItem(row, 3, QTableWidgetItem(f"{progress}%"))
                 return
 
     def _process_imported_files(self, filepaths: list[str]) -> None:
+        inputs: list[InputFile] = []
+        errors: list[str] = []
+        for fp in filepaths:
+            found, errs = discover_inputs(Path(fp))
+            inputs.extend(found)
+            errors.extend(errs)
+        self._load_inputs(inputs, errors)
+
+    def _load_inputs(self, inputs: list[InputFile], errors: list[str]) -> None:
+        if not inputs:
+            QMessageBox.warning(self, "导入失败", "\n".join(errors) or "未能识别视频列表。")
+            return
         if self._csv_queue and self._table.rowCount():
             reply = QMessageBox.question(
                 self, "替换队列？",
@@ -675,26 +835,17 @@ class MainWindow(QMainWindow):
                 return
 
         all_ids: list[str] = []
-        errors: list[str] = []
         detected_columns: list[str] = []
         self._csv_queue = []
         self._csv_cookie_overrides = {}
         self._table.setRowCount(0)
         seen_names: set[str] = set()
 
-        for fp in filepaths:
-            path = Path(fp)
-            try:
-                rows = YoutubeDownloader.load_csv_rows(path)
-            except (FileNotFoundError, ValueError) as exc:
-                errors.append(f"{path.name}: {exc}")
-                continue
-            if not rows:
-                errors.append(f"{path.name}: 未识别到有效视频 ID/链接")
-                continue
+        for inp in inputs:
+            path, rows = inp.path, inp.rows
             used_column = rows[0].get("_import_column", "")
             if used_column:
-                detected_columns.append(f"{path.name}→{used_column}")
+                detected_columns.append(f"{inp.rel}→{used_column}")
             ids = [row["video_id"] for row in rows]
             all_ids.extend(ids)
             for row in rows:
@@ -718,10 +869,14 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     plat_label = "?"
                 self._append_queue_row(plat_label, row["video_id"], "等待中", 0)
-            name = self._build_queue_name(path.stem, seen_names)
+            name = self._unique_queue_rel(inp.rel, seen_names)
             seen_names.add(name)
             output_dir = self._resolve_import_output_dir(rows)
-            self._csv_queue.append((name, list(dict.fromkeys(ids)), output_dir))
+            row_numbers = {
+                row["video_id"]: int(row.get("_row") or index)
+                for index, row in enumerate(rows, start=1)
+            }
+            self._csv_queue.append((name, list(dict.fromkeys(ids)), output_dir, row_numbers))
 
         if errors:
             QMessageBox.critical(self, "文件错误", "\n".join(errors))
@@ -730,7 +885,7 @@ class MainWindow(QMainWindow):
             return
 
         self._csv_ids = list(dict.fromkeys(all_ids))
-        total = sum(len(ids) for _, ids, _ in self._csv_queue)
+        total = sum(len(ids) for _, ids, _, _ in self._csv_queue)
         col_hint = f" | 列: {', '.join(detected_columns)}" if detected_columns else ""
         self._csv_label.setText(f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频{col_hint}")
         self._download_btn.setEnabled(True)
@@ -769,7 +924,8 @@ class MainWindow(QMainWindow):
         self._last_brutal_mode = brutal
         self._log(f"暴力下载={'开' if brutal else '关'}")
         if not self._csv_queue and self._csv_ids:
-            self._csv_queue = [("batch", list(self._csv_ids), None)]
+            self._csv_queue = [("batch", list(self._csv_ids), None, {})]
+        self._overview = OverviewStore(output_dir)
         self._start_queue(AUTO_FORMAT_ID, output_dir, min_height, strict_quality, brutal)
 
     def _start_queue(
@@ -778,14 +934,14 @@ class MainWindow(QMainWindow):
     ) -> None:
         if not self._csv_queue:
             return
-        name, ids, explicit_dir = self._csv_queue.pop(0)
+        name, ids, explicit_dir, row_numbers = self._csv_queue.pop(0)
         output_dir = explicit_dir or self._build_queue_output_dir(base_dir, name)
         output_dir.mkdir(parents=True, exist_ok=True)
-        self._output_input.setText(str(output_dir))
-        self._log(f"队列开始: {name} ({len(ids)} 个)")
+        self._log(f"队列开始: {name} ({len(ids)} 个) → {output_dir}")
         self._start_batch_download(
             format_id, output_dir, ids, min_height, strict_quality,
             results_dir=base_dir, brutal_mode=brutal_mode,
+            source_rel=name, row_numbers=row_numbers,
         )
 
     def _start_batch_download(
@@ -797,6 +953,8 @@ class MainWindow(QMainWindow):
         strict_quality: bool,
         results_dir: Path | None = None,
         brutal_mode: bool = False,
+        source_rel: str = "",
+        row_numbers: dict[str, int] | None = None,
     ) -> None:
         self._batch_errors.clear()
         self._batch_done = 0
@@ -816,6 +974,9 @@ class MainWindow(QMainWindow):
                 if source in self._csv_cookie_overrides
             },
             brutal_mode=brutal_mode,
+            overview=self._overview,
+            source_rel=source_rel,
+            row_numbers=row_numbers,
         )
         w = self._worker
         w.all_progress_changed.connect(self._on_batch_progress)
@@ -843,6 +1004,7 @@ class MainWindow(QMainWindow):
 
     def _set_downloading_ui(self, downloading: bool) -> None:
         self._load_csv_btn.setEnabled(not downloading)
+        self._load_folder_btn.setEnabled(not downloading)
         self._add_url_btn.setEnabled(not downloading)
         self._download_btn.setEnabled(not downloading and bool(self._csv_queue or self._csv_ids))
         self._cancel_btn.setEnabled(downloading)
@@ -897,20 +1059,17 @@ class MainWindow(QMainWindow):
         return None
 
     @staticmethod
-    def _build_queue_name(stem: str, seen_names: set[str]) -> str:
-        safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5._ -]+", "_", stem).strip(" .")
-        if not safe_name:
-            safe_name = "source"
-        candidate = safe_name
+    def _unique_queue_rel(rel: str, seen_names: set[str]) -> str:
+        candidate = rel
         suffix = 2
         while candidate in seen_names:
-            candidate = f"{safe_name}_{suffix}"
+            candidate = f"{rel}_{suffix}"
             suffix += 1
         return candidate
 
     @staticmethod
     def _build_queue_output_dir(base_dir: Path, queue_name: str) -> Path:
-        return base_dir / queue_name
+        return output_dir_for(base_dir, queue_name)
 
     # ------------------------------------------------------------------
     # Worker callbacks
@@ -971,14 +1130,14 @@ class MainWindow(QMainWindow):
         self._log(f"  ↳ {msg}")
 
     def _on_batch_all_finished(
-        self, success: int, fail: int, skipped: int, csv_path: str
+        self, success: int, fail: int, skipped: int, overview_path: str
     ) -> None:
         self._batch_progress_bar.setValue(100)
         self._status_label.setText(f"批量完成：成功 {success}，失败 {fail}")
         self._batch_errors.clear()
 
         if self._csv_queue:
-            self._queue_results.append((success, fail, skipped, csv_path))
+            self._queue_results.append((success, fail, skipped, overview_path))
             fmt_id = self._worker._format_id if self._worker else self._last_fmt_id  # noqa: SLF001
             self._start_queue(
                 fmt_id, self._output_dir, self._last_min_height, self._last_strict_quality,
@@ -987,36 +1146,26 @@ class MainWindow(QMainWindow):
             return
 
         if self._queue_results:
-            self._queue_results.append((success, fail, skipped, csv_path))
+            self._queue_results.append((success, fail, skipped, overview_path))
             total_ok = sum(s for s, _, _, _ in self._queue_results)
             total_fail = sum(f for _, f, _, _ in self._queue_results)
             total_skip = sum(k for _, _, k, _ in self._queue_results)
-            csv_list = "\n".join(f"  {p}" for _, _, _, p in self._queue_results)
             parts = [f"总数: {total_ok + total_fail + total_skip}", f"成功: {total_ok}"]
             if total_skip:
                 parts.append(f"跳过: {total_skip}")
             parts.append(f"失败: {total_fail}")
-            parts.append(f"\n结果 CSV:\n{csv_list}")
+            parts.append(f"\n下载总览:\n{overview_path}")
             QMessageBox.information(self, "队列下载完成", "\n".join(parts))
-            self._log(f"队列全部完成: 成功 {total_ok}, 失败 {total_fail}")
+            self._log(f"队列全部完成: 成功 {total_ok}, 失败 {total_fail}, 总览: {overview_path}")
             self._queue_results.clear()
         else:
-            extra = []
-            if self._worker is not None:
-                skipped_path = getattr(self._worker, "_last_skipped_csv", "")
-                failed_path = getattr(self._worker, "_last_failed_csv", "")
-                if skipped_path:
-                    extra.append(f"跳过列表 CSV:\n{skipped_path}")
-                if failed_path:
-                    extra.append(f"失败重试 CSV:\n{failed_path}")
-            msg = (
-                f"批量下载完成\n\n总数: {success + fail}\n成功: {success}\n失败: {fail}\n\n"
-                f"详细结果 CSV:\n{csv_path}"
-            )
-            if extra:
-                msg = f"{msg}\n\n" + "\n\n".join(extra)
-            QMessageBox.information(self, "批量下载完成", msg)
-            self._log(f"批量完成: 成功 {success}, 失败 {fail}, CSV: {csv_path}")
+            parts = [f"总数: {success + fail + skipped}", f"成功: {success}"]
+            if skipped:
+                parts.append(f"跳过: {skipped}")
+            parts.append(f"失败: {fail}")
+            parts.append(f"\n下载总览:\n{overview_path}")
+            QMessageBox.information(self, "批量下载完成", "批量下载完成\n\n" + "\n".join(parts))
+            self._log(f"批量完成: 成功 {success}, 失败 {fail}, 总览: {overview_path}")
 
         self._set_downloading_ui(False)
 

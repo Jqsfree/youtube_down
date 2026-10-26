@@ -29,6 +29,45 @@ def test_collect_completed_ids_requires_valid_media(tmp_path: Path, monkeypatch)
     assert done == {"AAA111aaaaa"}
 
 
+def test_collect_completed_ids_recognizes_row_prefixed_names(tmp_path: Path, monkeypatch) -> None:
+    import download_cli
+
+    (tmp_path / "0003_AbZ9o3oWYjo.mp4").write_bytes(b"x" * 2048)
+    monkeypatch.setattr(download_cli, "_probe_short_side", lambda p: 1080)
+
+    done = collect_completed_ids(tmp_path, min_height=720)
+
+    assert "AbZ9o3oWYjo" in done
+
+
+def test_iter_sources_mirrors_folder_and_pastes(tmp_path: Path) -> None:
+    import argparse
+
+    import download_cli
+
+    src = tmp_path / "in"
+    (src / "舞蹈").mkdir(parents=True)
+    (src / "舞蹈" / "擦边.csv").write_text(
+        "url\nhttps://www.youtube.com/watch?v=dQw4w9WgXcQ\n\nhttps://youtu.be/RajrwxvF4Yw\n",
+        encoding="utf-8",
+    )
+    (src / "top.txt").write_text("9xK8sxOIpOQ\n", encoding="utf-8")
+    out = tmp_path / "out"
+    args = argparse.Namespace(
+        sources=[str(src), "https://www.youtube.com/shorts/S4d2AB_unnw"], input_root=None,
+    )
+
+    jobs = download_cli._iter_sources(args, out)
+
+    by_id = {job.media_id: job for job in jobs}
+    assert by_id["dQw4w9WgXcQ"].out_dir == out / "舞蹈" / "擦边"
+    assert by_id["dQw4w9WgXcQ"].source == "舞蹈/擦边"
+    assert by_id["RajrwxvF4Yw"].stem.endswith("_RajrwxvF4Yw")
+    assert by_id["9xK8sxOIpOQ"].out_dir == out / "top"
+    assert by_id["S4d2AB_unnw"].out_dir == out / "paste"
+    assert by_id["S4d2AB_unnw"].stem == "0001_S4d2AB_unnw"
+
+
 def test_cli_ydl_opts_never_zero_sleep() -> None:
     assert CLI_YDL_OPTS["sleep_interval"] >= 1
     assert CLI_YDL_OPTS["max_sleep_interval"] >= CLI_YDL_OPTS["sleep_interval"]
