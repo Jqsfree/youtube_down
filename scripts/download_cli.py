@@ -134,15 +134,40 @@ def _debug_log(
         pass
 
 
-def collect_completed_ids(*dirs: Path) -> set[str]:
-    """已有有效媒体文件的 video_id。"""
+def _probe_short_side(path: Path) -> int | None:
+    """ffprobe 视频短边；无法解析视频轨时返回 None。"""
+    try:
+        from downloader import _find_tool
+        import subprocess
+        result = subprocess.run(
+            [_find_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        parts = [p.strip() for p in result.stdout.strip().split(",") if p.strip()]
+        dims = [int(p) for p in parts[:2]]
+        if len(dims) >= 2:
+            return min(dims)
+        return dims[0] if dims else None
+    except Exception:
+        return None
+
+
+def collect_completed_ids(*dirs: Path, min_height: int = 0) -> set[str]:
+    """已有有效媒体文件的 video_id（需能解析视频轨，且短边 >= min_height）。"""
     done: set[str] = set()
     for folder in dirs:
         if folder is None or not folder.exists() or folder.is_file():
             continue
         for path in folder.iterdir():
-            if path.suffix.lower() in _VIDEO_EXTS and path.stat().st_size > 1024:
-                done.add(path.stem)
+            if path.suffix.lower() not in _VIDEO_EXTS or path.stat().st_size <= 1024:
+                continue
+            short = _probe_short_side(path)
+            if short is None:
+                continue
+            if min_height > 0 and short < min_height:
+                continue
+            done.add(path.stem)
     return done
 
 
@@ -351,12 +376,18 @@ def _download_one(
         },
     )
     # #endregion
+    # 续传判定未通过的同名旧文件（损坏/低清）须先删，否则 yt-dlp 会直接复用它
+    _vid = YoutubeDownloader._normalize_video_id(video_id) or video_id
+    for ext in _VIDEO_EXTS:
+        stale = output_dir / f"{_vid}{ext}"
+        stale.unlink(missing_ok=True)
     dl = _make_downloader(
         cookiefile, use_pot=use_pot, fragment_workers=fragment_workers, brutal=brutal,
     )
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
+            # min_height=0 表示不限档位，expected_height=0 会把任意分辨率判为不符
             path = dl.download(
                 video_id=video_id,
                 format_id="best",
@@ -364,7 +395,7 @@ def _download_one(
                 use_cookies=True,
                 needs_audio_merge=True,
                 min_height=min_height,
-                expected_height=min_height,
+                expected_height=min_height if min_height > 0 else None,
                 strict_quality=True,
                 brutal=brutal,
             )
@@ -396,6 +427,11 @@ def _download_one(
                 },
             )
             # #endregion
+            # 下载后校验失败时文件已落盘，删除以免被续传当成已完成
+            if any(k in msg for k in ("低于最低要求", "与目标档位", "缺少音轨", "缺少视频轨", "时长异常", "无法解析为有效媒体")):
+                vid = YoutubeDownloader._normalize_video_id(video_id) or video_id
+                for ext in _VIDEO_EXTS:
+                    (output_dir / f"{vid}{ext}").unlink(missing_ok=True)
             if "低于最低要求" in msg or ("低于" in msg and str(min_height) in msg):
                 return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
             if "requested format is not available" in msg.lower():
@@ -667,7 +703,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     skip: set[str] = set()
     if not args.no_skip_existing:
-        skip = collect_completed_ids(output_dir, results_dir, output_dir.parent)
+        skip = collect_completed_ids(
+            output_dir, results_dir, output_dir.parent, min_height=args.min_height,
+        )
     pending = []
     for src in sources:
         vid = YoutubeDownloader._normalize_video_id(src) or src

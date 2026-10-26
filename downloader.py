@@ -1032,6 +1032,9 @@ class YoutubeDownloader:
                         f" 实际 {actual_duration:.0f}s (可能是合并中断)"
                     )
 
+            # expected_height<=0 视为未指定（避免与真实分辨率做 0p 精确比对）
+            if expected_height is not None and expected_height <= 0:
+                expected_height = None
             if expected_height is not None or (min_height and min_height > 0):
                 height_result = subprocess.run(
                     [_find_tool("ffprobe"), "-v", "error",

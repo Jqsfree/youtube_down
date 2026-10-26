@@ -146,9 +146,9 @@ jobs:
             | Windows | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
 
             ## 本版修复
-            - 竖屏/横屏按短边计档；缺 width 时从 resolution 解析，避免有 720 却误跳过
-            - 合并音频优先 m4a/AAC，避免 opus 进 mp4 后 Windows 播放器无声
-            - 格式选择兼容 m4s/fmp4 容器
+            - 批量续传只跳过能解析视频轨且短边达标的文件，损坏/低清残留会重新下载
+            - 下载后校验失败（分辨率、音轨、时长）时删除坏文件
+            - `--min-height 0` 不再把任意分辨率误判为「与目标档位 (0p) 不符」
 
             ## 使用
             1. 下载 `YouTubeDownloader-Windows.exe`

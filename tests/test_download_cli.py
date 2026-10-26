@@ -12,16 +12,21 @@ from download_cli import (  # noqa: E402
 )
 
 
-def test_collect_completed_ids_from_files_only(tmp_path: Path) -> None:
+def test_collect_completed_ids_requires_valid_media(tmp_path: Path, monkeypatch) -> None:
+    import download_cli
+
     out = tmp_path / "videos"
     out.mkdir()
     (out / "AAA111aaaaa.mp4").write_bytes(b"x" * 2048)
+    (out / "garbage0000.mp4").write_bytes(b"x" * 2048)
+    (out / "lowres00000.mp4").write_bytes(b"x" * 2048)
     (out / "tiny.mp4").write_bytes(b"no")
+    sides = {"AAA111aaaaa.mp4": 720, "garbage0000.mp4": None, "lowres00000.mp4": 576}
+    monkeypatch.setattr(download_cli, "_probe_short_side", lambda p: sides.get(p.name))
 
-    done = collect_completed_ids(out)
+    done = collect_completed_ids(out, min_height=720)
 
-    assert "AAA111aaaaa" in done
-    assert "tiny" not in done
+    assert done == {"AAA111aaaaa"}
 
 
 def test_cli_ydl_opts_never_zero_sleep() -> None:
