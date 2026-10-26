@@ -828,7 +828,7 @@ class MainWindow(QMainWindow):
         if self._csv_queue and self._table.rowCount():
             reply = QMessageBox.question(
                 self, "替换队列？",
-                f"当前有任务队列，导入新文件将清空。继续？",
+                "当前有任务队列，导入新文件将清空。继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:

@@ -5,8 +5,7 @@ Persists selection via QSettings. No third-party theme frameworks.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-from typing import Iterable
+from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QRectF, QSettings, Qt
 from PySide6.QtGui import QColor, QPainter, QPalette, QPen, QPixmap

@@ -1,5 +1,5 @@
 """CI smoke test — 验证 Windows 环境下 get_info 能正常工作。"""
-from downloader import YoutubeDownloader, check_environment, clean_error
+from downloader import YoutubeDownloader, check_environment
 
 # 环境检测
 ok, items = check_environment()

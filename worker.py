@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
-import yt_dlp
 from PySide6.QtCore import QThread, Signal
 
 from batch_io import (

@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import downloader
 from downloader import (
     BRUTAL_MAX_WORKERS,
     BRUTAL_YDL_OPTS,
