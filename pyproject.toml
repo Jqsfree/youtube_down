@@ -16,8 +16,24 @@ dependencies = [
 ]
 
 [project.scripts]
-youtube-down = "youtube_down:main"
+youtube-down = "main:main"
+youtube-down-cli = "download_cli:main"
 
 [build-system]
-requires = ["uv_build>=0.12.8,<0.13.0"]
-build-backend = "uv_build"
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "batch_io",
+    "download_cli",
+    "downloader",
+    "gui",
+    "gui_log",
+    "logger_utils",
+    "main",
+    "theme",
+    "worker",
+    "yt_dlp_updater",
+]
+packages = ["platforms"]

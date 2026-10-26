@@ -19,3 +19,4 @@ test_*.csv
 .vscode/
 resources/ffmpeg/
 resources/deno/
+*.egg-info/
