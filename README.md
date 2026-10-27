@@ -1,19 +1,36 @@
-# YouTube Downloader
+# Multi-Platform Downloader
 
-基于 yt-dlp + PySide6 的 YouTube 视频下载桌面工具。
+基于 yt-dlp + PySide6 的桌面下载工具，支持 YouTube / Bilibili / TikTok。
 
-## 系统要求
+## 下载安装包（推荐）
+
+最新版：[v1.1.6](https://github.com/Jqsfree/youtube_down/releases/tag/v1.1.6)
+
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| Windows (x64) | [YouTubeDownloader-Windows.exe](https://github.com/Jqsfree/youtube_down/releases/download/v1.1.6/YouTubeDownloader-Windows.exe) | 双击运行；已内嵌 ffmpeg / ffprobe / deno |
+| macOS (Apple Silicon) | [YouTubeDownloader-macOS.zip](https://github.com/Jqsfree/youtube_down/releases/download/v1.1.6/YouTubeDownloader-macOS.zip) | 解压后打开 `.app`；已内嵌 ffmpeg / ffprobe / deno |
+
+### macOS 首次打开
+
+若提示「无法验证开发者」：右键 App → 打开，或在「系统设置 → 隐私与安全性」中允许。
+
+会员 / 风控视频请在 GUI 按平台导入 Cookie。
+
+## 源码运行
+
+### 系统要求
 
 - Python 3.11+
-- ffmpeg（放入 PATH 或 `resources/ffmpeg/` 目录）
+- ffmpeg（放入 PATH 或 `resources/ffmpeg/`）
 
-## 安装
+### 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Windows 源码开发（推荐）
+### Windows 开发环境（推荐）
 
 无需全局安装 ffmpeg，一键下载到 `resources/ffmpeg/`：
 
@@ -24,15 +41,16 @@ python main.py
 
 也可手动 `winget install Gyan.FFmpeg`，或将 ffmpeg 放入 PATH / `resources\ffmpeg\`。
 
-## 运行
+### 启动
 
 ```bash
-python main.py
+python main.py                 # GUI
+python -m download_cli -h      # 批量 CLI
 ```
 
 ## Windows 本地测试
 
-在项目根目录打开 **PowerShell** 或 **命令提示符**，执行：
+在项目根目录打开 **PowerShell** 或 **命令提示符**：
 
 ```powershell
 # 一键测试：安装依赖 + 单元测试 + 冒烟测试 + GUI 初始化
@@ -47,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
 
 也可以双击 `scripts\win_test.bat`。
 
-> 若 PowerShell 报中文乱码或解析错误，请确保使用最新版 `scripts/win_test.ps1`（脚本输出为英文，避免 Windows 编码问题）。
+> 若 PowerShell 报中文乱码或解析错误，请使用最新版 `scripts/win_test.ps1`（脚本输出为英文，避免 Windows 编码问题）。
 
 ### 前置条件
 
@@ -60,40 +78,44 @@ powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
 可选（Cookie 重试模式）：
 
 - **deno**：Cookie 模式下 YouTube JS 挑战需要
-- **Chrome/Edge**：用于读取浏览器 Cookie
-- **手动 Cookie 文件**：Windows 上若无法自动读取浏览器 Cookie 或获取不到格式，可在 GUI 点击「导入 Cookie 文件」，选择 Netscape 格式的 `cookies.txt`（Chrome/Edge 可用扩展 **Get cookies.txt LOCALLY** 导出）。**Cookie 模式还需要 deno**（`scripts\setup_dev.ps1` 会一并下载，或 `winget install Denoland.Deno`）
+- **Chrome/Edge/Safari**：用于读取浏览器 Cookie
+- **手动 Cookie 文件**：若无法自动读取浏览器 Cookie，可在 GUI 导入 Netscape 格式的 `cookies.txt`（可用扩展 **Get cookies.txt LOCALLY** 导出）。Cookie 模式还需要 deno（`scripts\setup_dev.ps1` 会一并下载，或 `winget install Denoland.Deno` / `brew install deno`）
 
 ### 手动分步测试
 
-```powershell
+```bash
 python -m pip install -r requirements.txt pytest
 python -m pytest tests/ -v
 python smoke_test.py
 python main.py
 ```
 
+## 使用（GUI）
 
-1. 输入 YouTube Video ID（例如 `dQw4w9WgXcQ`）
-2. 点击 **获取信息** 查看视频详情和可用格式
-3. 选择目标格式
-4. 选择保存目录（默认为 Downloads）
-5. 点击 **下载**
-6. 下载完成后点击 **打开目录** 查看文件
+1. 导入 CSV / 文件夹 / 粘贴链接，或输入单个 Video ID
+2. 选择清晰度与保存目录
+3. 点击 **下载**（批量可开暴力并行）
+4. 结果写入输出根目录的 `下载总览.csv`
 
 ## 项目结构
 
 ```
-youtube_downloader/
-├── main.py          # 程序入口
-├── gui.py           # 主窗口（纯 UI）
-├── downloader.py    # yt-dlp 封装
-├── worker.py        # 下载线程
-├── requirements.txt
-└── README.md
+youtube_down/
+├── main.py            # GUI 入口
+├── gui.py / theme.py  # 纯 UI（不 import yt_dlp）
+├── worker.py          # QThread，连接 UI 与逻辑
+├── downloader.py      # yt-dlp 封装、校验、Cookie
+├── download_cli.py    # 批量 CLI
+├── batch_io.py        # 输入发现、输出镜像、下载总览
+├── pacing.py          # 自适应节流
+├── platforms/         # YouTube / Bilibili / TikTok
+└── .github/workflows/build.yml  # Windows + macOS 打包
 ```
 
 ## 解耦设计
 
 - `gui.py` 不直接调用 yt-dlp
-- 所有下载逻辑封装在 `downloader.py` 的 `YoutubeDownloader` 类中
+- 下载逻辑在 `downloader.py` / `platforms/`，可供 CLI 复用
 - `worker.py` 负责后台线程，通过 Qt Signals 更新 GUI
+
+推送到 `main` 会自动构建 Windows `.exe` 与 macOS `.zip`，并发布到 [Releases](https://github.com/Jqsfree/youtube_down/releases)。
