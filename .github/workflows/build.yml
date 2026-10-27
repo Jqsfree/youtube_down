@@ -18,6 +18,10 @@ jobs:
             platform: windows
             artifact_name: YouTubeDownloader-Windows.exe
             pyinstaller_name: YouTubeDownloader-Windows
+          - os: macos-latest
+            platform: macos
+            artifact_name: YouTubeDownloader-macOS.zip
+            pyinstaller_name: YouTubeDownloader-macOS
 
     runs-on: ${{ matrix.os }}
 
@@ -48,7 +52,7 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
 
-      # After tests: local ffmpeg.exe would otherwise shadow PATH in tool-resolution tests.
+      # After tests: local ffmpeg would otherwise shadow PATH in tool-resolution tests.
       - name: Install deno + ffmpeg (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -65,6 +69,18 @@ jobs:
           Copy-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
           Copy-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
           if (-not (Test-Path ffmpeg.exe)) { throw "ffmpeg.exe missing after extract" }
+
+      - name: Install deno + ffmpeg (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          brew install ffmpeg deno
+          cp "$(brew --prefix)/bin/ffmpeg" ./ffmpeg
+          cp "$(brew --prefix)/bin/ffprobe" ./ffprobe
+          cp "$(brew --prefix)/bin/deno" ./deno
+          chmod +x ffmpeg ffprobe deno
+          ./ffmpeg -version | head -1
+          ./deno --version | head -1
 
       - name: Smoke test
         shell: bash
@@ -92,8 +108,52 @@ jobs:
             --hidden-import platforms.bilibili `
             --hidden-import platforms.tiktok `
             --hidden-import theme `
+            --hidden-import pacing `
+            --hidden-import gui_log `
+            --hidden-import batch_io `
             --hidden-import yt_dlp_updater `
             main.py
+
+      - name: Build app (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          pyinstaller --onefile --windowed \
+            --name "${{ matrix.pyinstaller_name }}" \
+            --add-data "VERSION:." \
+            --add-binary "ffmpeg:." \
+            --add-binary "ffprobe:." \
+            --add-binary "deno:." \
+            --collect-all yt_dlp \
+            --collect-all yt_dlp_ejs \
+            --hidden-import PySide6.QtCore \
+            --hidden-import PySide6.QtWidgets \
+            --hidden-import PySide6.QtGui \
+            --hidden-import platforms \
+            --hidden-import platforms.youtube \
+            --hidden-import platforms.bilibili \
+            --hidden-import platforms.tiktok \
+            --hidden-import theme \
+            --hidden-import pacing \
+            --hidden-import gui_log \
+            --hidden-import batch_io \
+            --hidden-import yt_dlp_updater \
+            main.py
+          ls -la dist/
+          # --windowed on macOS → .app; zip for release download
+          if [ -d "dist/${{ matrix.pyinstaller_name }}.app" ]; then
+            ditto -c -k --keepParent \
+              "dist/${{ matrix.pyinstaller_name }}.app" \
+              "dist/${{ matrix.artifact_name }}"
+          elif [ -f "dist/${{ matrix.pyinstaller_name }}" ]; then
+            ditto -c -k \
+              "dist/${{ matrix.pyinstaller_name }}" \
+              "dist/${{ matrix.artifact_name }}"
+          else
+            echo "No macOS build output found in dist/" >&2
+            exit 1
+          fi
+          ls -la "dist/${{ matrix.artifact_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -124,12 +184,17 @@ jobs:
         id: stage
         run: |
           mkdir -p staged
-          find release-assets -type f \( -name 'YouTubeDownloader-*' -o -name '*.exe' \) -print
+          find release-assets -type f \( -name 'YouTubeDownloader-*' -o -name '*.exe' -o -name '*.zip' \) -print
           while IFS= read -r -d '' f; do
             base="$(basename "$f")"
             cp "$f" "staged/$base"
-          done < <(find release-assets -type f -name 'YouTubeDownloader-Windows.exe' -print0)
+          done < <(find release-assets -type f \( \
+            -name 'YouTubeDownloader-Windows.exe' -o \
+            -name 'YouTubeDownloader-macOS.zip' \
+          \) -print0)
           ls -la staged
+          test -f staged/YouTubeDownloader-Windows.exe
+          test -f staged/YouTubeDownloader-macOS.zip
           echo "files=$(find staged -type f | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
@@ -138,21 +203,22 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: Multi-Platform Downloader v${{ steps.version.outputs.version }}
           body: |
-            Windows 下载器 v${{ steps.version.outputs.version }}（YouTube / Bilibili / TikTok）
+            Windows / macOS 下载器 v${{ steps.version.outputs.version }}（YouTube / Bilibili / TikTok）
 
             ## 下载
             | 平台 | 文件 |
             |------|------|
-            | Windows | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
-
-            ## 本版修复
-            - 批量续传只跳过能解析视频轨且短边达标的文件，损坏/低清残留会重新下载
-            - 下载后校验失败（分辨率、音轨、时长）时删除坏文件
-            - `--min-height 0` 不再把任意分辨率误判为「与目标档位 (0p) 不符」
+            | Windows (x64) | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
+            | macOS (Apple Silicon) | `YouTubeDownloader-macOS.zip`（解压后打开 `.app`；内嵌 ffmpeg / ffprobe / deno） |
 
             ## 使用
+            ### Windows
             1. 下载 `YouTubeDownloader-Windows.exe`
             2. 双击运行
+
+            ### macOS
+            1. 下载并解压 `YouTubeDownloader-macOS.zip`
+            2. 首次打开若提示未验证：右键 → 打开，或在「系统设置 → 隐私与安全性」允许
             3. 会员/风控视频请按平台导入 Cookie
           files: staged/*
           draft: false
