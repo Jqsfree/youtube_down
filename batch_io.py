@@ -216,7 +216,7 @@ class OverviewStore:
         return _LABEL_TO_STATUS.get(row["状态"], row["状态"]) if row else ""
 
     def completed_ids(self, source: str | None = None) -> set[str]:
-        """状态为成功且输出文件仍存在的 video_id。"""
+        """状态为成功、输出路径非空且文件仍存在的 video_id。"""
         done: set[str] = set()
         with self._lock:
             for (src, media_id), row in self._rows.items():
@@ -225,7 +225,7 @@ class OverviewStore:
                 if row["状态"] != STATUS_LABELS["success"]:
                     continue
                 out = row["输出文件"]
-                if out and not (self.root / out).is_file():
+                if not out or not (self.root / out).is_file():
                     continue
                 done.add(media_id)
         return done

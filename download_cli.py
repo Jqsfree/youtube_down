@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""独立批量下载：Cookie 直下、自适应节流、跳过已完成文件。
+"""独立批量下载：默认带 Cookie、自适应节流、跳过已完成文件。
 
 不依赖 GUI。输入可为表格文件、文件夹（递归）或直接的链接/ID；
 输出目录镜像输入层级，文件名为 ``<原表行号>_<媒体ID>``，结果写入输出根的 ``下载总览.csv``。
+Cookie 由 ``--cookies`` 或浏览器导出准备，下载时始终启用。
 
 示例::
 
@@ -16,7 +17,6 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
-import random
 import socket
 import sys
 import threading
@@ -43,22 +43,18 @@ from batch_io import (
     parse_pasted_text,
 )
 from downloader import (
+    BOT_STREAK_LIMIT,
     BRUTAL_YDL_OPTS,
+    NORMAL_YDL_OPTS,
     YoutubeDownloader,
     classify_error,
     clean_error,
+    dump_browser_cookies,
 )
+from pacing import AdaptivePacer
 
-# CLI 专用 yt-dlp 选项：禁止 sleep=0，只加速分片下载阶段
-CLI_YDL_OPTS: dict[str, Any] = {
-    "sleep_interval": 5,
-    "max_sleep_interval": 10,
-    "sleep_interval_requests": 1.0,
-    "extractor_retries": 3,
-    "retries": 5,
-    # 只加速单条拉流，不增加 extract 频率
-    "concurrent_fragment_downloads": 16,
-}
+# 兼容旧测试名：正常模式与 NORMAL_YDL_OPTS 对齐（视频间间隔交给 AdaptivePacer）
+CLI_YDL_OPTS: dict[str, Any] = dict(NORMAL_YDL_OPTS)
 
 # 常见机房 ASN 关键词（出口为这些时提示换住宅节点）
 _DATACENTER_ORG_KEYWORDS = (
@@ -284,36 +280,6 @@ class ClashClient:
         return nxt
 
 
-def dump_browser_cookies(browser_spec: str, dest: Path) -> Path:
-    """从浏览器导出 Netscape cookies。"""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        dest.unlink()
-    parts = tuple(p for p in browser_spec.split(":") if p)
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": True,
-        "skip_download": True,
-        "cookiesfrombrowser": parts,
-        "cookiefile": str(dest),
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        try:
-            ydl.cookiejar  # 触发从浏览器加载
-        except Exception:
-            pass
-        cookiejar = getattr(ydl, "cookiejar", None)
-        if cookiejar is not None and hasattr(cookiejar, "save"):
-            cookiejar.save(filename=str(dest), ignore_discard=True, ignore_expires=True)
-    if not dest.is_file() or dest.stat().st_size < 80:
-        raise RuntimeError(
-            f"无法从浏览器导出 Cookie（{browser_spec}）。"
-            "请关闭 Chrome 后重试，或改用 --cookies cookies.txt"
-        )
-    return dest
-
-
 def _pot_extractor_args(enabled: bool) -> dict[str, Any]:
     if not enabled:
         return {}
@@ -329,10 +295,10 @@ def _make_downloader(
     cookiefile: Path,
     *,
     use_pot: bool = False,
-    fragment_workers: int = 16,
+    fragment_workers: int = 8,
     brutal: bool = False,
 ) -> YoutubeDownloader:
-    overrides = dict(BRUTAL_YDL_OPTS if brutal else CLI_YDL_OPTS)
+    overrides = dict(BRUTAL_YDL_OPTS if brutal else NORMAL_YDL_OPTS)
     overrides["concurrent_fragment_downloads"] = max(1, fragment_workers)
     overrides.update(_pot_extractor_args(use_pot))
     return YoutubeDownloader(
@@ -349,7 +315,7 @@ def _download_one(
     min_height: int,
     *,
     use_pot: bool = False,
-    fragment_workers: int = 16,
+    fragment_workers: int = 8,
     brutal: bool = False,
     stem: str | None = None,
 ) -> dict[str, str]:
@@ -363,7 +329,6 @@ def _download_one(
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            # min_height=0 表示不限档位，expected_height=0 会把任意分辨率判为不符
             path = dl.download(
                 video_id=video_id,
                 format_id="best",
@@ -390,8 +355,13 @@ def _download_one(
             last_exc = exc
             cat = classify_error(exc)
             msg = clean_error(exc)
-            # 下载后校验失败时文件已落盘，删除以免被续传当成已完成
-            if any(k in msg for k in ("低于最低要求", "与目标档位", "缺少音轨", "缺少视频轨", "时长异常", "无法解析为有效媒体")):
+            if any(
+                k in msg
+                for k in (
+                    "低于最低要求", "与目标档位", "缺少音轨", "缺少视频轨",
+                    "时长异常", "无法解析为有效媒体",
+                )
+            ):
                 _remove_media_files(output_dir, *stale_stems)
             if "低于最低要求" in msg or ("低于" in msg and str(min_height) in msg):
                 return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
@@ -411,7 +381,11 @@ def _download_one(
 
 
 def _result(
-    video_id: str, output_dir: Path, status: str, category: str, msg: str,
+    video_id: str,
+    output_dir: Path,
+    status: str,
+    category: str,
+    msg: str,
 ) -> dict[str, str]:
     return {
         "video_id": video_id,
@@ -455,7 +429,9 @@ def _rel_for(inp: InputFile, input_root: Path | None) -> str:
         return inp.rel
 
 
-def _iter_sources(args: argparse.Namespace, output_dir: Path) -> list[Job]:
+def _iter_sources(
+    args: argparse.Namespace, output_dir: Path,
+) -> tuple[list[Job], list[Job]]:
     input_root = args.input_root.expanduser().resolve() if args.input_root else None
     jobs: list[Job] = []
     pasted: list[str] = []
@@ -485,69 +461,19 @@ def _iter_sources(args: argparse.Namespace, output_dir: Path) -> list[Job]:
 
     seen: set[tuple[str, str]] = set()
     unique: list[Job] = []
+    duplicates: list[Job] = []
     for job in jobs:
         key = (job.source, job.media_id)
         if key in seen:
+            duplicates.append(job)
             continue
         seen.add(key)
         unique.append(job)
-    return unique
-
-
-class AdaptivePacer:
-    """自适应批量间隔：连续成功略提速，bot/429 退避。"""
-
-    def __init__(
-        self,
-        sleep_min: float,
-        sleep_max: float,
-        *,
-        ok_streak_to_speedup: int = 15,
-        speedup_step: float = 0.5,
-        min_floor: float = 1.5,
-        max_ceiling: float = 30.0,
-        bot_pause_sec: float = 120.0,
-    ) -> None:
-        self.sleep_min = sleep_min
-        self.sleep_max = sleep_max
-        self.ok_streak = 0
-        self.ok_streak_to_speedup = ok_streak_to_speedup
-        self.speedup_step = speedup_step
-        self.min_floor = min_floor
-        self.max_ceiling = max_ceiling
-        self.bot_pause_sec = bot_pause_sec
-
-    def wait(self) -> None:
-        if self.sleep_max <= 0:
-            return
-        lo = max(0.0, self.sleep_min)
-        hi = max(lo, self.sleep_max)
-        time.sleep(random.uniform(lo, hi))
-
-    def on_success(self) -> None:
-        self.ok_streak += 1
-        if self.ok_streak >= self.ok_streak_to_speedup:
-            self.sleep_min = max(self.min_floor, self.sleep_min - self.speedup_step)
-            self.sleep_max = max(self.sleep_min, self.sleep_max - self.speedup_step)
-            self.ok_streak = 0
-
-    def on_skip(self) -> None:
-        self.ok_streak += 1
-
-    def on_bot_or_rate_limit(self) -> None:
-        self.ok_streak = 0
-        self.sleep_min = min(self.max_ceiling, max(self.min_floor, self.sleep_min * 2))
-        self.sleep_max = min(self.max_ceiling, max(self.sleep_min, self.sleep_max * 2))
-        print(
-            f"触发限流/bot，退避 {self.bot_pause_sec:.0f}s，"
-            f"间隔调整为 {self.sleep_min:.1f}-{self.sleep_max:.1f}s",
-            flush=True,
-        )
-        time.sleep(self.bot_pause_sec)
+    return unique, duplicates
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cookie 直下批量下载（自适应节流、可续传）")
+    parser = argparse.ArgumentParser(description="批量下载（默认 Cookie、自适应节流、可续传）")
     parser.add_argument("sources", nargs="+", help="CSV/TSV/TXT、包含它们的文件夹，或视频 URL/ID")
     parser.add_argument(
         "-o", "--output-dir", type=Path, required=True,
@@ -566,20 +492,20 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="浏览器 Cookie 缓存目录，默认与输出目录相同",
     )
     parser.add_argument(
-        "--workers", type=int, default=1,
-        help="并行视频数（默认 1；>1 易触发 YouTube bot）",
+        "--workers", type=int, default=None,
+        help="并行视频数（默认 1；brutal 未指定时为 8；>1 易触发 YouTube bot）",
     )
     parser.add_argument(
-        "--sleep-min", type=float, default=5.0,
-        help="两条视频之间最小随机等待秒数（官方建议 5–10s）",
+        "--sleep-min", type=float, default=2.0,
+        help="两条视频之间最小随机等待秒数（默认 2）",
     )
     parser.add_argument(
-        "--sleep-max", type=float, default=10.0,
-        help="两条视频之间最大随机等待秒数",
+        "--sleep-max", type=float, default=4.0,
+        help="两条视频之间最大随机等待秒数（默认 4）",
     )
     parser.add_argument(
-        "--fragment-workers", type=int, default=16,
-        help="单条视频分片并发数（只加速拉流，默认 16）",
+        "--fragment-workers", type=int, default=None,
+        help="单条视频分片并发数（默认与正常模式一致，当前 12；brutal 未指定时为 8）",
     )
     parser.add_argument("--min-height", type=int, default=720)
     parser.add_argument(
@@ -605,7 +531,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pot",
         action="store_true",
-        help="启用 YouTube PO Token 模式（需安装 bgutil-ytdlp-pot-provider 插件）",
+        help="强制 youtube player_client=mweb（可再装 bgutil PO Token 插件；可能减少可用格式）",
     )
     parser.add_argument(
         "--no-skip-existing",
@@ -615,7 +541,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--brutal",
         action="store_true",
-        help="暴力模式：workers=8、fragment-workers=8、更高重试与更短 sleep",
+        help="暴力模式：未指定时 workers/fragment-workers=8、更高重试与更短 sleep",
     )
     parser.add_argument(
         "--no-auto-recover",
@@ -675,9 +601,12 @@ def _resolve_cookiefile(
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.brutal:
-        args.workers = 8
-        args.fragment_workers = 8
+    if args.workers is None:
+        args.workers = 8 if args.brutal else 1
+    if args.fragment_workers is None:
+        args.fragment_workers = 8 if args.brutal else int(
+            NORMAL_YDL_OPTS["concurrent_fragment_downloads"]
+        )
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     results_dir = (args.results_dir or output_dir).expanduser().resolve()
@@ -690,14 +619,30 @@ def main(argv: Iterable[str] | None = None) -> int:
             warn_datacenter_ip(org)
 
     if args.pot:
-        print("PO Token 模式已启用（需已安装 bgutil-ytdlp-pot-provider 等插件）", flush=True)
+        print(
+            "已强制 player_client=mweb（若需 PO Token 请另装 bgutil-ytdlp-pot-provider；"
+            "注意 mweb 可能减少可用清晰度）",
+            flush=True,
+        )
 
-    sources = _iter_sources(args, output_dir)
-    if not sources:
+    sources, duplicates = _iter_sources(args, output_dir)
+    if not sources and not duplicates:
         print("没有可下载的视频", file=sys.stderr)
         return 2
 
     overview = OverviewStore(output_dir)
+    skip_n = 0
+    for dup in duplicates:
+        # 总览键为 (来源, video_id)，重复行无法单独成行；只计数并提示
+        print(
+            f"跳过重复行: {dup.source}#{dup.row_no} {dup.media_id}",
+            file=sys.stderr,
+            flush=True,
+        )
+        skip_n += 1
+    if not sources:
+        print(f"没有可下载的视频（重复跳过 {skip_n}）", file=sys.stderr)
+        return 0 if skip_n else 2
 
     def _record(job: Job, result: dict[str, str]) -> None:
         try:
@@ -764,7 +709,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(f"下载总览: {overview.path}", flush=True)
 
     pacer = AdaptivePacer(args.sleep_min, args.sleep_max)
-    ok = fail = skip_n = 0
+    ok = fail = 0
     workers = max(1, args.workers)
     pending_iter = iter(pending)
     total = len(pending)
@@ -907,7 +852,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 print(f"[{done_n}/{total}] {mark} {job.source}#{job.row_no} {job.media_id} {extra[:120]}", flush=True)
                 _record(job, result)
 
-                if bot_streak >= 2:
+                if bot_streak >= BOT_STREAK_LIMIT:
                     stop_bot = True
                     print(
                         "连续触发 YouTube 机器人验证/限流，已停止以免刷爆。"

@@ -246,7 +246,8 @@ class MainWindow(QMainWindow):
         page, layout = self._page(
             "平台 Cookie",
             "公开视频无需 Cookie；遇到登录、年龄或机器人验证时才会使用。"
-            "选择平台后导入 Netscape 格式的 cookies.txt。",
+            "macOS 会尝试自动读取浏览器 Cookie；也可导入 Netscape 格式的 cookies.txt。"
+            "Windows 请手动导入 Cookie 文件。",
         )
         self._platform_buttons: dict[str, QPushButton] = {}
         self._cookie_labels: dict[str, QLabel] = {}
@@ -278,10 +279,15 @@ class MainWindow(QMainWindow):
         self._import_cookie_btn.setObjectName("primaryBtn")
         self._clear_cookie_btn = QPushButton("清除")
         self._clear_cookie_btn.setObjectName("dangerBtn")
+        self._reload_browser_cookie_btn = QPushButton("重新读取浏览器")
+        self._reload_browser_cookie_btn.setToolTip(
+            "重新检测浏览器并导出 Cookie（建议先关闭 Chrome/Edge）"
+        )
         self._remember_cookie_checkbox = QCheckBox("记住为默认")
         self._remember_cookie_checkbox.setToolTip("勾选后保存为该平台默认 Cookie")
         action_row.addWidget(self._import_cookie_btn)
         action_row.addWidget(self._clear_cookie_btn)
+        action_row.addWidget(self._reload_browser_cookie_btn)
         action_row.addSpacing(8)
         action_row.addWidget(self._remember_cookie_checkbox)
         action_row.addStretch(1)
@@ -500,6 +506,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self._import_cookie_btn.clicked.connect(self._on_import_cookie)
         self._clear_cookie_btn.clicked.connect(self._on_clear_cookie)
+        self._reload_browser_cookie_btn.clicked.connect(self._on_reload_browser_cookie)
         self._load_csv_btn.clicked.connect(self._on_load_csv)
         self._load_folder_btn.clicked.connect(self._on_load_folder)
         self._add_url_btn.clicked.connect(self._on_add_url)
@@ -629,11 +636,19 @@ class MainWindow(QMainWindow):
 
     def _refresh_cookie_ui(self) -> None:
         files = getattr(self._downloader, "_platform_cookiefiles", {}) or {}
+        browser_src = getattr(self._downloader, "_cookies_spec", None)
+        cookiefile = getattr(self._downloader, "_cookiefile_path", None)
         for plat in _PLATFORM_KEYS:
             label = self._cookie_labels[plat.value]
             path = files.get(plat.value)
             if path:
                 label.setText(f"Cookie：已配置 ({Path(path).name})")
+                label.setObjectName("cookieOk")
+            elif plat.value == "youtube" and cookiefile:
+                label.setText(f"Cookie：已配置 ({Path(cookiefile).name})")
+                label.setObjectName("cookieOk")
+            elif plat.value == "youtube" and browser_src:
+                label.setText(f"Cookie：浏览器 {browser_src}")
                 label.setObjectName("cookieOk")
             else:
                 label.setText("Cookie：未配置")
@@ -674,6 +689,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText("Cookie 已加载，正在后台验证...")
         self._import_cookie_btn.setEnabled(False)
         self._clear_cookie_btn.setEnabled(False)
+        self._reload_browser_cookie_btn.setEnabled(False)
         self._start_cookie_validation()
 
     def _start_cookie_validation(self) -> None:
@@ -686,6 +702,7 @@ class MainWindow(QMainWindow):
     def _on_cookie_validated(self, ok: bool, msg: str) -> None:
         self._import_cookie_btn.setEnabled(True)
         self._clear_cookie_btn.setEnabled(True)
+        self._reload_browser_cookie_btn.setEnabled(True)
         self._refresh_cookie_ui()
         if ok:
             self._log(f"  {msg}")
@@ -723,6 +740,31 @@ class MainWindow(QMainWindow):
         self._refresh_cookie_ui()
         self._log(f"已清除 {self._selected_platform.label} Cookie")
         self._status_label.setText("Cookie 已清除")
+
+    def _on_reload_browser_cookie(self) -> None:
+        if self._is_busy():
+            QMessageBox.warning(self, "请稍候", "当前正在下载或验证 Cookie。")
+            return
+        # 清掉当前文件，强制重新检测 / 导出
+        self._downloader._cookiefile_path = None  # noqa: SLF001
+        self._downloader._cookiefile_platform = None  # noqa: SLF001
+        self._downloader._browser_cookie_broken = False  # noqa: SLF001
+        ok = self._downloader.redetect_browser()
+        self._refresh_cookie_ui()
+        src = self._downloader.cookie_source()
+        if ok or src:
+            self._log(f"已重新读取浏览器 Cookie: {src or 'browser'}")
+            self._status_label.setText(f"Cookie 已更新: {src}")
+            if self._downloader._cookiefile_path:  # noqa: SLF001
+                self._start_cookie_validation()
+        else:
+            self._log("未能从浏览器读取 Cookie（请关闭浏览器后重试，或手动导入）")
+            self._status_label.setText("未检测到浏览器 Cookie")
+            QMessageBox.warning(
+                self,
+                "重新读取失败",
+                "未能从浏览器读取 Cookie。\n请关闭 Chrome/Edge 后重试，或使用「导入 Cookie」。",
+            )
 
     # ------------------------------------------------------------------
     # Import / queue
@@ -872,11 +914,20 @@ class MainWindow(QMainWindow):
             name = self._unique_queue_rel(inp.rel, seen_names)
             seen_names.add(name)
             output_dir = self._resolve_import_output_dir(rows)
-            row_numbers = {
-                row["video_id"]: int(row.get("_row") or index)
-                for index, row in enumerate(rows, start=1)
-            }
-            self._csv_queue.append((name, list(dict.fromkeys(ids)), output_dir, row_numbers))
+            # 保留首次出现的行号；同源同 ID 合并（总览键限制）
+            unique_ids = list(dict.fromkeys(ids))
+            if len(unique_ids) < len(ids):
+                self._log(
+                    f"同源重复 ID 已合并: {inp.rel} "
+                    f"{len(ids) - len(unique_ids)} 行（只保留首次）"
+                )
+            # 只记首次出现的行号（总览键为来源+id，无法保留重复行）
+            row_numbers: dict[str, int] = {}
+            for index, row in enumerate(rows, start=1):
+                vid = row["video_id"]
+                if vid not in row_numbers:
+                    row_numbers[vid] = int(row.get("_row") or index)
+            self._csv_queue.append((name, unique_ids, output_dir, row_numbers))
 
         if errors:
             QMessageBox.critical(self, "文件错误", "\n".join(errors))
@@ -1013,6 +1064,8 @@ class MainWindow(QMainWindow):
         self._output_input.setEnabled(not downloading)
         self._browse_btn.setEnabled(not downloading)
         self._import_cookie_btn.setEnabled(not downloading)
+        self._clear_cookie_btn.setEnabled(not downloading)
+        self._reload_browser_cookie_btn.setEnabled(not downloading)
         self._brutal_checkbox.setEnabled(not downloading)
         if overlay_enabled():
             updating = (

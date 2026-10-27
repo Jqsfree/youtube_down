@@ -95,6 +95,7 @@ def test_gui_apply_cookie_uses_selected_platform(tmp_path: Path, monkeypatch: py
     window._worker = None
     window._import_cookie_btn = type("B", (), {"setEnabled": lambda *a, **k: None})()
     window._clear_cookie_btn = type("B", (), {"setEnabled": lambda *a, **k: None})()
+    window._reload_browser_cookie_btn = type("B", (), {"setEnabled": lambda *a, **k: None})()
     window._status_label = type("L", (), {"setText": lambda *a, **k: None})()
     window._cookie_labels = {}
     window._base_title = "t"

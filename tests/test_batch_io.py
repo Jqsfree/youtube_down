@@ -118,6 +118,12 @@ def test_overview_upsert_dedups_and_sorts(tmp_path: Path) -> None:
     assert OverviewStore(tmp_path).completed_ids("x") == set()
 
 
+def test_completed_ids_ignores_success_without_output_file(tmp_path: Path) -> None:
+    store = OverviewStore(tmp_path)
+    store.upsert(source="x", row_no=1, media_id="aaa", status="success", output_file="")
+    assert store.completed_ids("x") == set()
+
+
 def test_overview_concurrent_upserts(tmp_path: Path) -> None:
     store = OverviewStore(tmp_path)
 

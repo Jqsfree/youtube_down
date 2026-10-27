@@ -10,6 +10,8 @@ from download_cli import (  # noqa: E402
     pick_next_clash_node,
     warn_datacenter_ip,
 )
+from downloader import NORMAL_YDL_OPTS  # noqa: E402
+from pacing import AdaptivePacer as SharedAdaptivePacer  # noqa: E402
 
 
 def test_collect_completed_ids_requires_valid_media(tmp_path: Path, monkeypatch) -> None:
@@ -57,7 +59,8 @@ def test_iter_sources_mirrors_folder_and_pastes(tmp_path: Path) -> None:
         sources=[str(src), "https://www.youtube.com/shorts/S4d2AB_unnw"], input_root=None,
     )
 
-    jobs = download_cli._iter_sources(args, out)
+    jobs, dups = download_cli._iter_sources(args, out)
+    assert dups == []
 
     by_id = {job.media_id: job for job in jobs}
     assert by_id["dQw4w9WgXcQ"].out_dir == out / "舞蹈" / "擦边"
@@ -68,11 +71,34 @@ def test_iter_sources_mirrors_folder_and_pastes(tmp_path: Path) -> None:
     assert by_id["S4d2AB_unnw"].stem == "0001_S4d2AB_unnw"
 
 
-def test_cli_ydl_opts_never_zero_sleep() -> None:
+def test_iter_sources_reports_duplicate_rows(tmp_path: Path) -> None:
+    """表内去重后，同一输入路径重复出现仍应被 CLI 第二层去重并汇报。"""
+    import argparse
+
+    import download_cli
+
+    csv_path = tmp_path / "dup.csv"
+    csv_path.write_text(
+        "url\nhttps://www.youtube.com/watch?v=dQw4w9WgXcQ\n",
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(sources=[str(csv_path), str(csv_path)], input_root=None)
+    jobs, dups = download_cli._iter_sources(args, tmp_path / "out")
+    assert len(jobs) == 1
+    assert len(dups) == 1
+    assert jobs[0].media_id == dups[0].media_id == "dQw4w9WgXcQ"
+
+
+def test_cli_ydl_opts_aligns_with_normal() -> None:
+    assert CLI_YDL_OPTS == NORMAL_YDL_OPTS
     assert CLI_YDL_OPTS["sleep_interval"] >= 1
     assert CLI_YDL_OPTS["max_sleep_interval"] >= CLI_YDL_OPTS["sleep_interval"]
     assert CLI_YDL_OPTS["sleep_interval_requests"] >= 0.5
-    assert CLI_YDL_OPTS["concurrent_fragment_downloads"] >= 8
+    assert CLI_YDL_OPTS["concurrent_fragment_downloads"] == 12
+
+
+def test_adaptive_pacer_reexported_from_pacing() -> None:
+    assert AdaptivePacer is SharedAdaptivePacer
 
 
 def test_adaptive_pacer_speeds_up_after_ok_streak() -> None:
@@ -88,6 +114,53 @@ def test_adaptive_pacer_backoff_on_bot() -> None:
     pacer.on_bot_or_rate_limit()
     assert pacer.sleep_min == 4.0
     assert pacer.sleep_max == 8.0
+
+
+def test_brutal_does_not_override_explicit_workers(monkeypatch) -> None:
+    import download_cli
+
+    args = download_cli.parse_args(
+        ["--brutal", "--workers", "3", "--fragment-workers", "4", "-o", "/tmp/out", "dQw4w9WgXcQ"]
+    )
+    assert args.brutal is True
+    assert args.workers == 3
+    assert args.fragment_workers == 4
+
+
+def test_brutal_defaults_workers_when_omitted() -> None:
+    import download_cli
+
+    args = download_cli.parse_args(["--brutal", "-o", "/tmp/out", "dQw4w9WgXcQ"])
+    # parse_args 本身不填默认；main 里填。这里验证 None 语义。
+    assert args.workers is None
+    assert args.fragment_workers is None
+
+
+def test_download_one_always_uses_cookies(tmp_path, monkeypatch) -> None:
+    import download_cli
+
+    cookie = tmp_path / "cookies.txt"
+    cookie.write_text("# Netscape\n.youtube.com\tTRUE\t/\tFALSE\t0\tSID\tx\n" * 5)
+    calls: list[bool] = []
+
+    def fake_download(*args, use_cookies=True, **kwargs):
+        calls.append(use_cookies)
+        out = tmp_path / "ok.mp4"
+        out.write_bytes(b"0" * 2048)
+        return out
+
+    monkeypatch.setattr(download_cli, "_remove_media_files", lambda *a, **k: None)
+
+    class FakeDL:
+        def download(self, *a, **k):
+            return fake_download(*a, **k)
+
+    monkeypatch.setattr(download_cli, "_make_downloader", lambda *a, **k: FakeDL())
+
+    result = download_cli._download_one("dQw4w9WgXcQ", tmp_path, cookie, 0)
+    assert calls == [True]
+    assert result["status"] == "success"
+    assert result["cookie_used"] == "true"
 
 
 def test_warn_datacenter_ip(capsys) -> None:

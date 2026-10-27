@@ -12,6 +12,9 @@ class FakeDownloader:
         self.has_cookie = has_cookie
         self.calls: list[tuple[str, bool, dict]] = []
 
+    def clear_cancel(self) -> None:
+        self._cancelled = False
+
     def has_cookie_for_source(self, source: str) -> bool:
         return self.has_cookie
 
@@ -135,9 +138,39 @@ def test_batches_share_single_overview(tmp_path: Path) -> None:
     assert not list(tmp_path.rglob("failed_videos_*.csv"))
 
 
-def test_legacy_batch_results_still_resume(tmp_path: Path) -> None:
+def test_legacy_batch_results_still_resume(tmp_path: Path, monkeypatch) -> None:
     from batch_io import OverviewStore
 
+    (tmp_path / "batch_results_20250101.csv").write_text(
+        "video_id,status\ndQw4w9WgXcQ,success\n", encoding="utf-8",
+    )
+    out = tmp_path / "list"
+    out.mkdir()
+    existing = out / "dQw4w9WgXcQ.mp4"
+    existing.write_bytes(b"x" * 2048)
+    monkeypatch.setattr(
+        "worker._check_existing",
+        lambda video_id, output_dir, min_height=0: existing,
+    )
+    downloader = FakeDownloader()
+    worker = BatchDownloadWorker(
+        downloader=downloader,
+        video_ids=["dQw4w9WgXcQ"],
+        format_id="22",
+        output_dir=out,
+        results_dir=tmp_path,
+    )
+
+    worker.run()
+
+    assert downloader.calls == []
+    rows = OverviewStore(tmp_path).rows()
+    assert [(r["来源文件"], r["状态"]) for r in rows] == [("list", "成功")]
+    assert rows[0]["输出文件"]
+
+
+def test_legacy_batch_results_without_file_redownloads(tmp_path: Path) -> None:
+    """旧 CSV 标成功但磁盘无文件时必须重下，不能空路径写成功。"""
     (tmp_path / "batch_results_20250101.csv").write_text(
         "video_id,status\ndQw4w9WgXcQ,success\n", encoding="utf-8",
     )
@@ -152,9 +185,7 @@ def test_legacy_batch_results_still_resume(tmp_path: Path) -> None:
 
     worker.run()
 
-    assert downloader.calls == []
-    rows = OverviewStore(tmp_path).rows()
-    assert [(r["来源文件"], r["状态"]) for r in rows] == [("list", "成功")]
+    assert any(c[0] == "download" for c in downloader.calls)
 
 
 def test_existing_candidates_match_old_and_row_prefixed_names(tmp_path: Path) -> None:

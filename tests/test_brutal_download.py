@@ -96,6 +96,28 @@ def test_cancel_coordinator_propagates(downloader_no_init: YoutubeDownloader) ->
     assert downloader_no_init._is_cancelled() is True
 
 
+def test_download_does_not_clear_shared_cancel(
+    tmp_path: Path, downloader_no_init: YoutubeDownloader, monkeypatch,
+) -> None:
+    """并行会话：某线程进入 download 不得清掉共享取消标志。"""
+    clone = downloader_no_init.clone_for_worker()
+    downloader_no_init.cancel()
+    assert clone._is_cancelled() is True
+
+    monkeypatch.setattr(
+        "downloader.yt_dlp.YoutubeDL",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("should not run")),
+    )
+    # 即使 download 在 yt-dlp 前抛错，也不得把 cancel 清掉
+    try:
+        clone.download("dQw4w9WgXcQ", "best", tmp_path, use_cookies=False)
+    except Exception:
+        pass
+    assert downloader_no_init._is_cancelled() is True
+    downloader_no_init.clear_cancel()
+    assert downloader_no_init._is_cancelled() is False
+
+
 def test_brutal_max_workers_downgrades_for_browser_cookies(
     tmp_path: Path, downloader_no_init: YoutubeDownloader,
 ) -> None:

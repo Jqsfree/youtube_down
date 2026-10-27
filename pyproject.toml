@@ -32,6 +32,7 @@ py-modules = [
     "gui_log",
     "logger_utils",
     "main",
+    "pacing",
     "theme",
     "worker",
     "yt_dlp_updater",

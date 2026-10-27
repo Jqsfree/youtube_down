@@ -263,7 +263,10 @@ _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
     # (类别代码,  重试Cookie, 关键词列表)
     ("CANCELLED",          False, ["下载已取消", "cancel"]),
     ("BOT_VERIFICATION",   True,  [
+        "sign in to confirm you're not a bot",
+        "confirm you're not a bot",
         "not a bot",
+        "captcha",
     ]),
     ("AUTH_REQUIRED",      True,  [
         "sign in to confirm your age",
@@ -275,6 +278,7 @@ _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
     ("PRIVATE_VIDEO",      True,  ["private video", "this video is private"]),
     ("RATE_LIMIT",         False, [
         "http error 429", "too many requests",
+        "rate-limited", "rate limited",
         "this content isn't available, try again later",
     ]),
     ("VIDEO_UNAVAILABLE",  False, [
@@ -296,6 +300,18 @@ _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
     ]),
 ]
 
+# 正常下载：分片并发与 sleep 偏快；视频间间隔交给 AdaptivePacer
+NORMAL_YDL_OPTS: dict[str, Any] = {
+    "concurrent_fragment_downloads": 12,
+    "file_access_retries": 5,
+    "fragment_retries": 5,
+    "extractor_retries": 10,
+    "retries": 10,
+    "sleep_interval": 1,
+    "max_sleep_interval": 3,
+    "sleep_interval_requests": 0.5,
+}
+
 # 暴力下载：更高重试、更短 sleep、分片并发上限 8
 BRUTAL_YDL_OPTS: dict[str, Any] = {
     "concurrent_fragment_downloads": 8,
@@ -310,6 +326,41 @@ BRUTAL_YDL_OPTS: dict[str, Any] = {
 
 BRUTAL_MAX_WORKERS = 8
 BRUTAL_EXTRA_RETRIES = 2
+BOT_STREAK_LIMIT = 2
+
+# macOS 自动导出的 Netscape Cookie 落盘路径（不强制 persist 到用户「记住」配置）
+_AUTO_BROWSER_COOKIE_FILE = _COOKIE_CONFIG_DIR / "auto_browser_cookies.txt"
+
+
+def dump_browser_cookies(browser_spec: str, dest: Path) -> Path:
+    """从浏览器导出 Netscape cookies（CLI / GUI 共用）。"""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    parts = tuple(p for p in browser_spec.split(":") if p)
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "skip_download": True,
+        "cookiesfrombrowser": parts,
+        "cookiefile": str(dest),
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        try:
+            ydl.cookiejar  # 触发从浏览器加载
+        except Exception:
+            pass
+        cookiejar = getattr(ydl, "cookiejar", None)
+        if cookiejar is not None and hasattr(cookiejar, "save"):
+            cookiejar.save(filename=str(dest), ignore_discard=True, ignore_expires=True)
+    if not dest.is_file() or dest.stat().st_size < 80:
+        raise RuntimeError(
+            f"无法从浏览器导出 Cookie（{browser_spec}）。"
+            "请关闭浏览器后重试，或改用导入 cookies.txt"
+        )
+    return dest
 
 
 @dataclass
@@ -407,6 +458,9 @@ class YoutubeDownloader:
             else:
                 info = self.detect_browser()
                 self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
+                # macOS：尽量导出一次为 cookie 文件；失败则保留 cookiesfrombrowser
+                if sys.platform == "darwin" and self._cookies_spec:
+                    self._try_autoload_browser_cookies()
         else:
             self._cookies_spec = cookies_from_browser
         self._cancel_coordinator: YoutubeDownloader | None = None
@@ -503,10 +557,24 @@ class YoutubeDownloader:
         return None
 
     @staticmethod
+    def _chromium_cookie_profile(user_data_dir: str) -> str | None:
+        """在 Chromium 系 User Data 目录中找第一个含 Cookies 的 Profile。"""
+        if not os.path.isdir(user_data_dir):
+            return None
+        profiles = ["Default"] + sorted(
+            d for d in os.listdir(user_data_dir)
+            if d.startswith("Profile ") and os.path.isdir(os.path.join(user_data_dir, d))
+        )
+        for profile in profiles:
+            if os.path.isfile(os.path.join(user_data_dir, profile, "Cookies")):
+                return profile
+        return None
+
+    @staticmethod
     def detect_browser() -> tuple[str, str] | None:
         """自动检测系统中可用的浏览器及 Profile。
 
-        按优先级：Chrome(Default→Profile*) → Firefox → Edge → ...
+        按优先级：Chrome(Default→Profile*) → Edge → Brave → Firefox → ...
 
         Returns:
             (browser_name, profile_name) 或 None。
@@ -514,69 +582,56 @@ class YoutubeDownloader:
         if os.name == "nt":
             localappdata = os.environ.get("LOCALAPPDATA", "")
             appdata = os.environ.get("APPDATA", "")
-
-            # Chrome — 多 Profile
-            chrome_dir = os.path.join(localappdata, "Google", "Chrome", "User Data")
-            if os.path.isdir(chrome_dir):
-                profiles = ["Default"] + sorted(
-                    d for d in os.listdir(chrome_dir)
-                    if d.startswith("Profile ") and os.path.isdir(os.path.join(chrome_dir, d))
-                )
-                for profile in profiles:
-                    if os.path.isfile(os.path.join(chrome_dir, profile, "Cookies")):
-                        return ("chrome", profile)
-
-            # Firefox
+            candidates = (
+                ("chrome", os.path.join(localappdata, "Google", "Chrome", "User Data")),
+                ("edge", os.path.join(localappdata, "Microsoft", "Edge", "User Data")),
+                ("brave", os.path.join(
+                    localappdata, "BraveSoftware", "Brave-Browser", "User Data",
+                )),
+            )
+            for name, path in candidates:
+                profile = YoutubeDownloader._chromium_cookie_profile(path)
+                if profile:
+                    return (name, profile)
             firefox_dir = os.path.join(appdata, "Mozilla", "Firefox", "Profiles")
             if os.path.isdir(firefox_dir):
                 return ("firefox", "default")
-
-            # Edge
-            edge_dir = os.path.join(localappdata, "Microsoft", "Edge", "User Data")
-            if os.path.isdir(edge_dir):
-                return ("edge", "Default")
-
             return None
 
-        # Linux / macOS
         home = os.path.expanduser("~")
-
-        # Chrome
-        chrome_dir = os.path.join(home, ".config/google-chrome")
-        if os.path.isdir(chrome_dir):
-            profiles = ["Default"] + sorted(
-                d for d in os.listdir(chrome_dir)
-                if d.startswith("Profile ") and os.path.isdir(os.path.join(chrome_dir, d))
+        # macOS：Application Support（无 User Data 层）
+        if sys.platform == "darwin":
+            mac_app = os.path.join(home, "Library", "Application Support")
+            mac_candidates = (
+                ("chrome", os.path.join(mac_app, "Google", "Chrome")),
+                ("edge", os.path.join(mac_app, "Microsoft Edge")),
+                ("brave", os.path.join(mac_app, "BraveSoftware", "Brave-Browser")),
+                ("chromium", os.path.join(mac_app, "Chromium")),
+                ("opera", os.path.join(mac_app, "com.operasoftware.Opera")),
             )
-            for profile in profiles:
-                cookie_file = os.path.join(chrome_dir, profile, "Cookies")
-                if os.path.isfile(cookie_file):
-                    return ("chrome", profile)
+            for name, path in mac_candidates:
+                profile = YoutubeDownloader._chromium_cookie_profile(path)
+                if profile:
+                    return (name, profile)
+            firefox_dir = os.path.join(mac_app, "Firefox", "Profiles")
+            if os.path.isdir(firefox_dir):
+                return ("firefox", "default")
 
-        # Firefox
+        # Linux（及 macOS 上可能存在的 Linux 风格路径）
+        linux_candidates = (
+            ("chrome", os.path.join(home, ".config/google-chrome")),
+            ("edge", os.path.join(home, ".config/microsoft-edge")),
+            ("brave", os.path.join(home, ".config/BraveSoftware/Brave-Browser")),
+            ("chromium", os.path.join(home, ".config/chromium")),
+            ("opera", os.path.join(home, ".config/opera")),
+        )
+        for name, path in linux_candidates:
+            profile = YoutubeDownloader._chromium_cookie_profile(path)
+            if profile:
+                return (name, profile)
         firefox_dir = os.path.join(home, ".mozilla/firefox")
         if os.path.isdir(firefox_dir):
             return ("firefox", "default")
-
-        # Edge
-        edge_dir = os.path.join(home, ".config/microsoft-edge")
-        if os.path.isdir(edge_dir):
-            return ("edge", "Default")
-
-        # Chromium
-        chromium_dir = os.path.join(home, ".config/chromium")
-        if os.path.isdir(chromium_dir):
-            return ("chromium", "Default")
-
-        # Brave
-        brave_dir = os.path.join(home, ".config/BraveSoftware/Brave-Browser")
-        if os.path.isdir(brave_dir):
-            return ("brave", "Default")
-
-        # Opera
-        opera_dir = os.path.join(home, ".config/opera")
-        if os.path.isdir(opera_dir):
-            return ("opera", "Default")
 
         return None
 
@@ -667,14 +722,13 @@ class YoutubeDownloader:
             "quiet": True,
             "no_warnings": True,
             "logger": _QuietLogger(),
-            # 网络韧性
-            "extractor_retries": 10,
-            "retries": 10,
+            # 网络韧性 / 节奏：与 NORMAL_YDL_OPTS 对齐（download 路径还会再合并一次）
+            "extractor_retries": NORMAL_YDL_OPTS["extractor_retries"],
+            "retries": NORMAL_YDL_OPTS["retries"],
             "socket_timeout": 20,
-            # 请求节奏控制（yt-dlp 官方建议：访客 ~300/h，登录 ~2000/h）
-            "sleep_interval": 3,
-            "max_sleep_interval": 8,
-            "sleep_interval_requests": 1.5,
+            "sleep_interval": NORMAL_YDL_OPTS["sleep_interval"],
+            "max_sleep_interval": NORMAL_YDL_OPTS["max_sleep_interval"],
+            "sleep_interval_requests": NORMAL_YDL_OPTS["sleep_interval_requests"],
             # 内部重试退避
             "retry_sleep_functions": {
                 "http": lambda n: min(4 * (2 ** n), 60),
@@ -706,10 +760,27 @@ class YoutubeDownloader:
             elif cookies_spec:
                 parts = cookies_spec.split(":")
                 opts["cookiesfrombrowser"] = tuple(parts)  # type: ignore[assignment]
+            # 不在此处默认强制 mweb：单独 mweb 常只返回少量格式，导致
+            # min_height≥720 时出现 "Requested format is not available"。
+            # 需要 mweb/PO Token 时由 CLI --pot 或 ydl_opt_overrides 显式开启。
         opts.update(extra)  # extra 中的 extractor_args 会覆盖默认值
         overrides = getattr(self, "_ydl_opt_overrides", None)
         if overrides:
-            opts.update(overrides)
+            # 深层合并 youtube extractor_args，避免整表替换丢掉 player_client
+            override_ea = overrides.get("extractor_args")
+            if isinstance(override_ea, dict):
+                merged_ea = dict(opts.get("extractor_args") or {})
+                for site, site_args in override_ea.items():
+                    if isinstance(site_args, dict):
+                        base_site = dict(merged_ea.get(site) or {})
+                        base_site.update(site_args)
+                        merged_ea[site] = base_site
+                    else:
+                        merged_ea[site] = site_args
+                opts.update({k: v for k, v in overrides.items() if k != "extractor_args"})
+                opts["extractor_args"] = merged_ea
+            else:
+                opts.update(overrides)
         return opts
 
     # ------------------------------------------------------------------
@@ -727,7 +798,7 @@ class YoutubeDownloader:
 
         Args:
             video_id: YouTube/Bilibili ID 或完整 URL。
-            use_cookies: 是否使用浏览器 Cookie。默认 False。
+            use_cookies: 是否使用浏览器 Cookie。默认 True。
 
         Returns:
             yt-dlp info dict（title, uploader, duration, formats 等）。
@@ -923,14 +994,17 @@ class YoutubeDownloader:
                 Video+Audio 格式传 False 避免双音轨。
             filename_stem: 输出文件名（不含扩展名）；为空时用媒体 ID。
         """
-        owner = self._cancel_coordinator or self
-        with owner._cancel_lock:
-            owner._cancelled = False
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_template = str(output_dir / f"{filename_stem or '%(id)s'}.%(ext)s")
         media = self.parse_input(video_id)
         url = media.url
+        # 与 get_info 一致：浏览器 Cookie 已坏且无显式 cookie 文件时禁用
+        has_explicit = self._has_explicit_cookie(
+            media, cookiefile_override, cookies_from_browser_override
+        )
+        if self._browser_cookie_broken and not has_explicit:
+            use_cookies = False
 
         def _progress_hook(d: dict[str, Any]) -> None:
             if progress_callback:
@@ -957,11 +1031,7 @@ class YoutubeDownloader:
         if brutal:
             download_extras.update(BRUTAL_YDL_OPTS)
         else:
-            download_extras.update({
-                "concurrent_fragment_downloads": 16,
-                "file_access_retries": 5,
-                "fragment_retries": 5,
-            })
+            download_extras.update(NORMAL_YDL_OPTS)
         opts = self._make_opts(
             use_cookies=use_cookies,
             media=media,
@@ -1045,31 +1115,31 @@ class YoutubeDownloader:
                     capture_output=True, text=True, timeout=10,
                 )
                 height_str = height_result.stdout.strip()
-                if height_str:
-                    try:
-                        parts = [p.strip() for p in height_str.split(",") if p.strip()]
-                        dims = [int(p) for p in parts[:2]]
-                        # 竖屏按短边计档（与 format_height 一致）
-                        actual_height = min(dims) if len(dims) >= 2 else dims[0]
-                        if expected_height is not None:
-                            tolerance = max(8, int(expected_height * 0.02))
-                            if abs(actual_height - expected_height) > tolerance:
-                                raise yt_dlp.utils.DownloadError(
-                                    f"下载视频分辨率 ({actual_height}p)"
-                                    f" 与目标档位 ({expected_height}p) 不符"
-                                )
-                        elif actual_height < min_height:
+                if not height_str:
+                    raise yt_dlp.utils.DownloadError(
+                        "无法校验视频分辨率：ffprobe 未返回宽高"
+                    )
+                try:
+                    parts = [p.strip() for p in height_str.split(",") if p.strip()]
+                    dims = [int(p) for p in parts[:2]]
+                    # 竖屏按短边计档（与 format_height 一致）
+                    actual_height = min(dims) if len(dims) >= 2 else dims[0]
+                    if expected_height is not None:
+                        tolerance = max(8, int(expected_height * 0.02))
+                        if abs(actual_height - expected_height) > tolerance:
                             raise yt_dlp.utils.DownloadError(
                                 f"下载视频分辨率 ({actual_height}p)"
-                                f" 低于最低要求 ({min_height}p)"
+                                f" 与目标档位 ({expected_height}p) 不符"
                             )
-                    except ValueError:
-                        AppLogger.get_logger().warning(
-                            "无法解析视频高度用于分辨率校验: height_str=%s, file=%s",
-                            height_str, path.name,
+                    elif actual_height < min_height:
+                        raise yt_dlp.utils.DownloadError(
+                            f"下载视频分辨率 ({actual_height}p)"
+                            f" 低于最低要求 ({min_height}p)"
                         )
-                    except yt_dlp.utils.DownloadError:
-                        raise
+                except ValueError as exc:
+                    raise yt_dlp.utils.DownloadError(
+                        f"无法解析视频分辨率用于校验: {height_str!r}"
+                    ) from exc
 
             return path
 
@@ -1085,6 +1155,12 @@ class YoutubeDownloader:
             name = path.name.lower()
             if name.endswith(".part") or fragment_pattern.match(name):
                 path.unlink(missing_ok=True)
+
+    def clear_cancel(self) -> None:
+        """清除取消标志。仅在新会话（单视频/批跑）开始时调用，勿在 download() 内调用。"""
+        owner = self._cancel_coordinator or self
+        with owner._cancel_lock:
+            owner._cancelled = False
 
     def cancel(self) -> None:
         """取消当前下载（线程安全；协调器会取消所有 clone）。"""
@@ -1662,17 +1738,38 @@ class YoutubeDownloader:
             return media.url
         return ""
 
-    def redetect_browser(self) -> bool:
-        """重新检测浏览器（Profile 可能已切换）。
-        返回 True 表示检测到了新的 Cookie 源。
+    def _try_autoload_browser_cookies(self) -> bool:
+        """尝试把浏览器 Cookie 导出为文件；成功返回 True。
+
+        仅应在已设置 ``_cookies_spec`` 且尚无 cookie 文件时调用。
         """
-        old = self._cookies_spec
+        if not self._cookies_spec:
+            return False
+        try:
+            dump_browser_cookies(self._cookies_spec, _AUTO_BROWSER_COOKIE_FILE)
+            self.set_cookiefile(
+                _AUTO_BROWSER_COOKIE_FILE,
+                persist=False,
+                preferred_platform="youtube",
+            )
+            return True
+        except Exception:
+            # 锁库 / 钥匙串拒绝 / 无 youtube 域名：保留 cookiesfrombrowser
+            return False
+
+    def redetect_browser(self) -> bool:
+        """重新检测浏览器（Profile 可能已切换），macOS 上会再尝试导出文件。
+
+        返回 True 表示检测到了可用的 Cookie 源（文件或浏览器）。
+        """
         info = self.detect_browser()
         self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
-        changed = self._cookies_spec is not None
-        if changed and self._cookies_spec == old:
-            changed = False  # 没变，不算重载成功
-        return changed
+        self._browser_cookie_broken = False
+        if not self._cookies_spec:
+            return False
+        if sys.platform == "darwin" and self._try_autoload_browser_cookies():
+            return True
+        return True
 
     # ------------------------------------------------------------------
     # 内部辅助

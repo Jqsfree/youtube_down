@@ -24,6 +24,7 @@ from batch_io import (
     media_id_from_stem,
 )
 from downloader import (
+    BOT_STREAK_LIMIT,
     BRUTAL_EXTRA_RETRIES,
     BRUTAL_MAX_WORKERS,
     ErrorCategory,
@@ -34,6 +35,11 @@ from downloader import (
     is_brutal_retryable,
 )
 from logger_utils import AppLogger
+from pacing import AdaptivePacer
+
+# GUI 顺序批量默认间隔（与 CLI --sleep-min/max 默认对齐）
+_GUI_SLEEP_MIN = 2.0
+_GUI_SLEEP_MAX = 4.0
 
 # DownloaderFacade is the architectural name; concrete class remains YoutubeDownloader.
 DownloaderFacade = YoutubeDownloader
@@ -64,7 +70,27 @@ def _existing_candidates(stem: str, output_dir: Path) -> list[Path]:
     )
 
 
-def _check_existing(video_id: str, output_dir: Path) -> Path | None:
+def _probe_short_side(path: Path) -> int | None:
+    """ffprobe 视频短边；无法解析时返回 None。"""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            [_find_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        parts = [p.strip() for p in r.stdout.strip().split(",") if p.strip()]
+        dims = [int(p) for p in parts[:2]]
+        if len(dims) >= 2:
+            return min(dims)
+        return dims[0] if dims else None
+    except Exception:
+        return None
+
+
+def _check_existing(
+    video_id: str, output_dir: Path, min_height: int = 0,
+) -> Path | None:
     """检查输出目录是否已有此视频的有效文件（用于去重）。"""
     import subprocess as _sp
     stem = _media_stem(video_id)
@@ -77,14 +103,20 @@ def _check_existing(video_id: str, output_dir: Path) -> Path | None:
                  "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(candidate)],
                 capture_output=True, text=True, timeout=10,
             )
-            if r.returncode == 0 and r.stdout.strip() == "video":
-                r2 = _sp.run(
-                    [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
-                     "format=duration", "-of", "csv=p=0", str(candidate)],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if r2.returncode == 0 and r2.stdout.strip():
-                    return candidate
+            if r.returncode != 0 or r.stdout.strip() != "video":
+                continue
+            r2 = _sp.run(
+                [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
+                 "format=duration", "-of", "csv=p=0", str(candidate)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r2.returncode != 0 or not r2.stdout.strip():
+                continue
+            if min_height > 0:
+                short = _probe_short_side(candidate)
+                if short is None or short < min_height:
+                    continue
+            return candidate
         except Exception:
             pass
     return None
@@ -131,8 +163,12 @@ class DownloadWorker(QThread):
 
     def run(self) -> None:
         """在后台线程中执行下载。"""
+        if hasattr(self._downloader, "clear_cancel"):
+            self._downloader.clear_cancel()
         # 去重检查
-        existing = _check_existing(self._video_id, self._output_dir)
+        existing = _check_existing(
+            self._video_id, self._output_dir, min_height=self._min_height,
+        )
         if existing:
             self.finished.emit(str(existing))
             return
@@ -363,6 +399,8 @@ class BatchDownloadWorker(QThread):
 
     def run(self) -> None:
         """按顺序或暴力并行下载所有 video_id。增量写入 + 续传。"""
+        if hasattr(self._downloader, "clear_cancel"):
+            self._downloader.clear_cancel()
         total = len(self._video_ids)
         overview_done = self._overview.completed_ids(self._source_rel)
         legacy_done = self._load_completed_ids()
@@ -383,32 +421,93 @@ class BatchDownloadWorker(QThread):
                 resumed += 1
                 continue
             if vid in legacy_done or stem in legacy_done:
-                self._log_resume_skip(i, total, vid)
-                self._record(vid, "", "success")
-                resumed += 1
-                continue
+                existing = _check_existing(
+                    vid, self._output_dir, min_height=self._min_height,
+                )
+                if existing:
+                    self._log_resume_skip(i, total, vid)
+                    self._record(vid, "", "success", output_file=str(existing))
+                    resumed += 1
+                    continue
             pending.append((i, vid))
 
         if self._brutal_mode and pending:
             d, f, s, results = self._run_brutal_parallel(pending, total, results)
             downloaded, fail_count, skip_count = d, f, s
         else:
-            for i, vid in pending:
-                if self._is_cancelled():
-                    break
-                row = self._process_one_video(i, vid, total)
-                results.append(row)
-                if row["status"] == "success":
-                    downloaded += 1
-                elif row["status"] == "skipped":
-                    skip_count += 1
-                else:
-                    fail_count += 1
+            downloaded, fail_count, skip_count, results = self._run_sequential(
+                pending, total, results,
+            )
 
         overview_path = str(self._overview.path)
         self.all_progress_changed.emit(100)
         self.all_finished.emit(downloaded + resumed, fail_count, skip_count, overview_path)
         self.status_changed.emit(f"批量下载完成，总览: {overview_path}")
+
+    @staticmethod
+    def _is_bot_or_rate(row: dict[str, str]) -> bool:
+        cat = row.get("error_category") or ""
+        if cat in {"BOT_VERIFICATION", "RATE_LIMIT"}:
+            return True
+        err = (row.get("error_message") or "").lower()
+        return "not a bot" in err or "captcha" in err
+
+    def _run_sequential(
+        self,
+        pending: list[tuple[int, str]],
+        total: int,
+        results: list[dict[str, str]],
+    ) -> tuple[int, int, int, list[dict[str, str]]]:
+        """顺序批量：AdaptivePacer 间隔 + 连续 bot/429 熔断。"""
+        pacer = AdaptivePacer(_GUI_SLEEP_MIN, _GUI_SLEEP_MAX, bot_pause_sec=30.0)
+        bot_streak = 0
+        downloaded = fail_count = skip_count = 0
+        for idx, (i, vid) in enumerate(pending):
+            if self._is_cancelled():
+                break
+            if bot_streak >= BOT_STREAK_LIMIT:
+                self.status_changed.emit(
+                    "连续触发机器人验证/限流，已停止本批剩余任务"
+                )
+                for _, left_vid in pending[idx:]:
+                    row = self._result_row(
+                        left_vid, "skipped", "BOT_VERIFICATION",
+                        "风控熔断：连续 bot/限流，已跳过", False, "",
+                    )
+                    results.append(row)
+                    self._record(
+                        left_vid, "", "skipped", "BOT_VERIFICATION",
+                        row["error_message"], "",
+                    )
+                    skip_count += 1
+                break
+
+            row = self._process_one_video(i, vid, total)
+            results.append(row)
+            if row["status"] == "success":
+                downloaded += 1
+                bot_streak = 0
+                pacer.on_success()
+            elif row["status"] == "skipped":
+                skip_count += 1
+                bot_streak = 0
+                pacer.on_skip()
+            else:
+                fail_count += 1
+                if self._is_bot_or_rate(row):
+                    bot_streak += 1
+                    self.status_changed.emit(
+                        f"触发限流/bot，退避后继续（连续 {bot_streak}/{BOT_STREAK_LIMIT}）"
+                    )
+                    pacer.on_bot_or_rate_limit()
+                else:
+                    bot_streak = 0
+
+            if idx < len(pending) - 1 and not self._is_cancelled():
+                pacer.wait()
+            self.all_progress_changed.emit(int((idx + 1) / max(1, len(pending)) * 100))
+
+        return downloaded, fail_count, skip_count, results
 
     def _run_brutal_parallel(
         self,
@@ -424,7 +523,9 @@ class BatchDownloadWorker(QThread):
 
         stats_lock = threading.Lock()
         results_lock = threading.Lock()
-        stats = {"completed": 0, "downloaded": 0, "fail": 0, "skip": 0}
+        stats = {"completed": 0, "downloaded": 0, "fail": 0, "skip": 0, "bot_streak": 0}
+        stop_bot = threading.Event()
+        pending_iter = iter(pending)
 
         def _job(index: int, vid: str) -> dict[str, str]:
             row = self._process_one_video_brutal(index, vid, total)
@@ -434,10 +535,18 @@ class BatchDownloadWorker(QThread):
                 status = row["status"]
                 if status == "success":
                     stats["downloaded"] += 1
+                    stats["bot_streak"] = 0
                 elif status == "skipped":
                     stats["skip"] += 1
+                    stats["bot_streak"] = 0
                 else:
                     stats["fail"] += 1
+                    if self._is_bot_or_rate(row):
+                        stats["bot_streak"] += 1
+                        if stats["bot_streak"] >= BOT_STREAK_LIMIT:
+                            stop_bot.set()
+                    else:
+                        stats["bot_streak"] = 0
             self.all_progress_changed.emit(pct)
             self._record(
                 vid, row.get("title", ""), status, row["error_category"],
@@ -448,28 +557,67 @@ class BatchDownloadWorker(QThread):
             return row
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(_job, index, vid): (index, vid)
-                for index, vid in pending
-            }
-            for fut in as_completed(futures):
-                if self._is_cancelled():
-                    for pending_fut in futures:
-                        pending_fut.cancel()
-                    break
+            inflight: dict = {}
+
+            def _submit() -> None:
+                if stop_bot.is_set() or self._is_cancelled():
+                    return
                 try:
-                    fut.result()
-                except Exception as exc:
-                    index, vid = futures[fut]
-                    AppLogger.log_exception(exc, f"暴力下载任务异常: {vid}")
+                    index, vid = next(pending_iter)
+                except StopIteration:
+                    return
+                fut = pool.submit(_job, index, vid)
+                inflight[fut] = (index, vid)
+
+            for _ in range(max_workers):
+                _submit()
+
+            while inflight:
+                for fut in as_completed(inflight):
+                    index, vid = inflight.pop(fut)
+                    if self._is_cancelled() or stop_bot.is_set():
+                        for leftover in list(inflight):
+                            leftover.cancel()
+                        inflight.clear()
+                        break
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        AppLogger.log_exception(exc, f"暴力下载任务异常: {vid}")
+                        row = self._result_row(
+                            vid, "failed", "UNKNOWN", clean_error(exc), False, "",
+                        )
+                        self._record(vid, "", "failed", "UNKNOWN", clean_error(exc))
+                        with results_lock:
+                            results.append(row)
+                        with stats_lock:
+                            stats["fail"] += 1
+                    if stop_bot.is_set():
+                        self.status_changed.emit(
+                            "暴力模式连续触发机器人验证/限流，已停止提交新任务"
+                        )
+                        for leftover in list(inflight):
+                            leftover.cancel()
+                        inflight.clear()
+                        break
+                    _submit()
+                    break  # 重新 as_completed，纳入新提交的 future
+
+            # 未提交的剩余任务标记为风控熔断跳过
+            if stop_bot.is_set():
+                for index, vid in pending_iter:
                     row = self._result_row(
-                        vid, "failed", "UNKNOWN", clean_error(exc), False, "",
+                        vid, "skipped", "BOT_VERIFICATION",
+                        "风控熔断：连续 bot/限流，已跳过", False, "",
                     )
-                    self._record(vid, "", "failed", "UNKNOWN", clean_error(exc))
+                    self._record(
+                        vid, "", "skipped", "BOT_VERIFICATION",
+                        row["error_message"], "",
+                    )
                     with results_lock:
                         results.append(row)
                     with stats_lock:
-                        stats["fail"] += 1
+                        stats["skip"] += 1
 
         return stats["downloaded"], stats["fail"], stats["skip"], results
 
@@ -743,7 +891,9 @@ class BatchDownloadWorker(QThread):
 
         title = ""
         try:
-            existing = _check_existing(video_id, self._output_dir)
+            existing = _check_existing(
+                video_id, self._output_dir, min_height=self._min_height,
+            )
             if existing:
                 self.video_finished.emit(index, str(existing), use_cookies)
                 return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing), "")
