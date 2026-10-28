@@ -15,6 +15,10 @@ def _window(tmp_path, monkeypatch):
     ini = str(tmp_path / "settings.ini")
     monkeypatch.setattr(theme, "settings", lambda: QSettings(ini, QSettings.Format.IniFormat))
     monkeypatch.setattr(gui, "settings", theme.settings)
+    # CI 没装 ffmpeg 时会弹模态环境向导，测试里直接跳过
+    monkeypatch.setattr(
+        gui.MainWindow, "_show_env_wizard", lambda self, *a, **k: None,
+    )
     return gui.MainWindow()
 
 
