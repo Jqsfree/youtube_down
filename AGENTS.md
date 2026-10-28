@@ -52,11 +52,11 @@ If a "copy chrome cookie" error occurs, `_cookie_broken` is set to `True` and al
 
 ## Error Classification
 
-`_CATEGORY_RULES` in `downloader.py` defines 9 error categories with priority-ordered keyword matching. Each category specifies `retry_cookie` (bool). `classify_error()` returns an `ErrorCategory` dataclass. All results are written to the output root's `下载总览.csv` (`错误类型` column).
+`_CATEGORY_RULES` in `downloader.py` defines 10 error categories (including `ENVIRONMENT` for missing ffprobe) with priority-ordered keyword matching. Each category specifies `retry_cookie` (bool). `classify_error()` returns an `ErrorCategory` dataclass. All results are written to the output root's `下载总览.csv` (`错误类型` column).
 
 ## Download Validation
 
-After download, three checks run in sequence:
+After download, four checks run in sequence:
 1. File exists and size > 1KB
 2. `ffprobe` can parse duration (valid media)
 3. Actual duration matches expected within 5% tolerance
@@ -69,7 +69,7 @@ After download, three checks run in sequence:
 ## Batch Results
 
 - Inputs: table files (`.csv/.tsv/.txt`), whole folders (recursive, via `batch_io.discover_inputs`), or pasted links (newline/comma/space separated, `parse_pasted_text`).
-- Output mirrors input: `<out>/<input rel path without ext>/<row:04d>_<media_id>.mp4`; pasted links go to `<out>/paste/`. Row number = data row in the original table (`_row`).
+- Output mirrors input: `<out>/<input rel path without ext>/<media_id>.mp4`; pasted links go to `<out>/paste/`. Row number = data row in the original table (`_row`) and only appears in the overview.
 - One overview per output root: `下载总览.csv` (utf-8-sig) with `来源文件, 行号, video_id, 平台, 链接, 标题, 状态, 错误类型, 错误信息, 输出文件, 更新时间`; keyed by (来源文件, video_id), upserted atomically. No per-batch `batch_results_* / failed_* / skipped_*` files are created anymore.
 - Resume: overview rows with 状态=成功 whose file still exists, valid files named `{id}.ext` or `NNNN_{id}.ext`, and legacy `batch_results_*.csv` (read-only).
 
@@ -79,4 +79,4 @@ Tests use `YoutubeDownloader.__new__()` to create instances without `__init__` (
 
 ## CI/CD
 
-Push to `main` triggers `.github/workflows/build.yml`: smoke test (`smoke_test.py`) → PyInstaller single-file EXE → upload artifact. The smoke test validates env detection and `get_info()` on a known public video.
+Push to `main` triggers `.github/workflows/build.yml`: unit tests → smoke test (`smoke_test.py`) → PyInstaller single-file app (Windows + macOS) → artifact upload → GitHub Release keyed off `VERSION`. The smoke test validates env detection and `get_info()` on a known public video.

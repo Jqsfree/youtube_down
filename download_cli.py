@@ -28,28 +28,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import yt_dlp
-
 from batch_io import (
     INPUT_EXTS,
     PASTE_SOURCE,
     InputFile,
     OverviewStore,
     discover_inputs,
-    filename_stem,
     media_id_from_stem,
     media_stem,
     output_dir_for,
     parse_pasted_text,
 )
 from downloader import (
+    AUDIO_EXTS,
     BOT_STREAK_LIMIT,
     BRUTAL_YDL_OPTS,
     NORMAL_YDL_OPTS,
+    VIDEO_EXTS,
     YoutubeDownloader,
+    _run_probe,
+    build_extra_options,
     classify_error,
     clean_error,
     dump_browser_cookies,
+    looks_like_playlist,
+    proxy_reachable,
 )
 from pacing import AdaptivePacer
 
@@ -106,23 +109,23 @@ _SKIP_NODE_CONTAINS = (
     "不够请",
 )
 
-_VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".flv")
+
 def _probe_short_side(path: Path) -> int | None:
     """ffprobe 视频短边；无法解析视频轨时返回 None。"""
+    ok, out = _run_probe(
+        ["-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        timeout=10,
+    )
+    if not ok:
+        return None
     try:
-        from downloader import _find_tool
-        import subprocess
-        result = subprocess.run(
-            [_find_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=15,
-        )
-        parts = [p.strip() for p in result.stdout.strip().split(",") if p.strip()]
+        parts = [p.strip() for p in out.strip().split(",") if p.strip()]
         dims = [int(p) for p in parts[:2]]
         if len(dims) >= 2:
             return min(dims)
         return dims[0] if dims else None
-    except Exception:
+    except ValueError:
         return None
 
 
@@ -134,29 +137,35 @@ def collect_completed_ids(*dirs: Path, min_height: int = 0) -> set[str]:
     return set(collect_completed_files(*dirs, min_height=min_height))
 
 
-def collect_completed_files(*dirs: Path, min_height: int = 0) -> dict[str, Path]:
+def collect_completed_files(
+    *dirs: Path, min_height: int = 0, audio_only: bool = False,
+) -> dict[str, Path]:
     """同 collect_completed_ids，返回 {video_id: 文件路径}。"""
     done: dict[str, Path] = {}
+    exts = AUDIO_EXTS if audio_only else VIDEO_EXTS
     for folder in dirs:
         if folder is None or not folder.exists() or folder.is_file():
             continue
         for path in folder.iterdir():
-            if path.suffix.lower() not in _VIDEO_EXTS or path.stat().st_size <= 1024:
+            if path.suffix.lower() not in exts or path.stat().st_size <= 1024:
                 continue
-            short = _probe_short_side(path)
-            if short is None:
-                continue
-            if min_height > 0 and short < min_height:
-                continue
+            if audio_only:
+                ok, out = _run_probe(
+                    ["-v", "quiet", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", str(path)],
+                    timeout=10,
+                )
+                if not ok or not out.strip():
+                    continue
+            else:
+                short = _probe_short_side(path)
+                if short is None:
+                    continue
+                if min_height > 0 and short < min_height:
+                    continue
             done.setdefault(path.stem, path)
             done.setdefault(media_id_from_stem(path.stem), path)
     return done
-
-
-def _remove_media_files(output_dir: Path, *stems: str) -> None:
-    for stem in stems:
-        for ext in _VIDEO_EXTS:
-            (output_dir / f"{stem}{ext}").unlink(missing_ok=True)
 
 
 def check_exit_ip(proxy: str = "http://127.0.0.1:7897") -> tuple[str, str]:
@@ -297,15 +306,37 @@ def _make_downloader(
     use_pot: bool = False,
     fragment_workers: int = 8,
     brutal: bool = False,
+    extra_overrides: dict[str, Any] | None = None,
 ) -> YoutubeDownloader:
     overrides = dict(BRUTAL_YDL_OPTS if brutal else NORMAL_YDL_OPTS)
     overrides["concurrent_fragment_downloads"] = max(1, fragment_workers)
     overrides.update(_pot_extractor_args(use_pot))
+    overrides.update(extra_overrides or {})
     return YoutubeDownloader(
         cookies_from_browser="",
         cookiefile=cookiefile,
         ydl_opt_overrides=overrides,
     )
+
+
+def _ui_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """字幕/元数据/封面/代理/限速 → yt-dlp 选项。"""
+    return build_extra_options(
+        subtitles=args.subs and not args.audio,
+        subtitle_langs=[s.strip() for s in args.subs_langs.split(",") if s.strip()],
+        metadata=args.metadata,
+        thumbnail=args.thumbnail,
+        proxy=args.proxy,
+        rate=args.limit_rate,
+    )
+
+
+def _is_generic_source(source: str) -> bool:
+    """直链没有分辨率元数据，不能按清晰度档位筛选或校验。"""
+    try:
+        return YoutubeDownloader.parse_input(source).platform == "generic"
+    except Exception:
+        return False
 
 
 def _download_one(
@@ -318,14 +349,15 @@ def _download_one(
     fragment_workers: int = 8,
     brutal: bool = False,
     stem: str | None = None,
+    audio_only: bool = False,
+    audio_format: str = "m4a",
+    extra_overrides: dict[str, Any] | None = None,
 ) -> dict[str, str]:
-    # 续传判定未通过的同名旧文件（损坏/低清）须先删，否则 yt-dlp 会直接复用它
-    _vid = YoutubeDownloader._normalize_video_id(video_id) or video_id
-    stale_stems = (_vid, stem) if stem else (_vid,)
-    _remove_media_files(output_dir, *stale_stems)
     dl = _make_downloader(
         cookiefile, use_pot=use_pot, fragment_workers=fragment_workers, brutal=brutal,
+        extra_overrides=extra_overrides,
     )
+    effective_min = 0 if _is_generic_source(video_id) else min_height
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
@@ -336,10 +368,12 @@ def _download_one(
                 filename_stem=stem,
                 use_cookies=True,
                 needs_audio_merge=True,
-                min_height=min_height,
-                expected_height=min_height if min_height > 0 else None,
+                min_height=effective_min,
+                expected_height=effective_min if effective_min > 0 else None,
                 strict_quality=True,
                 brutal=brutal,
+                audio_only=audio_only,
+                audio_format=audio_format,
             )
             return {
                 "video_id": video_id,
@@ -355,15 +389,7 @@ def _download_one(
             last_exc = exc
             cat = classify_error(exc)
             msg = clean_error(exc)
-            if any(
-                k in msg
-                for k in (
-                    "低于最低要求", "与目标档位", "缺少音轨", "缺少视频轨",
-                    "时长异常", "无法解析为有效媒体",
-                )
-            ):
-                _remove_media_files(output_dir, *stale_stems)
-            if "低于最低要求" in msg or ("低于" in msg and str(min_height) in msg):
+            if "低于最低要求" in msg or ("低于" in msg and str(effective_min) in msg):
                 return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
             if "requested format is not available" in msg.lower():
                 return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
@@ -417,7 +443,7 @@ class Job:
 
     @property
     def stem(self) -> str:
-        return filename_stem(self.row_no, self.media_id)
+        return self.media_id
 
 
 def _rel_for(inp: InputFile, input_root: Path | None) -> str:
@@ -453,6 +479,18 @@ def _iter_sources(
     valid, invalid = parse_pasted_text("\n".join(pasted))
     for token in invalid:
         print(f"跳过无效来源: {token}", file=sys.stderr, flush=True)
+    if valid:
+        expander = YoutubeDownloader(cookies_from_browser="")
+        limit = getattr(args, "playlist_limit", 0) or None
+        expanded: list[str] = []
+        for token in valid:
+            if looks_like_playlist(token):
+                urls = expander.expand_playlist(token, limit=limit)
+                print(f"展开播放列表 {token}: {len(urls)} 条", flush=True)
+                expanded.extend(urls)
+            else:
+                expanded.append(token)
+        valid = expanded
     paste_dir = output_dir_for(output_dir, PASTE_SOURCE)
     jobs.extend(
         Job(src, PASTE_SOURCE, index, paste_dir)
@@ -508,6 +546,42 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="单条视频分片并发数（默认与正常模式一致，当前 12；brutal 未指定时为 8）",
     )
     parser.add_argument("--min-height", type=int, default=720)
+    parser.add_argument(
+        "--audio", action="store_true",
+        help="仅下载音频（忽略清晰度）",
+    )
+    parser.add_argument(
+        "--audio-format", default="m4a", choices=["m4a", "mp3", "opus"],
+        help="仅音频输出格式（默认 m4a）",
+    )
+    parser.add_argument(
+        "--subs", action="store_true",
+        help="下载字幕并嵌入视频",
+    )
+    parser.add_argument(
+        "--subs-langs", default="zh-Hans,zh,en",
+        help="字幕语言，逗号分隔（默认 zh-Hans,zh,en）",
+    )
+    parser.add_argument(
+        "--metadata", action="store_true",
+        help="把标题等元数据写入文件",
+    )
+    parser.add_argument(
+        "--thumbnail", action="store_true",
+        help="下载并嵌入封面",
+    )
+    parser.add_argument(
+        "--proxy", default="",
+        help="yt-dlp 代理，如 http://127.0.0.1:7897（默认不使用）",
+    )
+    parser.add_argument(
+        "--limit-rate", default="",
+        help="单条下载限速，如 5M / 500k（默认不限）",
+    )
+    parser.add_argument(
+        "--playlist-limit", type=int, default=500,
+        help="播放列表/频道最多展开条数；0 表示不限（默认 500）",
+    )
     parser.add_argument(
         "--cookies-from-browser",
         default="chrome",
@@ -601,16 +675,24 @@ def _resolve_cookiefile(
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    if not proxy_reachable(args.proxy):
+        print(f"代理不可用: {args.proxy}（请检查端口，或去掉 --proxy 直连）", file=sys.stderr)
+        return 2
     if args.workers is None:
         args.workers = 8 if args.brutal else 1
+    ui_overrides = _ui_overrides(args)
     if args.fragment_workers is None:
         args.fragment_workers = 8 if args.brutal else int(
             NORMAL_YDL_OPTS["concurrent_fragment_downloads"]
         )
     output_dir = args.output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
     results_dir = (args.results_dir or output_dir).expanduser().resolve()
-    results_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"目录不可用: {exc}", file=sys.stderr)
+        return 2
 
     if args.proxy_check_url:
         ip, org = check_exit_ip(args.proxy_check_url)
@@ -664,18 +746,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
 
     pending: list[Job] = []
-    existing_cache: dict[Path, dict[str, Path]] = {}
-    legacy_existing: dict[str, Path] = {}
-    if not args.no_skip_existing:
-        # 旧版平铺布局：视频直接在输出根目录
-        legacy_existing = collect_completed_files(output_dir, min_height=args.min_height)
+    existing_cache: dict[tuple[Path, int], dict[str, Path]] = {}
+
+    def _existing(out_dir: Path, floor: int) -> dict[str, Path]:
+        key = (out_dir, floor)
+        if key not in existing_cache:
+            existing_cache[key] = collect_completed_files(
+                out_dir, min_height=floor, audio_only=args.audio,
+            )
+        return existing_cache[key]
+
     for job in sources:
         if not args.no_skip_existing:
-            if job.out_dir not in existing_cache:
-                existing_cache[job.out_dir] = collect_completed_files(
-                    job.out_dir, min_height=args.min_height,
-                )
-            found = existing_cache[job.out_dir].get(job.media_id) or legacy_existing.get(job.media_id)
+            # 直链没有分辨率元数据，续传时不能按清晰度档位过滤
+            floor = 0 if _is_generic_source(job.src) else args.min_height
+            found = _existing(job.out_dir, floor).get(job.media_id) or _existing(
+                output_dir, floor,
+            ).get(job.media_id)
             if found:
                 if overview.status_of(job.source, job.media_id) != "success":
                     _record(job, {"status": "success", "path": str(found)})
@@ -754,6 +841,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             job.src, job.out_dir, cf, args.min_height,
             use_pot=args.pot, fragment_workers=args.fragment_workers,
             brutal=args.brutal, stem=job.stem,
+            audio_only=args.audio, audio_format=args.audio_format,
+            extra_overrides=ui_overrides,
         )
 
     def _submit(pool: ThreadPoolExecutor, inflight: dict) -> None:

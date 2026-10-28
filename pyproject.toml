@@ -1,17 +1,15 @@
 [project]
 name = "youtube-down"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.2.0"
+description = "多平台批量视频下载器（yt-dlp + PySide6，CSV/文件夹导入、断点续传）"
 readme = "README.md"
 authors = [
     { name = "Jqsfree", email = "jiangqjnshenlsh@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "pillow>=10.0.0",
     "pyside6>=6.5.0",
-    "requests>=2.28.0",
-    "yt-dlp>=2024.1.1",
+    "yt-dlp[default,curl-cffi]>=2024.1.1",
     "yt-dlp-ejs>=0.8.0",
 ]
 

@@ -39,7 +39,7 @@ class TikTokPlatform(BaseMediaPlatform):
                 Platform.TIKTOK.value,
                 original,
                 media_id,
-                f"https://www.tiktok.com/@/video/{media_id}",
+                f"https://www.tiktok.com/share/video/{media_id}",
             )
         return None
 

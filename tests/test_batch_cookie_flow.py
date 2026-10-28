@@ -128,7 +128,7 @@ def test_batches_share_single_overview(tmp_path: Path) -> None:
         worker.run()
         paths.add(str(worker.overview_path))
         stems = [kw.get("filename_stem") for name, _, kw in downloader.calls if name == "download"]
-        assert stems == [f"0007_dQw4w9WgXc{i}"]
+        assert stems == [f"dQw4w9WgXc{i}"]
 
     assert paths == {str(tmp_path / OVERVIEW_NAME)}
     rows = OverviewStore(tmp_path).rows()
@@ -150,7 +150,7 @@ def test_legacy_batch_results_still_resume(tmp_path: Path, monkeypatch) -> None:
     existing.write_bytes(b"x" * 2048)
     monkeypatch.setattr(
         "worker._check_existing",
-        lambda video_id, output_dir, min_height=0: existing,
+        lambda video_id, output_dir, min_height=0, audio_only=False: existing,
     )
     downloader = FakeDownloader()
     worker = BatchDownloadWorker(

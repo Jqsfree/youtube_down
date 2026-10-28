@@ -16,20 +16,20 @@ import csv
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
 from logger_utils import AppLogger
 from yt_dlp_updater import overlay_source_label
 from platforms.base import MediaInput
-from platforms.bilibili import extract_bilibili_id
 from platforms.facade import (
     PLATFORM_BY_KEY,
     get_platform,
@@ -122,6 +122,160 @@ def _find_tool(name: str) -> str:
     """返回可执行文件路径；未找到时回退为 bare name（供 PATH 查找）。"""
     resolved = _resolve_tool(name)
     return resolved if resolved else name
+
+
+FFPROBE_UNAVAILABLE = "ffprobe 不可用：请安装 ffmpeg/ffprobe 或放入 resources/ffmpeg/"
+
+VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".flv")
+AUDIO_EXTS = (".m4a", ".mp3", ".opus", ".flac", ".wav")
+
+
+def _stash_existing_files(
+    output_dir: Path, stem: str, exts: tuple[str, ...],
+) -> list[tuple[Path, Path]]:
+    """下载前暂存同名旧文件，失败时恢复；上次异常退出遗留的 .bak 先还原。"""
+    stashed: list[tuple[Path, Path]] = []
+    for bak in output_dir.glob(f".{stem}.*.bak"):
+        original = bak.with_name(bak.name[1:-4])
+        if not original.exists():
+            try:
+                bak.replace(original)
+            except OSError:
+                pass
+    for path in output_dir.glob(f"{stem}.*"):
+        if path.suffix.lower() not in exts:
+            continue
+        bak = path.with_name(f".{path.name}.bak")
+        try:
+            path.replace(bak)
+        except OSError:
+            continue
+        stashed.append((path, bak))
+    return stashed
+
+
+def _finish_stashed_files(
+    stashed: list[tuple[Path, Path]], success: bool,
+) -> None:
+    """成功则丢弃暂存；失败则删除半成品并恢复旧文件。"""
+    if success:
+        for _, bak in stashed:
+            try:
+                bak.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
+    for original, bak in stashed:
+        try:
+            original.unlink(missing_ok=True)  # 清掉本次失败产生的同名文件
+            bak.replace(original)
+        except OSError:
+            pass
+
+
+def _run_probe(args: list[str], timeout: float = 30) -> tuple[bool, str]:
+    """运行 ffprobe，返回 (工具是否成功执行, 输出)。
+
+    第一项为 False 表示 ffprobe 缺失/超时（无法判断文件）；文件本身无效时
+    第一项仍为 True、输出为空，由调用方给出更准确的错误。
+    """
+    try:
+        result = subprocess.run(
+            [_find_tool("ffprobe"), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, ""
+    return True, result.stdout or ""
+
+
+_RATE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([kmg]?)$", re.I)
+
+
+def parse_rate(value: str) -> int | None:
+    """'5M' / '500k' / '1048576' → bytes/s；空或非法返回 None（不限速）。"""
+    match = _RATE_RE.match((value or "").strip())
+    if not match:
+        return None
+    rate = int(float(match.group(1)) * {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}[
+        match.group(2).lower()
+    ])
+    return rate if rate > 0 else None
+
+
+_PLAYLIST_HINTS = re.compile(
+    r"(?:youtube\.com/(?:playlist|@|channel/|c/|user/))|"
+    r"(?:space\.bilibili\.com)|(?:bilibili\.com/(?:medialist|space))",
+    re.I,
+)
+
+
+def looks_like_playlist(value: str) -> bool:
+    """粗判播放列表/频道 URL；watch?v= 带 list= 仍按单视频处理。"""
+    text = (value or "").lower()
+    if "watch?v=" in text or "youtu.be/" in text:
+        return False
+    return bool(_PLAYLIST_HINTS.search(text))
+
+
+def build_extra_options(
+    *,
+    subtitles: bool = False,
+    subtitle_langs: list[str] | None = None,
+    metadata: bool = False,
+    thumbnail: bool = False,
+    proxy: str = "",
+    rate: str = "",
+) -> dict[str, Any]:
+    """字幕/元数据/封面/代理/限速 → yt-dlp 选项；GUI 与 CLI 共用。
+
+    字幕是否启用（仅音频模式需关闭）由调用方决定。
+    """
+    overrides: dict[str, Any] = {}
+    postprocessors: list[dict[str, Any]] = []
+    if subtitles:
+        overrides.update({
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": list(subtitle_langs or ("zh-Hans", "zh", "en")),
+            "subtitlesformat": "srt",
+        })
+        postprocessors.append({"key": "FFmpegEmbedSubtitle"})
+    if metadata:
+        postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
+    if thumbnail:
+        overrides["writethumbnail"] = True
+        postprocessors.append({"key": "EmbedThumbnail"})
+    if postprocessors:
+        overrides["postprocessors"] = postprocessors
+    proxy = (proxy or "").strip()
+    if proxy:
+        overrides["proxy"] = proxy
+    rate_bytes = parse_rate(rate)
+    if rate_bytes:
+        overrides["ratelimit"] = rate_bytes
+    return overrides
+
+
+def proxy_reachable(proxy: str, timeout: float = 2.0) -> bool:
+    """下载前快速探测代理端口，避免每个视频都卡在连接重试上。"""
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return True
+    try:
+        parsed = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+        port = parsed.port
+    except ValueError:
+        return True  # 解析不了就交给 yt-dlp 报错
+    if not parsed.hostname or port is None:
+        return True
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _configure_js_runtimes(opts: dict[str, Any]) -> None:
@@ -217,13 +371,17 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
             "ffmpeg", "error", "", hint, fatal=True, install_kind="binary",
         ))
 
-    # ffprobe
+    # ffprobe (致命：下载后校验依赖它)
     if _resolve_tool("ffprobe"):
-        items.append(EnvItem("ffprobe", "ok", "", ""))
+        items.append(EnvItem("ffprobe", "ok", "", "", fatal=True))
     else:
         items.append(EnvItem(
-            "ffprobe", "warning", "", "未找到 ffprobe，无法校验下载文件",
-            install_kind="binary",
+            "ffprobe", "error", "",
+            "未找到 ffprobe，无法校验下载文件。\n"
+            "Windows: winget install Gyan.FFmpeg\n"
+            "或运行: powershell -ExecutionPolicy Bypass -File scripts\\setup_dev.ps1\n"
+            "或将 ffprobe.exe 放入 resources/ffmpeg/",
+            fatal=True, install_kind="binary",
         ))
 
     # deno
@@ -262,6 +420,11 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
 _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
     # (类别代码,  重试Cookie, 关键词列表)
     ("CANCELLED",          False, ["下载已取消", "cancel"]),
+    ("ENVIRONMENT",        False, [
+        "ffprobe 不可用",
+        "no such file or directory",
+        "filenotfounderror",
+    ]),
     ("BOT_VERIFICATION",   True,  [
         "sign in to confirm you're not a bot",
         "confirm you're not a bot",
@@ -291,18 +454,28 @@ _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
         "no video formats found",
         "requested format is not available",
         "this video is not available",
+        "this video is unavailable",
         "this video has been removed",
     ]),
     ("NETWORK_ERROR",      False, [
         "timeout", "timed out",
         "ssl", "eof", "connection",
         "unable to download",
+        "proxy",
     ]),
 ]
+
+# 重试退避上限：yt-dlp 默认指数退避最高可达 600s/次，单个坏视频会卡住整批
+RETRY_SLEEP_FUNCTIONS = {
+    "http": lambda n: min(4 * (2 ** n), 60),
+    "fragment": lambda n: min(2 * (2 ** n), 30),
+    "extractor": lambda n: min(3 * (2 ** n), 30),
+}
 
 # 正常下载：分片并发与 sleep 偏快；视频间间隔交给 AdaptivePacer
 NORMAL_YDL_OPTS: dict[str, Any] = {
     "concurrent_fragment_downloads": 12,
+    "socket_timeout": 20,
     "file_access_retries": 5,
     "fragment_retries": 5,
     "extractor_retries": 10,
@@ -310,11 +483,13 @@ NORMAL_YDL_OPTS: dict[str, Any] = {
     "sleep_interval": 1,
     "max_sleep_interval": 3,
     "sleep_interval_requests": 0.5,
+    "retry_sleep_functions": RETRY_SLEEP_FUNCTIONS,
 }
 
 # 暴力下载：更高重试、更短 sleep、分片并发上限 8
 BRUTAL_YDL_OPTS: dict[str, Any] = {
     "concurrent_fragment_downloads": 8,
+    "socket_timeout": 20,
     "retries": 20,
     "fragment_retries": 10,
     "extractor_retries": 15,
@@ -322,6 +497,7 @@ BRUTAL_YDL_OPTS: dict[str, Any] = {
     "sleep_interval": 1,
     "max_sleep_interval": 3,
     "sleep_interval_requests": 0.5,
+    "retry_sleep_functions": RETRY_SLEEP_FUNCTIONS,
 }
 
 BRUTAL_MAX_WORKERS = 8
@@ -477,7 +653,16 @@ class YoutubeDownloader:
         clone._cookies_spec = self._cookies_spec
         clone._browser_cookie_broken = self._browser_cookie_broken
         clone._cancel_coordinator = self
+        clone._impersonate_extract = getattr(self, "_impersonate_extract", False)
         return clone
+
+    def set_ydl_opt_overrides(self, overrides: dict[str, Any]) -> None:
+        """整体替换 UI/CLI 选项（字幕、代理、限速等）；每次开始下载前调用。"""
+        self._ydl_opt_overrides = dict(overrides)
+
+    def set_impersonate(self, enabled: bool) -> None:
+        """仅 get_info 阶段使用 curl-cffi 浏览器指纹（实验选项）。"""
+        self._impersonate_extract = enabled
 
     def _is_cancelled(self) -> bool:
         owner = self._cancel_coordinator or self
@@ -539,10 +724,6 @@ class YoutubeDownloader:
 
         # Preserve historical behavior: unknown bare values are treated as YouTube IDs.
         return MediaInput("youtube", text, text, f"https://www.youtube.com/watch?v={text}")
-
-    @staticmethod
-    def _extract_bilibili_id(value: str) -> str:
-        return extract_bilibili_id(value)
 
     @staticmethod
     def _platform_label(platform: str) -> str:
@@ -697,7 +878,7 @@ class YoutubeDownloader:
                         )
                     )
                 return "/".join(parts)
-            return f"bestvideo+{ba}/bestvideo+{ba}"
+            return f"bestvideo+{ba}/best"
         if needs_audio_merge:
             primary = f"{format_id}+{ba}"
             if min_height > 0:
@@ -711,12 +892,15 @@ class YoutubeDownloader:
         media: MediaInput | None = None,
         cookiefile_override: str | Path | None = None,
         cookies_from_browser_override: str | None = None,
+        for_extraction: bool = False,
         **extra: Any,
     ) -> dict[str, Any]:
         """构建 yt-dlp 通用选项。
 
         Args:
             use_cookies: 是否启用浏览器 Cookie。默认 True。
+            for_extraction: 仅取信息时允许额外选项（如 impersonate），
+                下载时不设，避免拖慢分片下载。
         """
         opts: dict[str, Any] = {
             "quiet": True,
@@ -730,11 +914,7 @@ class YoutubeDownloader:
             "max_sleep_interval": NORMAL_YDL_OPTS["max_sleep_interval"],
             "sleep_interval_requests": NORMAL_YDL_OPTS["sleep_interval_requests"],
             # 内部重试退避
-            "retry_sleep_functions": {
-                "http": lambda n: min(4 * (2 ** n), 60),
-                "fragment": lambda n: min(2 * (2 ** n), 30),
-                "extractor": lambda n: min(3 * (2 ** n), 30),
-            },
+            "retry_sleep_functions": RETRY_SLEEP_FUNCTIONS,
             # 限速检测
             "throttledratelimit": 100 * 1024,
             # 版本提醒
@@ -764,8 +944,18 @@ class YoutubeDownloader:
             # min_height≥720 时出现 "Requested format is not available"。
             # 需要 mweb/PO Token 时由 CLI --pot 或 ydl_opt_overrides 显式开启。
         opts.update(extra)  # extra 中的 extractor_args 会覆盖默认值
-        overrides = getattr(self, "_ydl_opt_overrides", None)
+        if for_extraction and getattr(self, "_impersonate_extract", False):
+            from importlib.util import find_spec
+            if find_spec("curl_cffi"):
+                opts.setdefault("impersonate", "chrome")
+        overrides = dict(getattr(self, "_ydl_opt_overrides", None) or {})
         if overrides:
+            # 后处理器与 download() 自带的（如音频转换）叠加，而不是整表替换
+            override_pp = overrides.pop("postprocessors", None)
+            if override_pp:
+                opts["postprocessors"] = list(opts.get("postprocessors") or []) + list(
+                    override_pp
+                )
             # 深层合并 youtube extractor_args，避免整表替换丢掉 player_client
             override_ea = overrides.get("extractor_args")
             if isinstance(override_ea, dict):
@@ -836,6 +1026,7 @@ class YoutubeDownloader:
                         media=media,
                         cookiefile_override=cookiefile_override,
                         cookies_from_browser_override=cookies_from_browser_override,
+                        for_extraction=True,
                     )
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=False)
@@ -937,34 +1128,68 @@ class YoutubeDownloader:
         # 每档分辨率只保留最优版本：Video Only > Video+Audio，大文件 > 小文件
         return self._dedup_formats(results)
 
+    def expand_playlist(
+        self, url: str, limit: int | None = None, use_cookies: bool = False,
+    ) -> list[str]:
+        """展开播放列表/频道为单条视频来源；普通视频或失败时返回 [url]。
+
+        只展开一层（``extract_flat``），不递归；去重后按 limit 截断。
+        播放列表本身展开失败/为空时返回 []，避免把整条列表当成单视频排队。
+        """
+        fallback = [] if looks_like_playlist(url) else [url]
+        opts = self._make_opts(
+            use_cookies=use_cookies,
+            extract_flat="in_playlist",
+            skip_download=True,
+            noplaylist=True,
+            for_extraction=True,
+        )
+        try:
+            with self._yt_dlp_lock:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+        except Exception:
+            return fallback
+        entries = (info or {}).get("entries") or []
+        results: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            target = str(
+                (entry or {}).get("webpage_url") or (entry or {}).get("url") or ""
+            ).strip()
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            results.append(target)
+            if limit and len(results) >= limit:
+                break
+        return results or fallback
+
     @staticmethod
     def _has_video_stream(path: Path) -> bool:
         """确认输出文件包含视频轨，避免仅音频文件被当成成功。"""
-        result = subprocess.run(
+        ok, out = _run_probe(
             [
-                _find_tool("ffprobe"), "-v", "quiet", "-select_streams", "v:0",
+                "-v", "quiet", "-select_streams", "v:0",
                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            ]
         )
-        return result.returncode == 0 and result.stdout.strip() == "video"
+        if not ok:
+            raise yt_dlp.utils.DownloadError(FFPROBE_UNAVAILABLE)
+        return out.strip() == "video"
 
     @staticmethod
     def _audio_codec(path: Path) -> str | None:
         """返回首个音轨 codec_name；无音轨时返回 None。"""
-        result = subprocess.run(
+        ok, out = _run_probe(
             [
-                _find_tool("ffprobe"), "-v", "error", "-select_streams", "a:0",
+                "-v", "error", "-select_streams", "a:0",
                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            ]
         )
-        codec = (result.stdout or "").strip()
-        return codec or None
+        if not ok:
+            raise yt_dlp.utils.DownloadError(FFPROBE_UNAVAILABLE)
+        return out.strip() or None
 
     def download(
         self,
@@ -981,18 +1206,22 @@ class YoutubeDownloader:
         cookies_from_browser_override: str | None = None,
         brutal: bool = False,
         filename_stem: str | None = None,
+        audio_only: bool = False,
+        audio_format: str = "m4a",
     ) -> Path:
         """下载指定格式的视频。
 
         Args:
             video_id: YouTube/Bilibili ID 或完整 URL。
-            format_id: yt-dlp format ID。
+            format_id: yt-dlp format ID（audio_only 时忽略）。
             output_dir: 输出目录。
             progress_callback: 进度回调。
             use_cookies: 是否使用浏览器 Cookie。
             needs_audio_merge: Video Only 格式才需要合并音频，
                 Video+Audio 格式传 False 避免双音轨。
             filename_stem: 输出文件名（不含扩展名）；为空时用媒体 ID。
+            audio_only: 只取最佳音轨并转成 audio_format。
+            audio_format: 仅音频输出格式（m4a / mp3 / opus）。
         """
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1022,12 +1251,20 @@ class YoutubeDownloader:
             "format": fmt_str,
             "outtmpl": output_template,
             "progress_hooks": [_progress_hook],
-            "merge_output_format": "mp4",
-            "format_sort": ["acodec:aac", "vcodec:h264"],
             "buffersize": 4 * 1024 * 1024,
             "keep_fragments": False,
             "prefer_ffmpeg": True,
         }
+        if audio_only:
+            download_extras["format"] = "bestaudio/best"
+            download_extras["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": audio_format,
+                "preferredquality": "0",
+            }]
+        else:
+            download_extras["merge_output_format"] = "mp4"
+            download_extras["format_sort"] = ["acodec:aac", "vcodec:h264"]
         if brutal:
             download_extras.update(BRUTAL_YDL_OPTS)
         else:
@@ -1040,108 +1277,127 @@ class YoutubeDownloader:
             **download_extras,
         )
 
-        with self._yt_dlp_lock:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                try:
-                    info = ydl.extract_info(url, download=True)
-                except Exception as exc:
-                    AppLogger.log_exception(exc, f"下载失败: {video_id}")
-                    raise
-                if info is None:
-                    raise yt_dlp.utils.DownloadError("下载失败：无法获取视频信息")
-                filename: str = ydl.prepare_filename(info)
-                path = Path(filename)
-                if not path.exists():
-                    stem = path.stem
-                    candidates = list(output_dir.glob(f"{stem}.*"))
-                    _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".flv"}
-                    video_candidates = [
-                        c for c in candidates if c.suffix.lower() in _VIDEO_EXTS
-                    ]
-                    if video_candidates:
-                        path = max(video_candidates, key=lambda p: p.stat().st_size)
-                    elif candidates:
-                        path = candidates[0]
-                    else:
+        protected: list[tuple[Path, Path]] = []
+        exts = AUDIO_EXTS if audio_only else VIDEO_EXTS
+        if filename_stem:
+            protected = _stash_existing_files(output_dir, filename_stem, exts)
+        ok = False
+        try:
+            with self._yt_dlp_lock:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    try:
+                        info = ydl.extract_info(url, download=True)
+                    except Exception as exc:
+                        AppLogger.log_exception(exc, f"下载失败: {video_id}")
+                        raise
+                    if info is None:
+                        raise yt_dlp.utils.DownloadError("下载失败：无法获取视频信息")
+                    filename: str = ydl.prepare_filename(info)
+                    path = Path(filename)
+                    preferred_exts = AUDIO_EXTS if audio_only else VIDEO_EXTS
+                    if not path.exists() or path.suffix.lower() not in preferred_exts:
+                        stem = path.stem
+                        candidates = list(output_dir.glob(f"{stem}.*"))
+                        preferred = [
+                            c for c in candidates if c.suffix.lower() in preferred_exts
+                        ]
+                        if preferred:
+                            path = max(preferred, key=lambda p: p.stat().st_size)
+                        elif candidates:
+                            path = candidates[0]
+                        else:
+                            raise yt_dlp.utils.DownloadError(
+                                f"下载完成但找不到输出文件: {path}"
+                            )
+                    # 校验文件大小合理（> 1KB）
+                    if path.stat().st_size <= 1024:
                         raise yt_dlp.utils.DownloadError(
-                            f"下载完成但找不到输出文件: {path}"
+                            f"下载文件过小 ({path.stat().st_size} bytes): {path}"
                         )
-                # 校验文件大小合理（> 1KB）
-                if path.stat().st_size <= 1024:
-                    raise yt_dlp.utils.DownloadError(
-                        f"下载文件过小 ({path.stat().st_size} bytes): {path}"
-                    )
 
-                if not self._has_video_stream(path):
-                    raise yt_dlp.utils.DownloadError(
-                        f"下载结果只有音频或缺少视频轨: {path}"
-                    )
+                    audio_codec = self._audio_codec(path)
+                    if audio_only:
+                        if not audio_codec:
+                            raise yt_dlp.utils.DownloadError(
+                                f"下载结果缺少音轨: {path}"
+                            )
+                    else:
+                        if not self._has_video_stream(path):
+                            raise yt_dlp.utils.DownloadError(
+                                f"下载结果只有音频或缺少视频轨: {path}"
+                            )
+                        if needs_audio_merge and not audio_codec:
+                            raise yt_dlp.utils.DownloadError(
+                                f"下载结果缺少音轨（合并失败）: {path}"
+                            )
 
-                audio_codec = self._audio_codec(path)
-                if needs_audio_merge and not audio_codec:
-                    raise yt_dlp.utils.DownloadError(
-                        f"下载结果缺少音轨（合并失败）: {path}"
+                    # 校验文件是有效媒体（ffprobe 解析 + 时长比对）
+                    probed, duration_out = _run_probe(
+                        ["-v", "quiet", "-show_entries", "format=duration",
+                         "-of", "csv=p=0", str(path)]
                     )
+                    if not probed:
+                        raise yt_dlp.utils.DownloadError(FFPROBE_UNAVAILABLE)
+                    if not duration_out.strip():
+                        raise yt_dlp.utils.DownloadError(
+                            f"下载文件无法解析为有效媒体: {path}"
+                        )
+                    actual_duration = float(duration_out.strip())
+                    expected_duration = float(info.get("duration") or 0)
+                    if (
+                        expected_duration > 0
+                        and abs(actual_duration - expected_duration) / expected_duration > 0.05
+                    ):
+                        raise yt_dlp.utils.DownloadError(
+                            f"下载文件时长异常: 期望 {expected_duration:.0f}s,"
+                            f" 实际 {actual_duration:.0f}s (可能是合并中断)"
+                        )
 
-                # 校验文件是有效媒体（ffprobe 解析 + 时长比对）
-                ffprobe_result = subprocess.run(
-                    [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
-                     "format=duration", "-of", "csv=p=0", str(path)],
-                    capture_output=True, text=True, timeout=30,
-                )
-                if ffprobe_result.returncode != 0 or not ffprobe_result.stdout.strip():
-                    raise yt_dlp.utils.DownloadError(
-                        f"下载文件无法解析为有效媒体: {path}"
-                    )
-                actual_duration = float(ffprobe_result.stdout.strip())
-                expected_duration = float(info.get("duration") or 0)
-                if (
-                    expected_duration > 0
-                    and abs(actual_duration - expected_duration) / expected_duration > 0.05
+                # expected_height<=0 视为未指定（避免与真实分辨率做 0p 精确比对）
+                if expected_height is not None and expected_height <= 0:
+                    expected_height = None
+                if not audio_only and (
+                    expected_height is not None or (min_height and min_height > 0)
                 ):
-                    raise yt_dlp.utils.DownloadError(
-                        f"下载文件时长异常: 期望 {expected_duration:.0f}s,"
-                        f" 实际 {actual_duration:.0f}s (可能是合并中断)"
+                    probed, height_str = _run_probe(
+                        ["-v", "error", "-select_streams", "v:0", "-show_entries",
+                         "stream=width,height", "-of", "csv=p=0", str(path)],
+                        timeout=10,
                     )
-
-            # expected_height<=0 视为未指定（避免与真实分辨率做 0p 精确比对）
-            if expected_height is not None and expected_height <= 0:
-                expected_height = None
-            if expected_height is not None or (min_height and min_height > 0):
-                height_result = subprocess.run(
-                    [_find_tool("ffprobe"), "-v", "error",
-                     "-select_streams", "v:0", "-show_entries",
-                     "stream=width,height", "-of", "csv=p=0", str(path)],
-                    capture_output=True, text=True, timeout=10,
-                )
-                height_str = height_result.stdout.strip()
-                if not height_str:
-                    raise yt_dlp.utils.DownloadError(
-                        "无法校验视频分辨率：ffprobe 未返回宽高"
-                    )
-                try:
-                    parts = [p.strip() for p in height_str.split(",") if p.strip()]
-                    dims = [int(p) for p in parts[:2]]
-                    # 竖屏按短边计档（与 format_height 一致）
-                    actual_height = min(dims) if len(dims) >= 2 else dims[0]
-                    if expected_height is not None:
-                        tolerance = max(8, int(expected_height * 0.02))
-                        if abs(actual_height - expected_height) > tolerance:
+                    if not probed:
+                        raise yt_dlp.utils.DownloadError(FFPROBE_UNAVAILABLE)
+                    height_str = height_str.strip()
+                    if not height_str:
+                        raise yt_dlp.utils.DownloadError(
+                            "无法校验视频分辨率：ffprobe 未返回宽高"
+                        )
+                    try:
+                        parts = [p.strip() for p in height_str.split(",") if p.strip()]
+                        dims = [int(p) for p in parts[:2]]
+                        # 竖屏按短边计档（与 format_height 一致）
+                        actual_height = min(dims) if len(dims) >= 2 else dims[0]
+                        if expected_height is not None:
+                            tolerance = max(8, int(expected_height * 0.02))
+                            if abs(actual_height - expected_height) > tolerance:
+                                raise yt_dlp.utils.DownloadError(
+                                    f"下载视频分辨率 ({actual_height}p)"
+                                    f" 与目标档位 ({expected_height}p) 不符"
+                                )
+                        elif actual_height < min_height:
                             raise yt_dlp.utils.DownloadError(
                                 f"下载视频分辨率 ({actual_height}p)"
-                                f" 与目标档位 ({expected_height}p) 不符"
+                                f" 低于最低要求 ({min_height}p)"
                             )
-                    elif actual_height < min_height:
+                    except ValueError as exc:
                         raise yt_dlp.utils.DownloadError(
-                            f"下载视频分辨率 ({actual_height}p)"
-                            f" 低于最低要求 ({min_height}p)"
-                        )
-                except ValueError as exc:
-                    raise yt_dlp.utils.DownloadError(
-                        f"无法解析视频分辨率用于校验: {height_str!r}"
-                    ) from exc
+                            f"无法解析视频分辨率用于校验: {height_str!r}"
+                        ) from exc
 
-            return path
+                ok = True
+                return path
+        finally:
+            if filename_stem:
+                _finish_stashed_files(protected, ok)
 
     @staticmethod
     def cleanup_partial_files(output_dir: Path) -> None:
@@ -1618,6 +1874,8 @@ class YoutubeDownloader:
             or "tiktok" in lower
         ):
             return 3
+        if re.search(r"\b(?:BV[0-9A-Za-z]{10}|av\d+)_p\d+\b", text, flags=re.I):
+            return 3
         if re.search(r"\bBV[0-9A-Za-z]{10}\b", text, flags=re.I):
             return 3
         if re.search(r"\bav\d+\b", text, flags=re.I):
@@ -1733,6 +1991,14 @@ class YoutubeDownloader:
             parsed = urlparse(media.original if "://" in media.original else media.url)
             if parsed.netloc.lower().endswith("b23.tv"):
                 return media.url
+            # 分P 的 ?p=N 必须保留，否则永远只下第 1 集；p=1 等同于无参数
+            page = (parse_qs(parsed.query).get("p") or [""])[0]
+            if (
+                page.isdigit()
+                and int(page) > 1
+                and not re.search(r"_p\d+$", media.media_id, re.I)
+            ):
+                return f"{media.media_id}_p{page}"
             return media.media_id
         if "://" in text:
             return media.url

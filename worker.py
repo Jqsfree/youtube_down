@@ -20,16 +20,17 @@ from PySide6.QtCore import QThread, Signal
 
 from batch_io import (
     OverviewStore,
-    filename_stem,
     media_id_from_stem,
 )
 from downloader import (
+    AUDIO_EXTS,
     BOT_STREAK_LIMIT,
     BRUTAL_EXTRA_RETRIES,
     BRUTAL_MAX_WORKERS,
+    VIDEO_EXTS,
     ErrorCategory,
     YoutubeDownloader,
-    _find_tool,
+    _run_probe,
     classify_error,
     clean_error,
     is_brutal_retryable,
@@ -56,225 +57,113 @@ def _media_stem(source: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)
 
 
-_VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".flv")
 
-
-def _existing_candidates(stem: str, output_dir: Path) -> list[Path]:
+def _existing_candidates(
+    stem: str, output_dir: Path, exts: tuple[str, ...] = VIDEO_EXTS,
+) -> list[Path]:
     """匹配 ``{id}.ext``（旧命名）与 ``NNNN_{id}.ext``（行号命名）。"""
     if not output_dir.is_dir():
         return []
     return sorted(
         p for p in output_dir.iterdir()
-        if p.suffix.lower() in _VIDEO_EXTS
+        if p.suffix.lower() in exts
         and (p.stem == stem or media_id_from_stem(p.stem) == stem)
     )
 
 
 def _probe_short_side(path: Path) -> int | None:
     """ffprobe 视频短边；无法解析时返回 None。"""
-    import subprocess as _sp
+    ok, out = _run_probe(
+        ["-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        timeout=10,
+    )
+    if not ok:
+        return None
     try:
-        r = _sp.run(
-            [_find_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        parts = [p.strip() for p in r.stdout.strip().split(",") if p.strip()]
+        parts = [p.strip() for p in out.strip().split(",") if p.strip()]
         dims = [int(p) for p in parts[:2]]
         if len(dims) >= 2:
             return min(dims)
         return dims[0] if dims else None
-    except Exception:
+    except ValueError:
         return None
 
 
+def _resume_min_height(video_id: str, min_height: int) -> int:
+    """直链没有分辨率元数据，续传时不能按清晰度档位过滤。"""
+    try:
+        if YoutubeDownloader.parse_input(video_id).platform == "generic":
+            return 0
+    except ValueError:
+        pass
+    return min_height
+
+
 def _check_existing(
-    video_id: str, output_dir: Path, min_height: int = 0,
+    video_id: str, output_dir: Path, min_height: int = 0, audio_only: bool = False,
 ) -> Path | None:
     """检查输出目录是否已有此视频的有效文件（用于去重）。"""
-    import subprocess as _sp
     stem = _media_stem(video_id)
-    for candidate in _existing_candidates(stem, output_dir):
+    for candidate in _existing_candidates(
+        stem, output_dir, AUDIO_EXTS if audio_only else VIDEO_EXTS,
+    ):
         if not candidate.is_file() or candidate.stat().st_size <= 1024:
             continue
-        try:
-            r = _sp.run(
-                [_find_tool("ffprobe"), "-v", "quiet", "-select_streams", "v:0",
+        if not audio_only:
+            ok, out = _run_probe(
+                ["-v", "quiet", "-select_streams", "v:0",
                  "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(candidate)],
-                capture_output=True, text=True, timeout=10,
+                timeout=10,
             )
-            if r.returncode != 0 or r.stdout.strip() != "video":
+            if not ok or out.strip() != "video":
                 continue
-            r2 = _sp.run(
-                [_find_tool("ffprobe"), "-v", "quiet", "-show_entries",
-                 "format=duration", "-of", "csv=p=0", str(candidate)],
-                capture_output=True, text=True, timeout=10,
-            )
-            if r2.returncode != 0 or not r2.stdout.strip():
+        ok, out = _run_probe(
+            ["-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(candidate)],
+            timeout=10,
+        )
+        if not ok or not out.strip():
+            continue
+        if min_height > 0 and not audio_only:
+            short = _probe_short_side(candidate)
+            if short is None or short < min_height:
                 continue
-            if min_height > 0:
-                short = _probe_short_side(candidate)
-                if short is None or short < min_height:
-                    continue
-            return candidate
-        except Exception:
-            pass
+        return candidate
     return None
 
 
-class DownloadWorker(QThread):
-    """后台下载线程（单视频）。
-
-    Signals:
-        progress_changed(int): 下载百分比 0–100。
-        status_changed(str): 状态文字描述。
-        speed_changed(str): 实时下载速度，如 "8.5MB/s"。
-        eta_changed(str): 预计剩余时间，如 "2:30"。
-        size_changed(str): 已下载/总大小，如 "45MB / 83MB"。
-        finished(str): 下载完成，携带文件路径。
-        error(str): 下载失败，携带错误信息。
-    """
-
-    progress_changed = Signal(int)
-    status_changed = Signal(str)
-    speed_changed = Signal(str)
-    eta_changed = Signal(str)
-    size_changed = Signal(str)
-    finished = Signal(str)
-    error = Signal(str)
-
-    def __init__(
-        self,
-        downloader: YoutubeDownloader,
-        video_id: str,
-        format_id: str,
-        output_dir: Path,
-        min_height: int = 720,
-        needs_audio_merge: bool = True,
-        parent: QThread | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._downloader = downloader
-        self._video_id = video_id
-        self._format_id = format_id
-        self._output_dir = output_dir
-        self._min_height = min_height
-        self._needs_audio_merge = needs_audio_merge
-
-    def run(self) -> None:
-        """在后台线程中执行下载。"""
-        if hasattr(self._downloader, "clear_cancel"):
-            self._downloader.clear_cancel()
-        # 去重检查
-        existing = _check_existing(
-            self._video_id, self._output_dir, min_height=self._min_height,
-        )
-        if existing:
-            self.finished.emit(str(existing))
-            return
-
-        try:
-
-            def on_progress(d: dict[str, Any]) -> None:
-                status = d.get("status", "")
-                if status == "downloading":
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    downloaded = d.get("downloaded_bytes", 0)
-                    if total > 0:
-                        pct = int(downloaded / total * 100)
-                        self.progress_changed.emit(pct)
-
-                    speed = d.get("speed") or ""
-                    if speed and isinstance(speed, (int, float)):
-                        speed = self._format_speed(speed)
-                    self.speed_changed.emit(str(speed) if speed else "—")
-
-                    eta = d.get("eta") or ""
-                    if eta and isinstance(eta, (int, float)):
-                        eta = self._format_eta(int(eta))
-                    self.eta_changed.emit(str(eta) if eta else "—")
-
-                    size_text = (
-                        f"{self._format_size(downloaded)} / {self._format_size(total)}"
-                    )
-                    self.size_changed.emit(size_text)
-
-                elif status == "finished":
-                    self.status_changed.emit("处理中...")
-
-            result_path = self._downloader.download(
-                video_id=self._video_id,
-                format_id=self._format_id,
-                output_dir=self._output_dir,
-                progress_callback=on_progress,
-                needs_audio_merge=self._needs_audio_merge,
-                min_height=self._min_height,
-            )
-            self.finished.emit(str(result_path))
-
-        except Exception as exc:
-            AppLogger.log_exception(exc, f"单视频下载失败: {self._video_id}")
-            self.error.emit(str(exc))
-
-    @staticmethod
-    def _format_speed(speed: float) -> str:
-        if speed < 1024:
-            return f"{speed:.0f}B/s"
-        if speed < 1024 * 1024:
-            return f"{speed / 1024:.1f}KB/s"
-        if speed < 1024 * 1024 * 1024:
-            return f"{speed / (1024 * 1024):.1f}MB/s"
-        return f"{speed / (1024 * 1024 * 1024):.2f}GB/s"
-
-    @staticmethod
-    def _format_eta(seconds: int) -> str:
-        if seconds < 0:
-            return "—"
-        minutes, secs = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours > 0:
-            return f"{hours}:{minutes:02d}:{secs:02d}"
-        return f"{minutes}:{secs:02d}"
-
-    @staticmethod
-    def _format_size(size_bytes: int | float) -> str:
-        if size_bytes is None or size_bytes <= 0:
-            return "—"
-        size_bytes = int(size_bytes)
-        if size_bytes < 1024:
-            return f"{size_bytes}B"
-        if size_bytes < 1024 * 1024:
-            return f"{size_bytes / 1024:.1f}KB"
-        if size_bytes < 1024 * 1024 * 1024:
-            return f"{size_bytes / (1024 * 1024):.1f}MB"
-        return f"{size_bytes / (1024 * 1024 * 1024):.2f}GB"
+def _format_speed(speed: float) -> str:
+    if speed < 1024:
+        return f"{speed:.0f}B/s"
+    if speed < 1024 * 1024:
+        return f"{speed / 1024:.1f}KB/s"
+    if speed < 1024 * 1024 * 1024:
+        return f"{speed / (1024 * 1024):.1f}MB/s"
+    return f"{speed / (1024 * 1024 * 1024):.2f}GB/s"
 
 
-class FetchInfoWorker(QThread):
-    """后台获取视频信息（单视频），避免主线程阻塞 GUI。"""
+def _format_eta(seconds: int) -> str:
+    if seconds < 0:
+        return "—"
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
-    finished = Signal(dict)
-    error = Signal(str)
 
-    def __init__(
-        self,
-        downloader: YoutubeDownloader,
-        video_id: str,
-        parent: QThread | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._downloader = downloader
-        self._video_id = video_id
-
-    def run(self) -> None:
-        try:
-            info = self._downloader.get_info(
-                self._video_id,
-                use_cookies=self._downloader.prefers_cookies_for_fetch(),
-            )
-            self.finished.emit(info)
-        except Exception as exc:
-            self.error.emit(clean_error(exc))
+def _format_size(size_bytes: int | float) -> str:
+    if size_bytes is None or size_bytes <= 0:
+        return "—"
+    size_bytes = int(size_bytes)
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f}KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f}MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.2f}GB"
 
 
 class ValidateCookieWorker(QThread):
@@ -305,7 +194,7 @@ class BatchDownloadWorker(QThread):
     Signals:
         all_progress_changed(int): 整体进度 0–100。
         video_started(int, int, str, bool): (index, total, video_id, cookie)。
-        video_finished(int, str, bool): (index, path, cookie_used)。
+        video_finished(int, str, bool, str): (index, path, cookie_used, title)。
         video_error(int, str, bool): (index, msg, cookie_used)。
         progress_changed(int): 当前视频下载百分比。
         speed_changed(str): 实时下载速度。
@@ -317,7 +206,7 @@ class BatchDownloadWorker(QThread):
 
     all_progress_changed = Signal(int)
     video_started = Signal(int, int, str, bool)
-    video_finished = Signal(int, str, bool)
+    video_finished = Signal(int, str, bool, str)
     video_error = Signal(int, str, bool)
     progress_changed = Signal(int)
     speed_changed = Signal(str)
@@ -340,6 +229,8 @@ class BatchDownloadWorker(QThread):
         overview: OverviewStore | None = None,
         source_rel: str = "",
         row_numbers: dict[str, int] | None = None,
+        audio_only: bool = False,
+        audio_format: str = "m4a",
         parent: QThread | None = None,
     ) -> None:
         super().__init__(parent)
@@ -351,6 +242,8 @@ class BatchDownloadWorker(QThread):
         self._min_height = min_height
         self._strict_quality = strict_quality
         self._brutal_mode = brutal_mode
+        self._audio_only = audio_only
+        self._audio_format = audio_format
         self._cookie_overrides = cookie_overrides or {}
         self._overview = overview or OverviewStore(self._results_dir)
         self._source_rel = source_rel or self._default_source_rel()
@@ -359,6 +252,8 @@ class BatchDownloadWorker(QThread):
             vid: given_rows.get(vid) or index + 1
             for index, vid in enumerate(video_ids)
         }
+        self._pause_event = threading.Event()
+        self._pause_event.set()
 
     @property
     def overview_path(self) -> Path:
@@ -372,7 +267,7 @@ class BatchDownloadWorker(QThread):
         return rel.as_posix() if rel.parts else self._output_dir.name
 
     def _filename_stem(self, vid: str) -> str:
-        return filename_stem(self._row_numbers.get(vid, 0), _media_stem(vid))
+        return _media_stem(vid)
 
     def _record(
         self, vid: str, title: str, status: str,
@@ -390,6 +285,17 @@ class BatchDownloadWorker(QThread):
             message=message,
             output_file=output_file,
         )
+
+    def pause(self) -> None:
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        self._pause_event.set()
+
+    def _wait_if_paused(self) -> None:
+        """暂停只发生在两个视频之间；取消会结束等待。"""
+        while not self._pause_event.is_set() and not self._is_cancelled():
+            self._pause_event.wait(0.2)
 
     def _is_cancelled(self) -> bool:
         dl = self._downloader
@@ -416,16 +322,25 @@ class BatchDownloadWorker(QThread):
             if self._is_cancelled():
                 break
             stem = _media_stem(vid)
+            # 总览只说明「曾成功」；文件被删/损坏时必须重下（与 CLI 一致）
             if stem in overview_done:
-                self._log_resume_skip(i, total, vid)
-                resumed += 1
-                continue
-            if vid in legacy_done or stem in legacy_done:
                 existing = _check_existing(
-                    vid, self._output_dir, min_height=self._min_height,
+                    vid, self._output_dir,
+                    min_height=_resume_min_height(vid, self._min_height),
+                    audio_only=self._audio_only,
                 )
                 if existing:
-                    self._log_resume_skip(i, total, vid)
+                    self._log_resume_skip(i, total, vid, existing)
+                    resumed += 1
+                    continue
+            elif vid in legacy_done or stem in legacy_done:
+                existing = _check_existing(
+                    vid, self._output_dir,
+                    min_height=_resume_min_height(vid, self._min_height),
+                    audio_only=self._audio_only,
+                )
+                if existing:
+                    self._log_resume_skip(i, total, vid, existing)
                     self._record(vid, "", "success", output_file=str(existing))
                     resumed += 1
                     continue
@@ -440,9 +355,13 @@ class BatchDownloadWorker(QThread):
             )
 
         overview_path = str(self._overview.path)
-        self.all_progress_changed.emit(100)
+        cancelled = self._is_cancelled()
+        if not cancelled:
+            self.all_progress_changed.emit(100)
         self.all_finished.emit(downloaded + resumed, fail_count, skip_count, overview_path)
-        self.status_changed.emit(f"批量下载完成，总览: {overview_path}")
+        self.status_changed.emit(
+            "已取消" if cancelled else f"批量下载完成，总览: {overview_path}"
+        )
 
     @staticmethod
     def _is_bot_or_rate(row: dict[str, str]) -> bool:
@@ -463,6 +382,7 @@ class BatchDownloadWorker(QThread):
         bot_streak = 0
         downloaded = fail_count = skip_count = 0
         for idx, (i, vid) in enumerate(pending):
+            self._wait_if_paused()
             if self._is_cancelled():
                 break
             if bot_streak >= BOT_STREAK_LIMIT:
@@ -560,6 +480,7 @@ class BatchDownloadWorker(QThread):
             inflight: dict = {}
 
             def _submit() -> None:
+                self._wait_if_paused()
                 if stop_bot.is_set() or self._is_cancelled():
                     return
                 try:
@@ -763,10 +684,12 @@ class BatchDownloadWorker(QThread):
             )
         )
 
-    def _log_resume_skip(self, index: int, total: int, video_id: str) -> None:
+    def _log_resume_skip(
+        self, index: int, total: int, video_id: str, path: Path,
+    ) -> None:
         """续传跳过日志。"""
         self.video_started.emit(index, total, video_id, False)
-        self.video_finished.emit(index, "续传跳过（已完成）", False)
+        self.video_finished.emit(index, str(path), False, "")
         self.status_changed.emit(f"[{index + 1}/{total}] 续传跳过: {video_id}")
 
     def _resolve_format(self, info: dict[str, Any]) -> tuple[str | None, bool, int | None]:
@@ -777,7 +700,12 @@ class BatchDownloadWorker(QThread):
             format_id 为 None 表示低于阈值应跳过。
         """
         preferred = self._format_id
+        if getattr(self, "_audio_only", False):
+            return ("bestaudio/best", False, None)
         formats = self._downloader.list_formats(info=info)
+        if not formats and info.get("_platform") == "generic":
+            # 直链没有 height，无法按档位筛选；取 best 并不做分辨率校验（0 = 未指定）
+            return ("best", False, 0)
         available_ids = {f["format_id"] for f in formats}
 
         def _needs_merge(fmt: dict) -> bool:
@@ -854,17 +782,17 @@ class BatchDownloadWorker(QThread):
 
                 speed = d.get("speed") or ""
                 if speed and isinstance(speed, (int, float)):
-                    speed = DownloadWorker._format_speed(speed)
+                    speed = _format_speed(speed)
                 self.speed_changed.emit(str(speed) if speed else "—")
 
                 eta = d.get("eta") or ""
                 if eta and isinstance(eta, (int, float)):
-                    eta = DownloadWorker._format_eta(int(eta))
+                    eta = _format_eta(int(eta))
                 self.eta_changed.emit(str(eta) if eta else "—")
 
                 size_text = (
-                    f"{DownloadWorker._format_size(downloaded)}"
-                    f" / {DownloadWorker._format_size(total_b)}"
+                    f"{_format_size(downloaded)}"
+                    f" / {_format_size(total_b)}"
                 )
                 self.size_changed.emit(size_text)
             elif status == "finished":
@@ -892,10 +820,12 @@ class BatchDownloadWorker(QThread):
         title = ""
         try:
             existing = _check_existing(
-                video_id, self._output_dir, min_height=self._min_height,
+                video_id, self._output_dir,
+                min_height=_resume_min_height(video_id, self._min_height),
+                audio_only=self._audio_only,
             )
             if existing:
-                self.video_finished.emit(index, str(existing), use_cookies)
+                self.video_finished.emit(index, str(existing), use_cookies, "")
                 return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(existing), "")
 
             cookie_args = self._cookie_args_for_source(video_id) if use_cookies else {}
@@ -925,8 +855,10 @@ class BatchDownloadWorker(QThread):
                 cookiefile_override=cookie_args.get("cookiefile"),
                 cookies_from_browser_override=cookie_args.get("cookies_from_browser"),
                 brutal=brutal,
+                audio_only=self._audio_only,
+                audio_format=self._audio_format,
             )
-            self.video_finished.emit(index, str(path), use_cookies)
+            self.video_finished.emit(index, str(path), use_cookies, title)
             return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)
 
         except Exception as exc:
@@ -953,8 +885,10 @@ class BatchDownloadWorker(QThread):
                             expected_height=expected_height,
                             strict_quality=self._strict_quality,
                             brutal=brutal,
+                            audio_only=self._audio_only,
+                            audio_format=self._audio_format,
                         )
-                        self.video_finished.emit(index, str(path), use_cookies)
+                        self.video_finished.emit(index, str(path), use_cookies, title)
                         return ("success", use_cookies, ErrorCategory("SUCCESS", False, ""), str(path), title)
                     except Exception:
                         continue
@@ -962,6 +896,33 @@ class BatchDownloadWorker(QThread):
             AppLogger.log_exception(exc, f"批量下载失败: {video_id}")
             self.video_error.emit(index, clean_error(exc), use_cookies)
             return ("failed", use_cookies, cat, str(exc), title)
+
+
+class PlaylistExpandWorker(QThread):
+    """后台展开播放列表/频道为单条视频来源。"""
+
+    expanded = Signal(list)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        downloader: YoutubeDownloader,
+        url: str,
+        limit: int | None = None,
+        parent: QThread | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._downloader = downloader
+        self._url = url
+        self._limit = limit
+
+    def run(self) -> None:
+        try:
+            urls = self._downloader.expand_playlist(self._url, limit=self._limit)
+        except Exception as exc:
+            self.failed.emit(clean_error(exc))
+            return
+        self.expanded.emit(urls)
 
 
 class YtdlpUpdateWorker(QThread):

@@ -19,6 +19,23 @@ def extract_bilibili_id(value: str) -> str:
     return ""
 
 
+# 分P 内部 ID：BV1xx_p2（保留页码，输出文件名才不会丢集）
+_PART_RE = re.compile(r"\b(BV[0-9A-Za-z]{10}|av\d+)_p(\d+)\b", flags=re.I)
+
+
+def _parse_part(value: str) -> MediaInput | None:
+    match = _PART_RE.search(value or "")
+    if not match:
+        return None
+    vid, page = match.group(1), match.group(2)
+    return MediaInput(
+        Platform.BILIBILI.value,
+        value,
+        f"{vid}_p{page}",
+        f"https://www.bilibili.com/video/{vid}?p={page}",
+    )
+
+
 class BilibiliPlatform(BaseMediaPlatform):
     key = Platform.BILIBILI
     cookie_domains = ("bilibili.com", "b23.tv")
@@ -33,9 +50,15 @@ class BilibiliPlatform(BaseMediaPlatform):
     ) -> MediaInput | None:
         host = parsed.netloc.lower()
         if "bilibili.com" in host or host.endswith("b23.tv"):
+            part = _parse_part(normalized)
+            if part is not None:
+                return part
             media_id = extract_bilibili_id(normalized) or normalized
             return MediaInput(Platform.BILIBILI.value, original, media_id, normalized)
 
+        part = _parse_part(original)
+        if part is not None:
+            return part
         bili_id = extract_bilibili_id(original)
         if bili_id:
             return MediaInput(

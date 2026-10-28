@@ -1,16 +1,19 @@
 """压力测试 —— 批量下载、错误恢复、内存观察。
 
 用法:
-    PYTHONPATH=. .venv/bin/python3 stress_test.py
+    .venv/bin/python3 scripts/stress_test.py
 """
 
 from __future__ import annotations
 
+import sys
 import time
 import tracemalloc
 from pathlib import Path
 
-from downloader import YoutubeDownloader, classify_error, clean_error
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from downloader import YoutubeDownloader, classify_error, clean_error  # noqa: E402
 
 # 20 个已知可用视频 ID
 TEST_IDS: list[str] = [

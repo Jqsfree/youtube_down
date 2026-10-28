@@ -12,9 +12,11 @@ import csv
 import os
 import re
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 from downloader import YoutubeDownloader
 
@@ -52,10 +54,6 @@ def safe_segment(name: str) -> str:
 
 def media_stem(media_id: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in media_id)
-
-
-def filename_stem(row_no: int, media_id: str) -> str:
-    return f"{row_no:04d}_{media_stem(media_id)}"
 
 
 def media_id_from_stem(stem: str) -> str:
@@ -137,6 +135,38 @@ def parse_pasted_text(text: str) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """跨进程独占锁（Windows msvcrt / POSIX flock），锁文件与 CSV 同目录。"""
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "a+b") as fh:
+        if os.name == "nt":
+            import msvcrt
+
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"0")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 class OverviewStore:
     """输出根目录下的 ``下载总览.csv``：主键 (来源文件, video_id)，线程安全、原子写入。"""
 
@@ -145,19 +175,26 @@ class OverviewStore:
         self.path = root / OVERVIEW_NAME
         self._lock = threading.Lock()
         self._rows: dict[tuple[str, str], dict[str, str]] = {}
+        self._touched: set[tuple[str, str]] = set()
         self._load()
 
     def _load(self) -> None:
-        if not self.path.is_file():
-            return
+        self._rows = self._read_rows(self.path)
+
+    @staticmethod
+    def _read_rows(path: Path) -> dict[tuple[str, str], dict[str, str]]:
+        rows: dict[tuple[str, str], dict[str, str]] = {}
+        if not path.is_file():
+            return rows
         try:
-            with open(self.path, "r", encoding="utf-8-sig", newline="") as f:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
                 for row in csv.DictReader(f):
                     key = (row.get("来源文件", ""), row.get("video_id", ""))
                     if key[1]:
-                        self._rows[key] = {k: row.get(k, "") or "" for k in OVERVIEW_FIELDS}
+                        rows[key] = {k: row.get(k, "") or "" for k in OVERVIEW_FIELDS}
         except (OSError, csv.Error, UnicodeDecodeError):
-            self._rows = {}
+            return {}
+        return rows
 
     def upsert(
         self,
@@ -183,6 +220,11 @@ class OverviewStore:
         with self._lock:
             key = (source, media_id)
             old = self._rows.get(key, {})
+            # 旧文件还在时，不因本次失败/跳过把已有的成功记录降级
+            if status != "success" and old.get("状态") == STATUS_LABELS["success"]:
+                old_path = Path(old.get("输出文件", ""))
+                if old_path and (old_path if old_path.is_absolute() else self.root / old_path).is_file():
+                    return
             self._rows[key] = {
                 "来源文件": source,
                 "行号": str(row_no),
@@ -196,20 +238,30 @@ class OverviewStore:
                 "输出文件": output_rel if status == "success" else "",
                 "更新时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
+            self._touched.add(key)
             self._flush()
 
     def _flush(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        rows = sorted(
-            self._rows.values(),
-            key=lambda r: (r["来源文件"], int(r["行号"]) if r["行号"].isdigit() else 0),
-        )
-        tmp = self.path.with_name(f".{self.path.name}.tmp")
-        with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=OVERVIEW_FIELDS)
-            writer.writeheader()
-            writer.writerows(rows)
-        os.replace(tmp, self.path)
+        with _file_lock(self.path):
+            # 重新读盘再合并：别的进程新增的行不会被本进程的旧快照抹掉
+            merged = self._read_rows(self.path)
+            for key in self._touched:
+                row = self._rows.get(key)
+                if row:
+                    merged[key] = row
+            rows = sorted(
+                merged.values(),
+                key=lambda r: (r["来源文件"], int(r["行号"]) if r["行号"].isdigit() else 0),
+            )
+            tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+            with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=OVERVIEW_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            os.replace(tmp, self.path)
+            self._rows = merged
+            self._touched.clear()
 
     def status_of(self, source: str, media_id: str) -> str:
         row = self._rows.get((source, media_id))

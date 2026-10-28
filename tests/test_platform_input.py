@@ -35,6 +35,32 @@ def test_parse_b23_short_link_keeps_url_for_yt_dlp():
     assert media.url == "https://b23.tv/abc123"
 
 
+def test_parse_bilibili_part_keeps_page_in_url():
+    media = YoutubeDownloader.parse_input("https://www.bilibili.com/video/BV1GJ411x7h7?p=2")
+
+    assert media.platform == "bilibili"
+    assert media.media_id == "BV1GJ411x7h7"
+    assert media.url.endswith("?p=2")
+
+
+def test_normalize_bilibili_part_preserves_page():
+    assert (
+        YoutubeDownloader._normalize_video_id(
+            "https://www.bilibili.com/video/BV1GJ411x7h7?p=2"
+        )
+        == "BV1GJ411x7h7_p2"
+    )
+
+    part = YoutubeDownloader.parse_input("BV1GJ411x7h7_p2")
+    assert part.media_id == "BV1GJ411x7h7_p2"
+    assert part.url == "https://www.bilibili.com/video/BV1GJ411x7h7?p=2"
+
+
+def test_normalize_bilibili_part_id_is_idempotent():
+    # 已带 _pN 的内部分页 ID 不应再拼一次页码
+    assert YoutubeDownloader._normalize_video_id("BV1GJ411x7h7_p2") == "BV1GJ411x7h7_p2"
+
+
 def test_parse_tiktok_url_extracts_video_id():
     media = YoutubeDownloader.parse_input(
         "https://www.tiktok.com/@scout2015/video/6718339390858298630"
@@ -43,6 +69,15 @@ def test_parse_tiktok_url_extracts_video_id():
     assert media.platform == "tiktok"
     assert media.media_id == "6718339390858298630"
     assert "tiktok.com" in media.url
+
+
+def test_parse_tiktok_bare_id_uses_share_url():
+    # yt-dlp 的 TikTokIE 接受 share/video/{id}；空用户名 @/ 形式服务端是否接受未知
+    media = YoutubeDownloader.parse_input("6718339390858298630")
+
+    assert media.platform == "tiktok"
+    assert media.media_id == "6718339390858298630"
+    assert media.url == "https://www.tiktok.com/share/video/6718339390858298630"
 
 
 def test_parse_tiktok_short_link():

@@ -4,12 +4,12 @@
 
 ## 下载安装包（推荐）
 
-最新版：[v1.1.6](https://github.com/Jqsfree/youtube_down/releases/tag/v1.1.6)
+最新版：[v1.2.0](https://github.com/Jqsfree/youtube_down/releases/tag/v1.2.0)
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| Windows (x64) | [YouTubeDownloader-Windows.exe](https://github.com/Jqsfree/youtube_down/releases/download/v1.1.6/YouTubeDownloader-Windows.exe) | 双击运行；已内嵌 ffmpeg / ffprobe / deno |
-| macOS (Apple Silicon) | [YouTubeDownloader-macOS.zip](https://github.com/Jqsfree/youtube_down/releases/download/v1.1.6/YouTubeDownloader-macOS.zip) | 解压后打开 `.app`；已内嵌 ffmpeg / ffprobe / deno |
+| Windows (x64) | [YouTubeDownloader-Windows.exe](https://github.com/Jqsfree/youtube_down/releases/download/v1.2.0/YouTubeDownloader-Windows.exe) | 双击运行；已内嵌 ffmpeg / ffprobe / deno |
+| macOS (Apple Silicon) | [YouTubeDownloader-macOS.zip](https://github.com/Jqsfree/youtube_down/releases/download/v1.2.0/YouTubeDownloader-macOS.zip) | 解压后打开 `.app`；已内嵌 ffmpeg / ffprobe / deno |
 
 ### macOS 首次打开
 
@@ -21,8 +21,8 @@
 
 ### 系统要求
 
-- Python 3.11+
-- ffmpeg（放入 PATH 或 `resources/ffmpeg/`）
+- Python 3.12+
+- ffmpeg / ffprobe（放入 PATH 或 `resources/ffmpeg/`）
 
 ### 安装
 
@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
 
 | 组件 | 说明 |
 |------|------|
-| Python 3.11+ | [python.org](https://www.python.org/downloads/) 安装时勾选 "Add to PATH" |
+| Python 3.12+ | [python.org](https://www.python.org/downloads/) 安装时勾选 "Add to PATH" |
 | ffmpeg | 运行 `scripts\setup_dev.ps1`，或加入 PATH，或放到 `resources\ffmpeg\` |
 | 网络 | 冒烟测试会请求 YouTube 获取视频信息 |
 
@@ -92,10 +92,26 @@ python main.py
 
 ## 使用（GUI）
 
-1. 导入 CSV / 文件夹 / 粘贴链接，或输入单个 Video ID
-2. 选择清晰度与保存目录
-3. 点击 **下载**（批量可开暴力并行）
-4. 结果写入输出根目录的 `下载总览.csv`
+1. 导入 CSV / 文件夹 / 粘贴链接（支持拖动链接），或输入单个 Video ID
+2. 播放列表 / 频道 URL 会自动展开（最多 500 条）
+3. 选择清晰度、保存目录；可勾选 **仅音频**（m4a / mp3 / opus）、字幕（中英 / 中文 / 英文）、元数据、封面
+4. 可设置代理与单条限速；「浏览器指纹（实验）」仅影响取信息阶段，需安装 `curl-cffi`
+5. 点击 **下载**（批量可开暴力并行）；暂停会在当前视频结束后生效，取消会停止整批
+6. 结果写入输出根目录的 `下载总览.csv`；失败项可右键重试，「历史」按钮可查看总览
+
+## 批量 CLI
+
+```bash
+python -m download_cli -o ./out inputs/            # 文件夹/CSV
+python -m download_cli -o ./out "https://www.youtube.com/playlist?list=..." --playlist-limit 50
+python -m download_cli -o ./out urls.txt --audio --audio-format mp3
+python -m download_cli -o ./out urls.txt --subs --metadata --thumbnail
+python -m download_cli -o ./out urls.txt --proxy http://127.0.0.1:7897 --limit-rate 5M
+```
+
+常用参数：`--min-height 1080`、`--workers 4`、`--brutal`、`--no-skip-existing`、
+`--playlist-limit`（0 = 不限）、`--audio` / `--audio-format`、`--subs` / `--subs-langs` /
+`--metadata` / `--thumbnail`、`--proxy` / `--limit-rate`。
 
 ## 项目结构
 

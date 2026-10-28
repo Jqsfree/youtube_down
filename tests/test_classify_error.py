@@ -37,6 +37,29 @@ def test_auth_required_age_gate() -> None:
     assert cat.retry_cookie is True
 
 
+def test_unavailable_video_is_classified_not_unknown() -> None:
+    cat = classify_error(Exception("ERROR: [youtube] zzzzzzzzzzz: This video is unavailable"))
+    assert cat.code == "VIDEO_UNAVAILABLE"
+    assert cat.retry_cookie is False
+
+
+def test_proxy_failure_is_network_error() -> None:
+    cat = classify_error(Exception("Unable to connect to proxy: Connection refused"))
+    assert cat.code == "NETWORK_ERROR"
+    assert cat.retry_cookie is False
+
+
+def test_retry_backoff_is_capped() -> None:
+    """下载路径也必须限制退避，否则单个坏视频可卡住整批几十分钟。"""
+    from downloader import BRUTAL_YDL_OPTS, NORMAL_YDL_OPTS
+
+    for opts in (NORMAL_YDL_OPTS, BRUTAL_YDL_OPTS):
+        sleepers = opts["retry_sleep_functions"]
+        assert sleepers["extractor"](10) == 30
+        assert sleepers["fragment"](10) == 30
+        assert sleepers["http"](10) == 60
+
+
 def test_normal_ydl_opts_never_zero_sleep() -> None:
     from downloader import NORMAL_YDL_OPTS
 

@@ -65,10 +65,10 @@ def test_iter_sources_mirrors_folder_and_pastes(tmp_path: Path) -> None:
     by_id = {job.media_id: job for job in jobs}
     assert by_id["dQw4w9WgXcQ"].out_dir == out / "舞蹈" / "擦边"
     assert by_id["dQw4w9WgXcQ"].source == "舞蹈/擦边"
-    assert by_id["RajrwxvF4Yw"].stem.endswith("_RajrwxvF4Yw")
+    assert by_id["RajrwxvF4Yw"].stem == "RajrwxvF4Yw"
     assert by_id["9xK8sxOIpOQ"].out_dir == out / "top"
     assert by_id["S4d2AB_unnw"].out_dir == out / "paste"
-    assert by_id["S4d2AB_unnw"].stem == "0001_S4d2AB_unnw"
+    assert by_id["S4d2AB_unnw"].stem == "S4d2AB_unnw"
 
 
 def test_iter_sources_reports_duplicate_rows(tmp_path: Path) -> None:
@@ -149,8 +149,6 @@ def test_download_one_always_uses_cookies(tmp_path, monkeypatch) -> None:
         out.write_bytes(b"0" * 2048)
         return out
 
-    monkeypatch.setattr(download_cli, "_remove_media_files", lambda *a, **k: None)
-
     class FakeDL:
         def download(self, *a, **k):
             return fake_download(*a, **k)
@@ -161,6 +159,17 @@ def test_download_one_always_uses_cookies(tmp_path, monkeypatch) -> None:
     assert calls == [True]
     assert result["status"] == "success"
     assert result["cookie_used"] == "true"
+
+
+def test_main_rejects_output_path_that_is_a_file(tmp_path, capsys) -> None:
+    import download_cli
+
+    not_a_dir = tmp_path / "out"
+    not_a_dir.write_text("x")
+    rc = download_cli.main(["-o", str(not_a_dir), "dQw4w9WgXcQ"])
+
+    assert rc == 2
+    assert "目录不可用" in capsys.readouterr().err
 
 
 def test_warn_datacenter_ip(capsys) -> None:

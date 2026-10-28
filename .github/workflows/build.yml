@@ -100,6 +100,7 @@ jobs:
             --add-binary "deno.exe;." `
             --collect-all yt_dlp `
             --collect-all yt_dlp_ejs `
+            --collect-all curl_cffi `
             --hidden-import PySide6.QtCore `
             --hidden-import PySide6.QtWidgets `
             --hidden-import PySide6.QtGui `
@@ -126,6 +127,7 @@ jobs:
             --add-binary "deno:." \
             --collect-all yt_dlp \
             --collect-all yt_dlp_ejs \
+            --collect-all curl_cffi \
             --hidden-import PySide6.QtCore \
             --hidden-import PySide6.QtWidgets \
             --hidden-import PySide6.QtGui \

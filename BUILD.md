@@ -4,195 +4,131 @@
 
 | 组件 | 选型 | 原因 |
 |------|------|------|
-| GUI | PySide6 | Qt 官方 Python 绑定，原生控件，支持 DPI 缩放，跨平台 |
-| 下载核心 | yt-dlp | 活跃维护的 youtube-dl 分支，YouTube 适配最快 |
-| 音视频合并 | ffmpeg | 业界标准，yt-dlp 直接调用 |
-| 后台线程 | QThread | PySide6 原生，信号/槽更新 GUI，零卡死 |
-| 打包 | PyInstaller | 单文件分发，无需用户安装 Python |
-| CI/CD | GitHub Actions | 自动构建 Windows .exe |
+| GUI | PySide6 | Qt 官方绑定，原生控件，支持 DPI 缩放 |
+| 下载核心 | yt-dlp | 活跃维护，YouTube/Bilibili/TikTok 适配快 |
+| 音视频合并 | ffmpeg | yt-dlp 直接调用；ffprobe 用于下载后校验 |
+| 后台线程 | QThread | 信号/槽更新 GUI |
+| 打包 | PyInstaller | 单文件分发 |
+| CI/CD | GitHub Actions | Windows + macOS 构建并发布 Release |
 
-## 为什么这样设计
-
-### GUI 与下载逻辑完全解耦
+## 分层
 
 ```
-gui.py          ← 纯 UI，不 import yt_dlp
-    ↓ 调用
-downloader.py   ← 纯逻辑，不 import PySide6
-    ↓ 桥接
-worker.py       ← QThread，信号连接两端
+gui.py + theme.py       ← 纯 UI / QSS，不 import yt_dlp
+    ↓
+worker.py               ← QThread，Qt Signal 连接两端
+    ↓
+platforms/ + downloader.py + batch_io.py   ← 纯逻辑，不 import PySide6
 ```
 
-好处：
-- `downloader.py` 可以独立被其他项目（CLI、Web）调用
-- 单元测试不需要启动 GUI
-- 换 GUI 框架不影响下载逻辑
+`downloader.py` 与平台插件可被 CLI / Web 复用；单元测试不需要显示服务器。
 
-### 两阶段 Cookie 策略
+## 两阶段 Cookie 策略
 
 ```
-Stage 1: 无 Cookie 下载
-  └─ 99% 公开视频直接成功
-
-Stage 2: Cookie 重试（仅 3 种错误触发）
-  ├─ BOT_VERIFICATION  → YouTube 要求验证
-  ├─ AUTH_REQUIRED     → 年龄/登录限制
-  └─ PRIVATE_VIDEO     → 私有视频
+Stage 1: 无 Cookie 下载 —— 99% 公开视频直接成功
+Stage 2: 仅对 BOT_VERIFICATION / AUTH_REQUIRED / PRIVATE_VIDEO
+         用浏览器 Cookie 重试
 ```
 
-如果默认先尝 Cookie，10000 个视频 = 20000 次网络请求（全浪费）。
-反过来，99% 只需 1 次请求。
+若浏览器 Cookie 读取失败（如「copy chrome cookie」错误），本次会话跳过后续所有 Cookie 尝试。
 
-### 错误分类（9 类）
+## 错误分类（10 类）
+
+`_CATEGORY_RULES` 按优先级匹配关键词，每类带 `retry_cookie`：
 
 ```
-SUCCESS           下载成功
-BOT_VERIFICATION  YouTube 反爬检测 → 触发 Cookie 重试
-AUTH_REQUIRED     需要登录/年龄验证 → 触发 Cookie 重试
-PRIVATE_VIDEO     私有视频 → 触发 Cookie 重试
-RATE_LIMIT        HTTP 429 限流 → 不重试
-VIDEO_UNAVAILABLE 已删除/下架/版权 → 不重试
-NETWORK_ERROR     超时/SSL/连接中断 → 不重试
-CANCELLED         用户取消 → 不重试
-UNKNOWN           未分类 → 不重试
+SUCCESS / BOT_VERIFICATION / AUTH_REQUIRED / PRIVATE_VIDEO
+RATE_LIMIT / VIDEO_UNAVAILABLE / NETWORK_ERROR
+CANCELLED / ENVIRONMENT / UNKNOWN
 ```
 
-所有结果写入输出根目录的 `下载总览.csv`（含 `错误类型`、`错误信息`），输出目录镜像输入层级，文件名为 `<原表行号>_<媒体ID>`。
+结果写入输出根目录的 `下载总览.csv`（含 `错误类型`、`错误信息`）。
 
 ## 项目结构
 
 ```
-youtube_downloader/
-├── main.py                  # 入口，QApplication + MainWindow
-├── gui.py                   # 主窗口（纯 UI）
-├── downloader.py            # yt-dlp 封装 + 错误分类 + 环境检测
-├── worker.py                # DownloadWorker / BatchDownloadWorker
-├── requirements.txt         # Python 依赖
-├── README.md                # 使用说明
-├── BUILD.md                 # 本文档
-└── .github/workflows/
-    └── build.yml            # CI：自动构建 Windows .exe
-```
-
-## 核心流程
-
-### 单视频
-
-```text
-输入 Video ID → get_info() → 选格式 → download()
-                                    ↓
-                              progress_hooks
-                                    ↓
-                          GUI 实时刷新进度/速度/ETA
-```
-
-### 批量下载（Load CSV）
-
-```text
-Load CSV
-  ↓
-取前 5 个 video_id → 后台线程分析格式交集 → 展示共有格式
-  ↓
-用户选格式 → 点击下载
-  ↓
-for each video:
-  ├─ Stage 1: get_info(cookies=F) → download(cookies=F)
-  │   ├─ 成功 → 下一个
-  │   └─ 失败 → classify_error()
-  │       ├─ retry_cookie=True  → Stage 2
-  │       └─ retry_cookie=False → 记录失败
-  │
-  └─ Stage 2: get_info(cookies=T) → download(fmt="best")
-      ├─ 成功 → 下一个 (cookie_used=true)
-      └─ 失败 → 记录失败 → 重检浏览器 → 再试一次
-```
-
-### 格式降级
-
-```text
-用户选 720p mp4 Video+Audio
-  ↓
-某视频没有 720p → 自动降级到 480p mp4 Video+Audio
-  ↓
-还没有？→ 降级到 360p
-  ↓
-还没有？→ "best"（yt-dlp 自选最优）
+youtube_down/
+├── main.py                 # 入口
+├── gui.py                  # 主窗口（纯 UI）
+├── theme.py                # 主题 / QSS / QSettings
+├── worker.py               # BatchDownloadWorker、PlaylistExpandWorker 等
+├── downloader.py           # yt-dlp 封装、错误分类、校验、环境检测
+├── batch_io.py             # 输入发现、输出镜像、下载总览.csv
+├── platforms/
+│   ├── base.py             # Platform / MediaInput / ABC
+│   ├── youtube.py
+│   ├── bilibili.py
+│   ├── tiktok.py
+│   └── facade.py           # 按平台路由（YoutubeDownloader）
+├── download_cli.py         # 命令行入口
+├── scripts/                # 诊断与压力测试脚本（不参与 pytest 收集）
+├── tests/                  # 单元测试
+├── smoke_test.py           # CI 冒烟测试
+└── .github/workflows/build.yml
 ```
 
 ## 下载后校验
 
-```text
-文件存在 → size > 1KB → ffprobe 能解析 duration
-  ↓              ↓              ↓
-  失败           失败            失败
-  → 报错         → 0字节空壳      → 文件损坏
-```
+四项依次执行，任一失败即报错并写入总览：
+
+1. 文件存在且大小 > 1KB
+2. `ffprobe` 能解析时长（有效媒体；ffprobe 缺失记为 `ENVIRONMENT`）
+3. 实际时长与预期相差 ≤ 5%
+4. 指定 `min_height` 时，ffprobe 校验实际高度
+
+仅音频模式把视频轨检查替换为音频轨检查。
 
 ## 环境依赖
 
-### 必需
-
 | 组件 | 检查方式 | 用途 |
 |------|---------|------|
-| yt-dlp | `import yt_dlp` | 下载核心 |
-| ffmpeg | `shutil.which("ffmpeg")` | 音视频合并 |
-| ffprobe | `shutil.which("ffprobe")` | 下载后校验文件完整性 |
+| yt-dlp（`[default,curl-cffi]`） | `import yt_dlp` | 下载核心、浏览器指纹 |
+| ffmpeg | `shutil.which` | 合并 / 转码 / 内嵌字幕 |
+| ffprobe | `shutil.which` | 下载后校验（致命依赖） |
+| yt-dlp-ejs + deno | 探测 | YouTube JS 挑战 |
 
-### Cookie 模式额外需要
+Cookie 由 yt-dlp 直接读取浏览器 Cookie 数据库（`cookiesfrombrowser`），不使用 `browser_cookie3`。
 
-| 组件 | 原因 |
-|------|------|
-| yt-dlp-ejs | yt-dlp 的 JS 挑战解决脚本 |
-| deno | JS 运行时，执行挑战脚本 |
-| 浏览器 Cookie 目录 | Chrome/Firefox/etc 的 SQLite cookie DB |
+## 构建
 
-所有依赖在启动时自动检测，缺失弹窗提示。
-
-## 构建 .exe
-
-### 本地（Linux，验证打包逻辑用）
+### 本地（验证打包逻辑）
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed \
-  --name "YouTubeDownloader" \
-  --hidden-import PySide6.QtCore \
-  --hidden-import PySide6.QtWidgets \
-  --hidden-import yt_dlp \
-  --hidden-import yt_dlp.extractor \
-  --hidden-import yt_dlp.downloader \
+pyinstaller --onefile --windowed --name "YouTubeDownloader" \
+  --add-data "VERSION:." \
+  --collect-all yt_dlp --collect-all yt_dlp_ejs --collect-all curl_cffi \
+  --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
+  --hidden-import platforms --hidden-import platforms.youtube \
+  --hidden-import platforms.bilibili --hidden-import platforms.tiktok \
+  --hidden-import theme --hidden-import batch_io \
   main.py
-./dist/YouTubeDownloader
 ```
 
-### GitHub Actions（生成 Windows .exe）
+Windows 用 `;` 作为 `--add-data` 分隔符；macOS/Linux 用 `:`。
 
-推送到 `main` 分支自动触发。workflow：
-1. `windows-latest` runner
-2. 安装 PySide6 + yt-dlp + PyInstaller
-3. 下载 ffmpeg Windows 二进制
-4. PyInstaller 打包单文件，内嵌 ffmpeg
-5. 上传 artifact
+### CI
 
-在 Actions 页面下载 `YouTubeDownloader.exe`。
+推送到 `main` 触发 `.github/workflows/build.yml`：
 
-## Cookie 浏览器检测
+1. Windows / macOS 矩阵，Python 3.12
+2. `pip install -r requirements.txt pytest pyinstaller`
+3. 单元测试（`QT_QPA_PLATFORM=offscreen`）
+4. 下载 ffmpeg / ffprobe / deno 并内嵌
+5. `smoke_test.py`
+6. PyInstaller 单文件打包 → 上传 artifact
+7. `release` job 按 `VERSION` 创建 GitHub Release
 
-```text
-Linux:   ~/.config/google-chrome/{Default,Profile 1,Profile 2,...}/Cookies
-         ~/.mozilla/firefox/
-Windows: %LOCALAPPDATA%\Google\Chrome\User Data\{Default,Profile 1,...}\Cookies
+产物：`YouTubeDownloader-Windows.exe`、`YouTubeDownloader-macOS.zip`。
 
-优先级: Chrome(Default→Profile*) → Firefox → Edge → Chromium → Brave → Opera
-```
+## 下载总览.csv
 
-yt-dlp 通过 `browser_cookie3` 库直接读取 SQLite，使用系统 keyring 解密。不需要打开浏览器。
-
-## 结果 CSV 格式
+utf-8-sig，输出根目录唯一一份，按 `(来源文件, video_id)` upsert：
 
 ```csv
-video_id,status,error_category,error_message,cookie_used
-dQw4w9WgXcQ,success,SUCCESS,,false
-jNQXAC9IVRw,success,SUCCESS,/path/to/file.mp4,true
-INVALID_ID,failed,VIDEO_UNAVAILABLE,Video unavailable,false
+来源文件,行号,video_id,平台,链接,标题,状态,错误类型,错误信息,输出文件,更新时间
+videos.csv,2,dQw4w9WgXcQ,youtube,https://www.youtube.com/watch?v=dQw4w9WgXcQ,标题,成功,,,out/videos/0002_dQw4w9WgXcQ.mp4,2026-01-01 12:00:00
 ```
+
+写入带跨进程文件锁（`fcntl.flock` / `msvcrt.locking`），原子替换。

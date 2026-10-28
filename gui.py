@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -51,7 +53,13 @@ from batch_io import (
     output_dir_for,
     parse_pasted_text,
 )
-from downloader import YoutubeDownloader, check_environment
+from downloader import (
+    YoutubeDownloader,
+    build_extra_options,
+    check_environment,
+    looks_like_playlist,
+    proxy_reachable,
+)
 from logger_utils import AppLogger
 from platforms.base import Platform
 from theme import (
@@ -60,10 +68,17 @@ from theme import (
     load_palette,
     preset_names,
     save_palette,
+    settings,
     theme_preview,
     with_accent,
 )
-from worker import AUTO_FORMAT_ID, BatchDownloadWorker, ValidateCookieWorker, YtdlpUpdateWorker
+from worker import (
+    AUTO_FORMAT_ID,
+    BatchDownloadWorker,
+    PlaylistExpandWorker,
+    ValidateCookieWorker,
+    YtdlpUpdateWorker,
+)
 from yt_dlp_updater import load_state, overlay_enabled, should_auto_check
 
 _PLATFORM_KEYS = (Platform.YOUTUBE, Platform.BILIBILI, Platform.TIKTOK)
@@ -78,6 +93,11 @@ class MainWindow(QMainWindow):
         ("1440p", 1440),
         ("2160p (4K)", 2160),
         ("自定义", None),
+    )
+    _SUBS_LANG_SETS: tuple[list[str], ...] = (
+        ["zh-Hans", "zh", "en"],
+        ["zh-Hans", "zh"],
+        ["en"],
     )
 
     def __init__(self) -> None:
@@ -109,6 +129,16 @@ class MainWindow(QMainWindow):
         self._batch_video_ids: list[str] = []
         self._current_video_id: str = ""
         self._queue_results: list[tuple[int, int, int, str]] = []
+        self._cancelled: bool = False
+        self._downloading: bool = False
+        self._paused: bool = False
+        self._env_ok: bool = True
+        self._source_dirs: dict[str, Path] = {}
+        self._last_audio_only: bool = False
+        self._last_audio_format: str = "m4a"
+        self._expand_pending: list[str] = []
+        self._expand_collected: list[str] = []
+        self._expand_workers: list[PlaylistExpandWorker] = []
         self._selected_platform = Platform.YOUTUBE
         self._palette = load_palette()
 
@@ -122,10 +152,12 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self._restore_settings()
         self._refresh_cookie_ui()
         AppLogger.attach_gui(self._append_log_line)
 
         all_ok, env_items = check_environment()
+        self._env_ok = all_ok
         errors = [i for i in env_items if i.status == "error"]
         warnings = [i for i in env_items if i.status == "warning"]
         if errors or warnings:
@@ -147,10 +179,15 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1500, self._maybe_auto_check_ytdlp)
 
     def closeEvent(self, event: Any) -> None:
+        self._save_settings()
         if self._ytdlp_update_worker is not None and self._ytdlp_update_worker.isRunning():
             self._ytdlp_update_worker.wait(3000)
         if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
             self._validate_cookie_worker.wait(3000)
+        self._expand_pending.clear()
+        self._expand_collected.clear()
+        for expand in list(self._expand_workers):
+            expand.wait(3000)
         if self._worker is not None and self._worker.isRunning():
             self._downloader.cancel()
             self._worker.quit()
@@ -163,11 +200,20 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event: Any) -> None:
+        # 下载中不接受拖入：会覆盖待执行队列并允许启动第二个 worker
+        if self._download_running():
+            event.ignore()
+            return
         filepaths = [
             url.toLocalFile() for url in event.mimeData().urls()
             if url.toLocalFile().lower().endswith((".csv", ".tsv", ".txt"))
         ]
         if not filepaths:
+            # 拖入网页链接（浏览器拖拽带 url 但非本地文件）→ 走粘贴框同一条路径
+            text = event.mimeData().text().strip()
+            if "http://" in text or "https://" in text:
+                self._url_edit.setPlainText(text)
+                self._on_add_url()
             return
         if len(filepaths) == 1 and YoutubeDownloader.is_netscape_cookie_file(filepaths[0]):
             self._apply_cookie_file(filepaths[0])
@@ -394,6 +440,9 @@ class MainWindow(QMainWindow):
         btn_col.addWidget(self._load_csv_btn)
         btn_col.addWidget(self._load_folder_btn)
         url_row.addWidget(self._url_edit, stretch=1)
+        self._paste_btn = QPushButton("粘贴")
+        self._paste_btn.setToolTip("把剪贴板内容填入左侧输入框")
+        url_row.addWidget(self._paste_btn)
         url_row.addLayout(btn_col)
         input_layout.addLayout(url_row)
         self._url_edit.setFixedHeight(btn_col.sizeHint().height())
@@ -416,6 +465,15 @@ class MainWindow(QMainWindow):
         opts.addWidget(self._min_height_input)
         opts.addSpacing(8)
 
+        self._audio_checkbox = QCheckBox("仅音频")
+        self._audio_checkbox.setToolTip("下载最佳音轨并转换为 m4a / mp3")
+        self._audio_format_combo = QComboBox()
+        self._audio_format_combo.addItems(["m4a", "mp3", "opus"])
+        self._audio_format_combo.setVisible(False)
+        opts.addWidget(self._audio_checkbox)
+        opts.addWidget(self._audio_format_combo)
+        opts.addSpacing(8)
+
         opts.addWidget(QLabel("输出"))
         self._output_input = QLineEdit(str(self._output_dir))
         self._browse_btn = QPushButton("浏览…")
@@ -428,15 +486,51 @@ class MainWindow(QMainWindow):
         )
         opts.addWidget(self._brutal_checkbox)
         input_layout.addLayout(opts)
+
+        extras = QHBoxLayout()
+        extras.setSpacing(8)
+        self._subs_checkbox = QCheckBox("字幕")
+        self._subs_checkbox.setToolTip("下载字幕 SRT 并嵌入视频（仅视频模式）")
+        self._subs_lang_combo = QComboBox()
+        self._subs_lang_combo.addItems(["中英", "中文", "英文"])
+        self._subs_lang_combo.setToolTip("嵌入的字幕语言")
+        self._meta_checkbox = QCheckBox("元数据")
+        self._meta_checkbox.setToolTip("把标题、上传者等写入文件")
+        self._thumb_checkbox = QCheckBox("封面")
+        self._thumb_checkbox.setToolTip("下载并嵌入视频封面")
+        self._proxy_input = QLineEdit()
+        self._proxy_input.setPlaceholderText("代理 http://127.0.0.1:7897（留空不走代理）")
+        self._rate_combo = QComboBox()
+        self._rate_combo.addItems(["不限速", "1M", "5M", "10M"])
+        self._rate_combo.setToolTip("单条视频下载限速")
+        self._impersonate_checkbox = QCheckBox("浏览器指纹（实验）")
+        self._impersonate_checkbox.setToolTip(
+            "仅取信息阶段用 curl-cffi 模拟 Chrome；需安装 curl-cffi"
+        )
+        extras.addWidget(self._subs_checkbox)
+        extras.addWidget(self._subs_lang_combo)
+        extras.addWidget(self._meta_checkbox)
+        extras.addWidget(self._thumb_checkbox)
+        extras.addSpacing(8)
+        extras.addWidget(QLabel("代理"))
+        extras.addWidget(self._proxy_input, stretch=1)
+        extras.addWidget(QLabel("限速"))
+        extras.addWidget(self._rate_combo)
+        extras.addWidget(self._impersonate_checkbox)
+        input_layout.addLayout(extras)
         layout.addWidget(input_card)
 
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(["平台", "ID/URL", "状态", "进度"])
+        self._table = QTableWidget(0, 6)
+        self._table.setHorizontalHeaderLabels(
+            ["平台", "ID/URL", "标题", "状态", "进度", "错误"]
+        )
         header_view = self._table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header_view.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header_view.setHighlightSections(False)
         self._table.verticalHeader().setVisible(False)
@@ -446,6 +540,8 @@ class MainWindow(QMainWindow):
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_table_menu)
         self._table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self._table, stretch=2)
 
@@ -484,10 +580,17 @@ class MainWindow(QMainWindow):
         self._cancel_btn = QPushButton("取消")
         self._cancel_btn.setObjectName("dangerBtn")
         self._cancel_btn.setEnabled(False)
+        self._pause_btn = QPushButton("暂停")
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setToolTip("在当前视频结束后暂停，继续时从下一个视频开始")
+        self._history_btn = QPushButton("历史")
+        self._history_btn.setToolTip("查看当前输出目录的下载总览")
         self._open_dir_btn = QPushButton("打开目录")
         self._log_toggle_btn = QPushButton("收起日志")
         action_row.addWidget(self._download_btn)
+        action_row.addWidget(self._pause_btn)
         action_row.addWidget(self._cancel_btn)
+        action_row.addWidget(self._history_btn)
         action_row.addWidget(self._open_dir_btn)
         action_row.addStretch(1)
         action_row.addWidget(self._log_toggle_btn)
@@ -510,18 +613,68 @@ class MainWindow(QMainWindow):
         self._load_csv_btn.clicked.connect(self._on_load_csv)
         self._load_folder_btn.clicked.connect(self._on_load_folder)
         self._add_url_btn.clicked.connect(self._on_add_url)
+        self._paste_btn.clicked.connect(self._on_paste_clipboard)
+        self._pause_btn.clicked.connect(self._on_pause)
+        self._history_btn.clicked.connect(self._show_history)
         self._browse_btn.clicked.connect(self._on_browse)
         self._download_btn.clicked.connect(self._on_download)
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._open_dir_btn.clicked.connect(self._on_open_dir)
         self._log_toggle_btn.clicked.connect(self._on_toggle_log)
         self._quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+        self._audio_checkbox.toggled.connect(self._on_audio_toggled)
         self._accent_btn.clicked.connect(self._on_pick_accent)
         self._ytdlp_update_btn.clicked.connect(self._on_check_ytdlp_update)
         self._shortcut_download = QShortcut("Ctrl+D", self)
         self._shortcut_download.activated.connect(self._on_download)
         self._shortcut_cancel = QShortcut("Escape", self)
         self._shortcut_cancel.activated.connect(self._on_cancel)
+
+    def _save_settings(self) -> None:
+        s = settings()
+        s.setValue("download/output_dir", self._output_input.text())
+        s.setValue("download/quality_index", self._quality_combo.currentIndex())
+        s.setValue("download/brutal", self._brutal_checkbox.isChecked())
+        s.setValue("download/audio_only", self._audio_checkbox.isChecked())
+        s.setValue("download/audio_format", self._audio_format_combo.currentText())
+        s.setValue("download/subs", self._subs_checkbox.isChecked())
+        s.setValue("download/subs_langs", self._subs_lang_combo.currentIndex())
+        s.setValue("download/metadata", self._meta_checkbox.isChecked())
+        s.setValue("download/thumbnail", self._thumb_checkbox.isChecked())
+        s.setValue("download/proxy", self._proxy_input.text())
+        s.setValue("download/rate", self._rate_combo.currentText())
+        s.setValue("download/impersonate", self._impersonate_checkbox.isChecked())
+
+    def _restore_settings(self) -> None:
+        s = settings()
+        output_dir = str(s.value("download/output_dir", "") or "")
+        if output_dir:
+            self._output_dir = Path(output_dir)
+            self._output_input.setText(output_dir)
+        index = int(s.value("download/quality_index", 0) or 0)
+        self._quality_combo.setCurrentIndex(
+            min(max(index, 0), self._quality_combo.count() - 1)
+        )
+        self._brutal_checkbox.setChecked(bool(s.value("download/brutal", False, type=bool)))
+        self._meta_checkbox.setChecked(bool(s.value("download/metadata", False, type=bool)))
+        self._thumb_checkbox.setChecked(bool(s.value("download/thumbnail", False, type=bool)))
+        self._impersonate_checkbox.setChecked(
+            bool(s.value("download/impersonate", False, type=bool))
+        )
+        self._proxy_input.setText(str(s.value("download/proxy", "") or ""))
+        for combo, key in ((self._rate_combo, "download/rate"),
+                           (self._audio_format_combo, "download/audio_format")):
+            value = str(s.value(key, "") or "")
+            if value and combo.findText(value) >= 0:
+                combo.setCurrentText(value)
+        self._audio_checkbox.setChecked(
+            bool(s.value("download/audio_only", False, type=bool))
+        )
+        self._subs_checkbox.setChecked(bool(s.value("download/subs", False, type=bool)))
+        lang_index = int(s.value("download/subs_langs", 0) or 0)
+        self._subs_lang_combo.setCurrentIndex(
+            min(max(lang_index, 0), self._subs_lang_combo.count() - 1)
+        )
 
     # ------------------------------------------------------------------
     # Theme
@@ -787,6 +940,13 @@ class MainWindow(QMainWindow):
         inputs, errors = discover_inputs(Path(directory))
         self._load_inputs(inputs, errors)
 
+    def _on_paste_clipboard(self) -> None:
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            self.statusBar().showMessage("剪贴板为空", 3000)
+            return
+        self._url_edit.setPlainText(text)
+
     def _on_add_url(self) -> None:
         text = self._url_edit.toPlainText().strip()
         if not text:
@@ -798,26 +958,118 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "部分输入无效", f"以下内容无法识别，已忽略：\n{preview}{more}")
         if not valid:
             return
-        added = 0
-        for source in valid:
+        playlist_urls = [s for s in valid if looks_like_playlist(s)]
+        if playlist_urls:
+            self._expand_pending = playlist_urls
+            self._expand_collected = [s for s in valid if s not in playlist_urls]
+            self._add_url_btn.setEnabled(False)
+            self._status_label.setText(f"正在展开 {len(playlist_urls)} 个播放列表…")
+            self._expand_next()
+            return
+        self._add_sources(valid)
+
+    def _expand_next(self) -> None:
+        if not self._expand_pending:
+            self._add_url_btn.setEnabled(True)
+            self._add_sources(self._expand_collected)
+            return
+        url = self._expand_pending.pop(0)
+        worker = PlaylistExpandWorker(self._downloader, url, limit=500)
+        worker.expanded.connect(self._on_playlist_expanded)
+        worker.failed.connect(self._on_playlist_failed)
+        worker.finished.connect(
+            lambda w=worker: self._expand_workers.remove(w)
+            if w in self._expand_workers else None
+        )
+        self._expand_workers.append(worker)
+        worker.start()
+
+    def _on_playlist_expanded(self, urls: list[str]) -> None:
+        self._log(f"播放列表展开: {len(urls)} 条")
+        self._expand_collected.extend(urls)
+        self._expand_next()
+
+    def _on_playlist_failed(self, message: str) -> None:
+        self._log(f"播放列表展开失败: {message}")
+        self._expand_next()
+
+    def _reset_batch_state(self) -> None:
+        """开始新一轮导入：清掉上一批的队列、结果表与统计，避免串批。"""
+        self._csv_ids = []
+        self._csv_queue = []
+        self._source_dirs.clear()
+        self._csv_cookie_overrides.clear()
+        self._batch_video_ids = []
+        self._batch_errors.clear()
+        self._queue_results.clear()
+        self._batch_done = 0
+        self._batch_total = 0
+        self._current_video_id = ""
+        self._table.setRowCount(0)
+        self._csv_label.setText("")
+        self._reset_progress_display()
+
+    def _reset_progress_display(self) -> None:
+        self._progress_bar.setValue(0)
+        self._batch_progress_bar.setValue(0)
+        self._progress_label.setText("0%")
+        self._speed_label.setText("—")
+        self._eta_label.setText("ETA: —")
+        self._size_label.setText("— / —")
+
+    def _add_sources(self, sources: list[str]) -> None:
+        # 上一批已结束（队列被消费完）时，粘贴/展开的新链接开启新一轮
+        if not self._download_running() and not self._csv_queue:
+            self._reset_batch_state()
+        if not sources:
+            self._url_edit.clear()
+            self._status_label.setText("播放列表为空或展开失败")
+            self._log("未加入任何视频")
+            return
+        added_ids: list[str] = []
+        for source in sources:
             if source in self._csv_ids:
                 continue
             self._csv_ids.append(source)
+            added_ids.append(source)
             try:
                 label = YoutubeDownloader.parse_input(source).label
             except ValueError:
                 label = "?"
             self._append_queue_row(label, source, "等待中", 0)
-            added += 1
-        row_numbers = {source: index for index, source in enumerate(self._csv_ids, start=1)}
-        self._csv_queue = [(PASTE_SOURCE, list(self._csv_ids), None, row_numbers)]
+        if added_ids:
+            # 保留已导入的 CSV 分组，只把新链接并入/新增 paste 组
+            paste_index = next(
+                (
+                    index
+                    for index, (name, _ids, explicit, _rows) in enumerate(self._csv_queue)
+                    if name == PASTE_SOURCE and explicit is None
+                ),
+                None,
+            )
+            if paste_index is None:
+                self._csv_queue.append(
+                    (PASTE_SOURCE, added_ids, None,
+                     {source: index for index, source in enumerate(added_ids, start=1)})
+                )
+            else:
+                name, ids, explicit, _rows = self._csv_queue[paste_index]
+                ids = ids + added_ids
+                self._csv_queue[paste_index] = (
+                    name, ids, explicit,
+                    {source: index for index, source in enumerate(ids, start=1)},
+                )
         self._url_edit.clear()
-        self._download_btn.setEnabled(True)
-        self._csv_label.setText(f"队列 {len(self._csv_ids)} 个视频")
+        self._download_btn.setEnabled(self._env_ok and not self._download_running())
+        total = sum(len(ids) for _, ids, _, _ in self._csv_queue)
+        if len(self._csv_queue) == 1 and self._csv_queue[0][0] == PASTE_SOURCE:
+            self._csv_label.setText(f"队列 {total} 个视频")
+        else:
+            self._csv_label.setText(f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频")
         self._status_label.setText(
-            f"已加入 {added} 个 — {self._quality_label(*self._get_quality_settings())}"
+            f"已加入 {len(added_ids)} 个 — {self._quality_label(*self._get_quality_settings())}"
         )
-        self._log(f"加入队列: {added} 个（共 {len(self._csv_ids)}）")
+        self._log(f"加入队列: {len(added_ids)} 个（共 {total} 个）")
 
     def _status_item(self, status: str) -> QTableWidgetItem:
         item = QTableWidgetItem(status)
@@ -835,24 +1087,48 @@ class MainWindow(QMainWindow):
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 1)
             if item and item.text() == vid:
-                self._table.setItem(row, 2, self._status_item(status))
-                self._table.setItem(row, 3, QTableWidgetItem(f"{progress}%"))
+                self._table.setItem(row, 3, self._status_item(status))
+                self._table.setItem(row, 4, QTableWidgetItem(f"{progress}%"))
                 return
         row = self._table.rowCount()
         self._table.insertRow(row)
         self._table.setItem(row, 0, QTableWidgetItem(platform_name))
         self._table.setItem(row, 1, QTableWidgetItem(vid))
-        self._table.setItem(row, 2, self._status_item(status))
-        self._table.setItem(row, 3, QTableWidgetItem(f"{progress}%"))
+        self._table.setItem(row, 2, QTableWidgetItem(""))
+        self._table.setItem(row, 3, self._status_item(status))
+        self._table.setItem(row, 4, QTableWidgetItem(f"{progress}%"))
+        self._table.setItem(row, 5, QTableWidgetItem(""))
 
-    def _set_row_status(self, video_id: str, status: str, progress: int | None = None) -> None:
+    def _row_for_video(self, video_id: str) -> int | None:
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 1)
             if item and item.text() == video_id:
-                self._table.setItem(row, 2, self._status_item(status))
-                if progress is not None:
-                    self._table.setItem(row, 3, QTableWidgetItem(f"{progress}%"))
-                return
+                return row
+        return None
+
+    def _set_row_status(
+        self,
+        video_id: str,
+        status: str,
+        progress: int | None = None,
+        title: str | None = None,
+        error: str | None = None,
+        path: str | None = None,
+    ) -> None:
+        row = self._row_for_video(video_id)
+        if row is None:
+            return
+        self._table.setItem(row, 3, self._status_item(status))
+        if progress is not None:
+            self._table.setItem(row, 4, QTableWidgetItem(f"{progress}%"))
+        if title:
+            self._table.setItem(row, 2, QTableWidgetItem(title))
+        if error is not None:
+            self._table.setItem(row, 5, QTableWidgetItem(error))
+        if path:
+            item = self._table.item(row, 1)
+            if item:
+                item.setData(Qt.ItemDataRole.UserRole, path)
 
     def _process_imported_files(self, filepaths: list[str]) -> None:
         inputs: list[InputFile] = []
@@ -878,9 +1154,7 @@ class MainWindow(QMainWindow):
 
         all_ids: list[str] = []
         detected_columns: list[str] = []
-        self._csv_queue = []
-        self._csv_cookie_overrides = {}
-        self._table.setRowCount(0)
+        self._reset_batch_state()
         seen_names: set[str] = set()
 
         for inp in inputs:
@@ -914,6 +1188,8 @@ class MainWindow(QMainWindow):
             name = self._unique_queue_rel(inp.rel, seen_names)
             seen_names.add(name)
             output_dir = self._resolve_import_output_dir(rows)
+            if output_dir:
+                self._source_dirs[name] = output_dir
             # 保留首次出现的行号；同源同 ID 合并（总览键限制）
             unique_ids = list(dict.fromkeys(ids))
             if len(unique_ids) < len(ids):
@@ -939,7 +1215,7 @@ class MainWindow(QMainWindow):
         total = sum(len(ids) for _, ids, _, _ in self._csv_queue)
         col_hint = f" | 列: {', '.join(detected_columns)}" if detected_columns else ""
         self._csv_label.setText(f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频{col_hint}")
-        self._download_btn.setEnabled(True)
+        self._download_btn.setEnabled(self._env_ok and not self._download_running())
         min_height, strict = self._get_quality_settings()
         self._status_label.setText(
             f"已加载 {total} 个视频 — {self._quality_label(min_height, strict)}"
@@ -960,8 +1236,16 @@ class MainWindow(QMainWindow):
         if not (self._csv_queue or self._csv_ids):
             QMessageBox.warning(self, "提示", "请先加载 CSV 或加入链接")
             return
+        self._cancelled = False
+        if not proxy_reachable(self._proxy_input.text()):
+            QMessageBox.warning(
+                self, "代理不可用",
+                f"无法连接代理 {self._proxy_input.text().strip()}\n"
+                "请启动代理，或清空代理后直连。",
+            )
+            return
         min_height, strict_quality = self._get_quality_settings()
-        output_dir = Path(self._output_input.text())
+        output_dir = Path(self._output_input.text()).expanduser()
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -970,6 +1254,10 @@ class MainWindow(QMainWindow):
         self._last_fmt_id = AUTO_FORMAT_ID
         self._last_min_height = min_height
         self._last_strict_quality = strict_quality
+        self._last_audio_only = self._audio_checkbox.isChecked()
+        self._last_audio_format = self._audio_format_combo.currentText()
+        self._downloader.set_ydl_opt_overrides(self._collect_ydl_overrides())
+        self._downloader.set_impersonate(self._impersonate_checkbox.isChecked())
         self._output_dir = output_dir
         brutal = self._brutal_checkbox.isChecked()
         self._last_brutal_mode = brutal
@@ -1011,6 +1299,8 @@ class MainWindow(QMainWindow):
         self._batch_done = 0
         self._batch_total = len(video_ids)
         self._batch_video_ids = list(video_ids)
+        self._current_video_id = ""
+        self._reset_progress_display()
         self._worker = BatchDownloadWorker(
             downloader=self._downloader,
             video_ids=video_ids,
@@ -1028,6 +1318,8 @@ class MainWindow(QMainWindow):
             overview=self._overview,
             source_rel=source_rel,
             row_numbers=row_numbers,
+            audio_only=self._last_audio_only,
+            audio_format=self._last_audio_format,
         )
         w = self._worker
         w.all_progress_changed.connect(self._on_batch_progress)
@@ -1041,25 +1333,55 @@ class MainWindow(QMainWindow):
         w.status_changed.connect(self._on_status)
         w.all_finished.connect(self._on_batch_all_finished)
         self._batch_progress_bar.setValue(0)
+        self._paused = False
+        self._pause_btn.setText("暂停")
         self._set_downloading_ui(True)
         self._worker.start()
 
+    def _download_running(self) -> bool:
+        return self._downloading
+
     def _on_cancel(self) -> None:
-        if self._worker is not None and self._worker.isRunning():
-            self._downloader.cancel()
-            self._worker.wait(10000)
-        self._set_downloading_ui(False)
+        if not self._download_running():
+            return
+        # 取消 = 整批停止；worker 仍在跑，收尾交给 all_finished
+        self._cancelled = True
+        self._csv_queue.clear()
+        self._downloader.cancel()
+        self._cancel_btn.setEnabled(False)
+        self._pause_btn.setEnabled(False)
         self._progress_bar.setValue(0)
-        self._status_label.setText("已取消")
+        self._status_label.setText("正在取消…")
         self._log("用户取消下载")
 
+    def _on_pause(self) -> None:
+        if not self._download_running() or self._worker is None:
+            return
+        self._paused = not self._paused
+        if self._paused:
+            self._worker.pause()
+            self._pause_btn.setText("继续")
+            self._status_label.setText("已暂停（当前视频完成后生效）")
+        else:
+            self._worker.resume()
+            self._pause_btn.setText("暂停")
+            self._status_label.setText("继续下载…")
+
     def _set_downloading_ui(self, downloading: bool) -> None:
+        self._downloading = downloading
         self._load_csv_btn.setEnabled(not downloading)
         self._load_folder_btn.setEnabled(not downloading)
         self._add_url_btn.setEnabled(not downloading)
-        self._download_btn.setEnabled(not downloading and bool(self._csv_queue or self._csv_ids))
+        self._paste_btn.setEnabled(not downloading)
+        self._download_btn.setEnabled(
+            not downloading and self._env_ok and bool(self._csv_queue or self._csv_ids)
+        )
         self._cancel_btn.setEnabled(downloading)
-        self._quality_combo.setEnabled(not downloading)
+        self._pause_btn.setEnabled(downloading)
+        if not downloading:
+            self._paused = False
+            self._pause_btn.setText("暂停")
+        self._quality_combo.setEnabled(not downloading and not self._audio_checkbox.isChecked())
         self._min_height_input.setEnabled(not downloading)
         self._output_input.setEnabled(not downloading)
         self._browse_btn.setEnabled(not downloading)
@@ -1067,13 +1389,22 @@ class MainWindow(QMainWindow):
         self._clear_cookie_btn.setEnabled(not downloading)
         self._reload_browser_cookie_btn.setEnabled(not downloading)
         self._brutal_checkbox.setEnabled(not downloading)
+        self._audio_checkbox.setEnabled(not downloading)
+        self._audio_format_combo.setEnabled(not downloading)
+        self._subs_checkbox.setEnabled(not downloading and not self._audio_checkbox.isChecked())
+        self._subs_lang_combo.setEnabled(not downloading and self._subs_checkbox.isChecked())
+        self._meta_checkbox.setEnabled(not downloading)
+        self._thumb_checkbox.setEnabled(not downloading)
+        self._proxy_input.setEnabled(not downloading)
+        self._rate_combo.setEnabled(not downloading)
+        self._impersonate_checkbox.setEnabled(not downloading)
         if overlay_enabled():
             updating = (
                 self._ytdlp_update_worker is not None
                 and self._ytdlp_update_worker.isRunning()
             )
             self._ytdlp_update_btn.setEnabled(not downloading and not updating)
-        if not downloading:
+        if not downloading and self._worker is not None and not self._worker.isRunning():
             self._worker = None
 
     def _on_quality_changed(self, index: int) -> None:
@@ -1081,6 +1412,27 @@ class MainWindow(QMainWindow):
         self._min_height_input.setVisible(preset is None)
         if preset is not None:
             self._min_height_input.setText(str(preset))
+
+    def _on_audio_toggled(self, checked: bool) -> None:
+        self._audio_format_combo.setVisible(checked)
+        self._quality_combo.setEnabled(not checked)
+        self._min_height_input.setEnabled(not checked)
+        self._subs_checkbox.setEnabled(not checked)
+        self._subs_lang_combo.setEnabled(not checked)
+
+    def _collect_ydl_overrides(self) -> dict[str, object]:
+        """把界面开关翻译成 yt-dlp 选项（每次开始下载前调用）。"""
+        return build_extra_options(
+            subtitles=(
+                self._subs_checkbox.isChecked()
+                and not self._audio_checkbox.isChecked()
+            ),
+            metadata=self._meta_checkbox.isChecked(),
+            thumbnail=self._thumb_checkbox.isChecked(),
+            subtitle_langs=self._SUBS_LANG_SETS[self._subs_lang_combo.currentIndex()],
+            proxy=self._proxy_input.text(),
+            rate=self._rate_combo.currentText(),
+        )
 
     def _get_quality_settings(self) -> tuple[int, bool]:
         index = self._quality_combo.currentIndex()
@@ -1160,13 +1512,15 @@ class MainWindow(QMainWindow):
         self._size_label.setText("— / —")
         tag = " 🍪" if cookie else ""
         self._status_label.setText(f"[{index + 1}/{total}] 下载: {video_id}{tag}")
-        self._set_row_status(video_id, "下载中", 0)
+        self._set_row_status(video_id, "下载中", 0, error="")
         self._log(f"[{index + 1}/{total}] 开始: {video_id}{tag}")
 
-    def _on_batch_video_finished(self, index: int, path: str, cookie_used: bool) -> None:
+    def _on_batch_video_finished(
+        self, index: int, path: str, cookie_used: bool, title: str
+    ) -> None:
         self._batch_done = index + 1
         vid = self._batch_video_ids[index] if index < len(self._batch_video_ids) else "?"
-        self._set_row_status(vid, "完成", 100)
+        self._set_row_status(vid, "完成", 100, title=title, error="", path=path)
         tag = " [🍪]" if cookie_used else ""
         self._log(f"[{index + 1}/{self._batch_total}] 完成{tag}: {path}")
 
@@ -1175,7 +1529,7 @@ class MainWindow(QMainWindow):
         self._batch_errors = [(i, v, m) for i, v, m in self._batch_errors if i != index]
         self._batch_errors.append((index, vid, msg))
         status = "跳过" if "跳过" in msg or "低于" in msg else "失败"
-        self._set_row_status(vid, status, 0)
+        self._set_row_status(vid, status, 0, error=msg)
         if not self._log_view.isVisible():
             self._log_view.setVisible(True)
             self._log_toggle_btn.setText("收起日志")
@@ -1186,8 +1540,18 @@ class MainWindow(QMainWindow):
         self, success: int, fail: int, skipped: int, overview_path: str
     ) -> None:
         self._batch_progress_bar.setValue(100)
-        self._status_label.setText(f"批量完成：成功 {success}，失败 {fail}")
         self._batch_errors.clear()
+
+        if self._cancelled:
+            self._queue_results.clear()
+            self._csv_ids = []
+            self._csv_label.setText("")
+            self._status_label.setText(f"已取消（成功 {success}，失败 {fail}）")
+            self._log(f"已取消: 成功 {success}, 失败 {fail}, 总览: {overview_path}")
+            self._set_downloading_ui(False)
+            return
+
+        self._status_label.setText(f"批量完成：成功 {success}，失败 {fail}")
 
         if self._csv_queue:
             self._queue_results.append((success, fail, skipped, overview_path))
@@ -1220,17 +1584,137 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "批量下载完成", "批量下载完成\n\n" + "\n".join(parts))
             self._log(f"批量完成: 成功 {success}, 失败 {fail}, 总览: {overview_path}")
 
+        # 本轮队列已结束；结果表保留供查看/重试，下一轮导入时再清空
+        self._csv_ids = []
+        self._csv_label.setText("")
         self._set_downloading_ui(False)
 
     def _on_open_dir(self) -> None:
-        path = Path(self._output_input.text())
+        path = Path(self._output_input.text()).expanduser()
         path.mkdir(parents=True, exist_ok=True)
+        self._open_path(path)
+
+    def _show_history(self) -> None:
+        """只读展示当前输出目录的 下载总览.csv。"""
+        rows = sorted(
+            OverviewStore(Path(self._output_input.text()).expanduser()).rows(),
+            key=lambda r: (
+                r["来源文件"], int(r["行号"]) if r["行号"].isdigit() else 0,
+            ),
+        )
+        if not rows:
+            QMessageBox.information(self, "下载历史", "当前输出目录还没有下载记录。")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("下载历史")
+        dialog.resize(960, 540)
+        layout = QVBoxLayout(dialog)
+        filter_combo = QComboBox()
+        filter_combo.addItems(["全部", "成功", "失败", "跳过"])
+        layout.addWidget(filter_combo)
+        table = QTableWidget(0, 7)
+        table.setHorizontalHeaderLabels(
+            ["来源文件", "行号", "标题", "状态", "错误类型", "错误信息", "输出文件"]
+        )
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(table)
+
+        def fill() -> None:
+            wanted = filter_combo.currentText()
+            shown = [r for r in rows if wanted == "全部" or r["状态"] == wanted]
+            table.setRowCount(len(shown))
+            for row_index, row in enumerate(shown):
+                for col, key in enumerate(
+                    ["来源文件", "行号", "标题", "状态", "错误类型", "错误信息", "输出文件"]
+                ):
+                    table.setItem(row_index, col, QTableWidgetItem(row.get(key, "")))
+
+        filter_combo.currentTextChanged.connect(fill)
+        fill()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
+
+    @staticmethod
+    def _open_path(path: Path) -> None:
         if os.name == "nt":
             os.startfile(str(path))  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
             subprocess.Popen(["open", str(path)])
         else:
             subprocess.Popen(["xdg-open", str(path)])
+
+    def _on_table_menu(self, pos: Any) -> None:
+        row = self._table.rowAt(pos.y())
+        if row < 0:
+            return
+        id_item = self._table.item(row, 1)
+        vid = id_item.text() if id_item else ""
+        path = id_item.data(Qt.ItemDataRole.UserRole) if id_item else None
+        menu = QMenu(self)
+        copy_action = menu.addAction("复制链接")
+        file_action = menu.addAction("打开文件")
+        file_action.setEnabled(bool(path))
+        folder_action = menu.addAction("打开所在目录")
+        retry_action = menu.addAction("重试失败项")
+        chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if chosen is copy_action:
+            link = vid
+            if "://" not in vid:
+                try:
+                    link = YoutubeDownloader.parse_input(vid).url
+                except ValueError:
+                    pass
+            QApplication.clipboard().setText(link)
+        elif chosen is file_action and path:
+            self._open_path(Path(path))
+        elif chosen is folder_action:
+            if path:
+                self._open_path(Path(path).parent)
+            else:
+                self._on_open_dir()
+        elif chosen is retry_action:
+            self._retry_failed()
+
+    def _retry_failed(self) -> None:
+        if self._download_running():
+            return
+        failed = []
+        for row in range(self._table.rowCount()):
+            status = self._table.item(row, 3)
+            vid = self._table.item(row, 1)
+            if status and vid and status.text() == "失败":
+                failed.append(vid.text())
+        if not failed:
+            QMessageBox.information(self, "重试", "没有失败项")
+            return
+        # 沿用总览里原来的来源文件/行号，重试成功后不会留下同一条旧的失败行
+        origin: dict[str, tuple[str, int]] = {}
+        for row in self._overview.rows() if self._overview else []:
+            vid = row.get("video_id", "")
+            if vid in failed and vid not in origin:
+                row_no = row.get("行号", "")
+                origin[vid] = (
+                    row.get("来源文件", "") or PASTE_SOURCE,
+                    int(row_no) if row_no.isdigit() else 0,
+                )
+        groups: dict[str, list[str]] = {}
+        numbers: dict[str, dict[str, int]] = {}
+        for vid in failed:
+            source, row_no = origin.get(vid, (PASTE_SOURCE, 0))
+            groups.setdefault(source, []).append(vid)
+            if row_no:
+                numbers.setdefault(source, {})[vid] = row_no
+        self._csv_ids = failed
+        self._csv_queue = [
+            (source, ids, self._source_dirs.get(source), numbers.get(source, {}))
+            for source, ids in groups.items()
+        ]
+        self._log(f"重试失败项: {len(failed)} 个")
+        self._on_download()
 
     def _on_toggle_log(self) -> None:
         visible = self._log_view.isVisible()

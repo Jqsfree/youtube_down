@@ -56,11 +56,22 @@ If a "copy chrome cookie" error occurs, `_cookie_broken` is set to `True` and al
 
 ## Download Validation
 
-After download, three checks run in sequence:
+After download, four checks run in sequence:
 1. File exists and size > 1KB
-2. `ffprobe` can parse duration (valid media)
+2. `ffprobe` can parse duration (valid media) — ffprobe is a fatal dependency; missing it raises `ENVIRONMENT`
 3. Actual duration matches expected within 5% tolerance
 4. If `min_height` is set, actual video height is verified via ffprobe
+
+Audio-only mode (`audio_only=True`) replaces the video-track check with an audio-track check.
+
+## Download Options (yt-dlp built-ins)
+
+UI/CLI extras are passed through `YoutubeDownloader.set_ydl_opt_overrides(...)`:
+subtitles (`FFmpegEmbedSubtitle`), metadata (`FFmpegMetadata`), thumbnail
+(`EmbedThumbnail`), `proxy`, `ratelimit`. Postprocessor lists are merged with the
+download-time audio converter rather than replaced. Playlist/channel URLs expand
+one level via `expand_playlist` (`extract_flat`) before entering the queue.
+`impersonate` (curl-cffi) applies to extraction only, never to downloads.
 
 ## Format Selection
 
@@ -69,7 +80,7 @@ After download, three checks run in sequence:
 ## Batch Results
 
 - Inputs: table files (`.csv/.tsv/.txt`), whole folders (recursive, via `batch_io.discover_inputs`), or pasted links (newline/comma/space separated, `parse_pasted_text`).
-- Output mirrors input: `<out>/<input rel path without ext>/<row:04d>_<media_id>.mp4`; pasted links go to `<out>/paste/`. Row number = data row in the original table (`_row`).
+- Output mirrors input: `<out>/<input rel path without ext>/<media_id>.mp4`; pasted links go to `<out>/paste/`. Row number = data row in the original table (`_row`) and only appears in the overview.
 - One overview per output root: `下载总览.csv` (utf-8-sig) with `来源文件, 行号, video_id, 平台, 链接, 标题, 状态, 错误类型, 错误信息, 输出文件, 更新时间`; keyed by (来源文件, video_id), upserted atomically. No per-batch `batch_results_* / failed_* / skipped_*` files are created anymore.
 - Resume: overview rows with 状态=成功 whose file still exists, valid files named `{id}.ext` or `NNNN_{id}.ext`, and legacy `batch_results_*.csv` (read-only).
 
