@@ -2,6 +2,13 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.1] - 2026-10-29
+
+- **修复更新检查的报错难以理解**：未认证访问 `api.github.com` 是 60 次/小时/IP，
+  公司 NAT 或反复点「检查更新」会撞上 403，旧实现直接弹
+  `HTTP Error 403: rate limit exceeded`。现在区分限流 / 404 / 其他 HTTP /
+  连接失败 / 超时，给出「稍后再试」或「去 Releases 手动下载」的提示。
+
 ## [1.3.0] - 2026-10-29
 
 应用内更新 + 打包图标 + 活动下载队列。**里程碑：从这一版起可以在软件里一键升级。**
@@ -80,6 +87,7 @@
 
 - 取消/续传/Cookie/清晰度校验加固。
 
+[1.3.1]: https://github.com/Jqsfree/youtube_down/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/Jqsfree/youtube_down/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Jqsfree/youtube_down/compare/v1.1.6...v1.2.0
 [1.1.6]: https://github.com/Jqsfree/youtube_down/releases/tag/v1.1.6
