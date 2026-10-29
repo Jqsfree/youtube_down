@@ -4,12 +4,16 @@
 
 ## 下载安装包（推荐）
 
-最新版：[v1.2.0](https://github.com/Jqsfree/youtube_down/releases/tag/v1.2.0)
+最新版：[v1.3.0](https://github.com/Jqsfree/youtube_down/releases/tag/v1.3.0)
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| Windows (x64) | [YouTubeDownloader-Windows.exe](https://github.com/Jqsfree/youtube_down/releases/download/v1.2.0/YouTubeDownloader-Windows.exe) | 双击运行；已内嵌 ffmpeg / ffprobe / deno |
-| macOS (Apple Silicon) | [YouTubeDownloader-macOS.zip](https://github.com/Jqsfree/youtube_down/releases/download/v1.2.0/YouTubeDownloader-macOS.zip) | 解压后打开 `.app`；已内嵌 ffmpeg / ffprobe / deno |
+| Windows (x64) | [YouTubeDownloader-Windows.exe](https://github.com/Jqsfree/youtube_down/releases/download/v1.3.0/YouTubeDownloader-Windows.exe) | 双击运行；已内嵌 ffmpeg / ffprobe / deno |
+| macOS (Apple Silicon) | [YouTubeDownloader-macOS.zip](https://github.com/Jqsfree/youtube_down/releases/download/v1.3.0/YouTubeDownloader-macOS.zip) | 解压后打开 `.app`；已内嵌 ffmpeg / ffprobe / deno |
+| 校验 | [SHA256SUMS.txt](https://github.com/Jqsfree/youtube_down/releases/download/v1.3.0/SHA256SUMS.txt) | 应用内更新会自动校验 |
+
+> **v1.3.0 起支持应用内更新。** 1.2.0 及更早版本没有更新入口，需手动下载一次
+> v1.3.0；之后即可在「设置 → 检查更新」一键升级。
 
 ### macOS 首次打开
 
@@ -97,7 +101,16 @@ python main.py
 3. 选择清晰度、保存目录；可勾选 **仅音频**（m4a / mp3 / opus）、字幕（中英 / 中文 / 英文）、元数据、封面
 4. 可设置代理与单条限速；「浏览器指纹（实验）」仅影响取信息阶段，需安装 `curl-cffi`
 5. 点击 **下载**（批量可开暴力并行）；暂停会在当前视频结束后生效，取消会停止整批
-6. 结果写入输出根目录的 `下载总览.csv`；失败项可右键重试，「历史」按钮可查看总览
+6. 运行中仍可继续「加入队列」或粘贴新 ID，任务会立刻排进当前活动队列继续下载
+7. 结果写入输出根目录的 `下载总览.csv`；失败项可右键重试，「历史」按钮可查看总览
+
+## 检查更新与图标
+
+- 设置页「检查更新」会读取 GitHub Releases 最新版本：有新版可一键下载并自动替换、重启；
+  启动后 24 小时内也会静默检查一次。源码运行时只会打开 Releases 页面。
+- 下载时会校验 release 的 `SHA256SUMS.txt`（有该资产时强制校验，哈希不符即删除并报错）。
+- 图标源文件是 `assets/icon.svg`，打包用 `icon.ico`（Windows）/ `icon.icns`（macOS）。
+  改完图标后运行 `python scripts/make_icon.py` 重新生成。
 
 ## 批量 CLI
 
@@ -121,10 +134,12 @@ youtube_down/
 ├── gui.py / theme.py  # 纯 UI（不 import yt_dlp）
 ├── worker.py          # QThread，连接 UI 与逻辑
 ├── downloader.py      # yt-dlp 封装、校验、Cookie
+├── app_updater.py     # GitHub Release 检查 / 下载 / 自替换
 ├── download_cli.py    # 批量 CLI
 ├── batch_io.py        # 输入发现、输出镜像、下载总览
 ├── pacing.py          # 自适应节流
 ├── platforms/         # YouTube / Bilibili / TikTok
+├── assets/            # 图标（icon.svg / png / ico / icns）
 └── .github/workflows/build.yml  # Windows + macOS 打包
 ```
 

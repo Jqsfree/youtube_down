@@ -1,6 +1,6 @@
 [project]
 name = "youtube-down"
-version = "1.2.0"
+version = "1.3.0"
 description = "多平台批量视频下载器（yt-dlp + PySide6，CSV/文件夹导入、断点续传）"
 readme = "README.md"
 authors = [
@@ -23,6 +23,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = [
+    "app_updater",
     "batch_io",
     "download_cli",
     "downloader",
