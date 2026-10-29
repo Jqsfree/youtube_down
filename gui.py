@@ -10,12 +10,13 @@ import os
 import platform as py_platform
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QIcon, QShortcut
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -64,6 +65,7 @@ from logger_utils import AppLogger
 from platforms.base import Platform
 from theme import (
     PRESETS,
+    app_icon,
     apply_theme,
     load_palette,
     preset_names,
@@ -74,6 +76,7 @@ from theme import (
 )
 from worker import (
     AUTO_FORMAT_ID,
+    AppUpdateWorker,
     BatchDownloadWorker,
     PlaylistExpandWorker,
     ValidateCookieWorker,
@@ -112,6 +115,9 @@ class MainWindow(QMainWindow):
         self._validate_cookie_worker: ValidateCookieWorker | None = None
         self._ytdlp_update_worker: YtdlpUpdateWorker | None = None
         self._ytdlp_check_interactive: bool = False
+        self._app_update_worker: AppUpdateWorker | None = None
+        self._app_check_interactive: bool = False
+        self._release: Any = None
         self._output_dir: Path = Path.home() / "Downloads"
         self._csv_ids: list[str] = []
         # (来源相对路径, 来源列表, CSV 指定的输出目录, {来源: 原表行号})
@@ -146,6 +152,9 @@ class MainWindow(QMainWindow):
         self._app_version = ver.read_text().strip() if ver.exists() else "dev"
         self._base_title = f"Multi-Platform Downloader v{self._app_version}"
         self.setWindowTitle(self._base_title)
+        self._icon = app_icon()
+        if not self._icon.isNull():
+            self.setWindowIcon(self._icon)
         self.resize(980, 640)
         self.setMinimumSize(720, 480)
         self.setAcceptDrops(True)
@@ -177,23 +186,37 @@ class MainWindow(QMainWindow):
         )
         if overlay_enabled():
             QTimer.singleShot(1500, self._maybe_auto_check_ytdlp)
+        QTimer.singleShot(2500, self._maybe_auto_check_app_update)
 
     def closeEvent(self, event: Any) -> None:
         self._save_settings()
-        if self._ytdlp_update_worker is not None and self._ytdlp_update_worker.isRunning():
-            self._ytdlp_update_worker.wait(3000)
-        if self._validate_cookie_worker is not None and self._validate_cookie_worker.isRunning():
-            self._validate_cookie_worker.wait(3000)
+        self._stop_background_threads()
+        AppLogger.get_logger().info("应用退出")
+        event.accept()
+
+    def _stop_background_threads(self, timeout: int = 3000) -> None:
+        """停掉所有后台线程；退出与安装更新共用。
+
+        ``QThread.quit()`` 对没有事件循环的 ``run()`` 无效，必须
+        ``close_queue()`` + ``downloader.cancel()`` 让 run() 自己返回。
+        """
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.close_queue()
+            self._downloader.cancel()
+            if not self._worker.wait(timeout):
+                AppLogger.get_logger().warning("下载线程未在 %s ms 内退出", timeout)
+                self._worker.wait()
+        for worker in (
+            self._app_update_worker,
+            self._ytdlp_update_worker,
+            self._validate_cookie_worker,
+        ):
+            if worker is not None and worker.isRunning():
+                worker.wait(timeout)
         self._expand_pending.clear()
         self._expand_collected.clear()
         for expand in list(self._expand_workers):
-            expand.wait(3000)
-        if self._worker is not None and self._worker.isRunning():
-            self._downloader.cancel()
-            self._worker.quit()
-            self._worker.wait(3000)
-        AppLogger.get_logger().info("应用退出")
-        event.accept()
+            expand.wait(timeout)
 
     def dragEnterEvent(self, event: Any) -> None:
         if event.mimeData().hasUrls():
@@ -382,6 +405,8 @@ class MainWindow(QMainWindow):
         engine_row = QHBoxLayout()
         engine_label = QLabel(f"应用版本 v{self._app_version} · yt-dlp 可在线热更新（仅发布版 EXE）")
         engine_label.setObjectName("mutedLabel")
+        self._app_update_btn = QPushButton("检查更新")
+        self._app_update_btn.setToolTip("从 GitHub Releases 检查并安装新版本")
         self._ytdlp_update_btn = QPushButton("更新 yt-dlp")
         if overlay_enabled():
             self._ytdlp_update_btn.setToolTip("从 PyPI 更新 yt-dlp（需重启后生效）")
@@ -389,6 +414,7 @@ class MainWindow(QMainWindow):
             self._ytdlp_update_btn.setEnabled(False)
             self._ytdlp_update_btn.setToolTip("仅发布版 EXE 支持热更新")
         engine_row.addWidget(engine_label, stretch=1)
+        engine_row.addWidget(self._app_update_btn)
         engine_row.addWidget(self._ytdlp_update_btn)
         engine_layout.addLayout(engine_row)
         layout.addWidget(engine_card)
@@ -625,6 +651,7 @@ class MainWindow(QMainWindow):
         self._audio_checkbox.toggled.connect(self._on_audio_toggled)
         self._accent_btn.clicked.connect(self._on_pick_accent)
         self._ytdlp_update_btn.clicked.connect(self._on_check_ytdlp_update)
+        self._app_update_btn.clicked.connect(self._on_check_app_update)
         self._shortcut_download = QShortcut("Ctrl+D", self)
         self._shortcut_download.activated.connect(self._on_download)
         self._shortcut_cancel = QShortcut("Escape", self)
@@ -700,6 +727,157 @@ class MainWindow(QMainWindow):
 
     def _batch_running(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
+
+    # ------------------------------------------------------------------
+    # 应用自更新（GitHub Releases）
+    # ------------------------------------------------------------------
+
+    def _app_worker_running(self) -> bool:
+        return self._app_update_worker is not None and self._app_update_worker.isRunning()
+
+    def _maybe_auto_check_app_update(self) -> None:
+        """启动后静默检查（24h 一次），只在发现新版时提示。"""
+        import app_updater
+
+        s = settings()
+        try:
+            last = float(s.value("update/last_check", 0) or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if not app_updater.should_auto_check(last):
+            return
+        s.setValue("update/last_check", time.time())
+        self._start_app_check(interactive=False)
+
+    def _on_check_app_update(self) -> None:
+        if self._app_worker_running():
+            QMessageBox.information(self, "检查更新", "正在检查或下载更新，请稍候")
+            return
+        self._start_app_check(interactive=True)
+
+    def _start_app_check(self, interactive: bool) -> None:
+        self._app_check_interactive = interactive
+        self._app_update_btn.setEnabled(False)
+        worker = AppUpdateWorker("check")
+        worker.check_done.connect(self._on_app_check_done)
+        worker.finished.connect(worker.deleteLater)
+        self._app_update_worker = worker
+        worker.start()
+        if interactive:
+            self._log("正在检查应用更新…")
+
+    def _on_app_check_done(
+        self, available: bool, current: str, latest: str, notes: str, error: str,
+    ) -> None:
+        worker = self._app_update_worker
+        self._release = getattr(worker, "release", None) if worker else getattr(
+            self, "_release", None,
+        )
+        self._app_update_worker = None
+        self._app_update_btn.setEnabled(True)
+        if error:
+            if self._app_check_interactive:
+                QMessageBox.warning(self, "检查更新", f"检查失败：{error}")
+            else:
+                self._log(f"检查应用更新失败: {error}")
+            return
+        if not available:
+            msg = f"已是最新版本（v{current or self._app_version}）"
+            self._log(msg)
+            if self._app_check_interactive:
+                QMessageBox.information(self, "检查更新", msg)
+            return
+        self._app_update_btn.setText(f"安装更新 (v{latest})")
+        self._log(f"发现新版本 v{latest}（当前 v{current or self._app_version}）")
+        if not self._app_check_interactive:
+            self._status_label.setText(f"发现新版本 v{latest}，可在「设置 → 检查更新」升级")
+            return
+        summary = "\n".join(notes.strip().splitlines()[:12]) if notes else "（无更新说明）"
+        reply = QMessageBox.question(
+            self,
+            "发现新版本",
+            f"当前版本: v{current or self._app_version}\n最新版本: v{latest}\n\n"
+            f"{summary}\n\n现在下载并安装吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_app_download()
+
+    def _start_app_download(self) -> None:
+        import app_updater
+
+        release = getattr(self, "_release", None)
+        if release is None:
+            QMessageBox.warning(self, "更新失败", "没有可用的发布信息，请重新检查更新")
+            return
+        if not app_updater.is_frozen():
+            QDesktopServices.openUrl(QUrl(app_updater.RELEASES_PAGE))
+            self._log("源码运行，已打开 Releases 页面手动下载")
+            return
+        if not self._app_worker_running():
+            self._app_update_btn.setEnabled(False)
+            worker = AppUpdateWorker("download", release=release)
+            worker.progress.connect(self._on_app_download_progress)
+            worker.download_done.connect(self._on_app_download_done)
+            worker.finished.connect(worker.deleteLater)
+            self._app_update_worker = worker
+            worker.start()
+            self._status_label.setText("正在下载新版本…")
+            self._log(f"开始下载 v{release.version} 安装包")
+
+    def _on_app_download_progress(self, pct: int) -> None:
+        self._status_label.setText(f"正在下载新版本… {pct}%")
+
+    def _on_app_download_done(self, ok: bool, message: str) -> None:
+        import app_updater
+
+        self._app_update_worker = None
+        self._app_update_btn.setEnabled(True)
+        if not ok:
+            self._log(f"下载更新失败: {message}")
+            QMessageBox.warning(self, "更新失败", message)
+            return
+        self._log(f"更新包已就绪: {message}")
+        if self._batch_running():
+            reply = QMessageBox.question(
+                self,
+                "安装更新",
+                "更新包已下载完成。安装会退出应用并重启，当前下载任务会被中断。\n\n"
+                "现在安装吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+        else:
+            reply = QMessageBox.question(
+                self,
+                "安装更新",
+                "更新包已下载完成，现在退出并安装新版本吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._status_label.setText("更新包已下载，可稍后重新检查更新安装")
+            return
+        # 必须先把后台线程停干净，再让脚本替换文件：
+        # QApplication.quit() 不会触发 closeEvent，运行中的 QThread 被析构会 abort。
+        self._shutdown_for_update()
+        info = app_updater.install_and_restart(Path(message))
+        self._log(info)
+        if app_updater.is_frozen():
+            QApplication.quit()
+        else:
+            QMessageBox.information(self, "更新", info)
+
+    def _shutdown_for_update(self) -> None:
+        """安装更新前停掉所有后台线程，避免文件仍被占用 / QThread 中途析构。"""
+        for vid in self._batch_video_ids:
+            row = self._row_for_video(vid)
+            if row is None:
+                continue
+            item = self._table.item(row, 3)
+            if item is not None and item.text() in ("排队中", "等待中"):
+                self._set_row_status(vid, "已取消")
+        self._stop_background_threads(timeout=10000)
+        self._save_settings()
+        self._log("已停止后台任务，准备安装更新")
 
     def _ytdlp_worker_running(self) -> bool:
         return self._ytdlp_update_worker is not None and self._ytdlp_update_worker.isRunning()
@@ -1037,7 +1215,9 @@ class MainWindow(QMainWindow):
             except ValueError:
                 label = "?"
             self._append_queue_row(label, source, "等待中", 0)
-        if added_ids:
+        live = self._enqueue_live(added_ids)
+        if added_ids and not live:
+            # 未在下载中（或 worker 已收尾）：进入下一轮队列
             # 保留已导入的 CSV 分组，只把新链接并入/新增 paste 组
             paste_index = next(
                 (
@@ -1061,15 +1241,37 @@ class MainWindow(QMainWindow):
                 )
         self._url_edit.clear()
         self._download_btn.setEnabled(self._env_ok and not self._download_running())
-        total = sum(len(ids) for _, ids, _, _ in self._csv_queue)
-        if len(self._csv_queue) == 1 and self._csv_queue[0][0] == PASTE_SOURCE:
-            self._csv_label.setText(f"队列 {total} 个视频")
+        if live:
+            total = self._batch_total
+            self._status_label.setText(f"已加入活动队列 {len(added_ids)} 个（当前共 {total} 个）")
         else:
-            self._csv_label.setText(f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频")
-        self._status_label.setText(
-            f"已加入 {len(added_ids)} 个 — {self._quality_label(*self._get_quality_settings())}"
-        )
+            total = sum(len(ids) for _, ids, _, _ in self._csv_queue)
+            if len(self._csv_queue) == 1 and self._csv_queue[0][0] == PASTE_SOURCE:
+                self._csv_label.setText(f"队列 {total} 个视频")
+            else:
+                self._csv_label.setText(f"队列 {len(self._csv_queue)} 组 / 共 {total} 个视频")
+            self._status_label.setText(
+                f"已加入 {len(added_ids)} 个 — {self._quality_label(*self._get_quality_settings())}"
+            )
         self._log(f"加入队列: {len(added_ids)} 个（共 {total} 个）")
+
+    def _enqueue_live(self, video_ids: list[str]) -> bool:
+        """把新任务塞进正在运行的 worker；成功返回 True。"""
+        worker = self._worker
+        if not video_ids or worker is None or not worker.isRunning():
+            return False
+        # 与 worker._seen_ids 保持一致，避免索引错位
+        new_ids = [vid for vid in video_ids if vid not in self._batch_video_ids]
+        if not new_ids:
+            return True
+        if not worker.enqueue(new_ids):
+            return False
+        self._batch_video_ids.extend(new_ids)
+        self._batch_total = len(self._batch_video_ids)
+        for vid in new_ids:
+            self._set_row_status(vid, "排队中", 0)
+        self._csv_label.setText(f"活动队列 {self._batch_total} 个视频")
+        return True
 
     def _status_item(self, status: str) -> QTableWidgetItem:
         item = QTableWidgetItem(status)
@@ -1321,6 +1523,7 @@ class MainWindow(QMainWindow):
             audio_only=self._last_audio_only,
             audio_format=self._last_audio_format,
         )
+        self._worker.enable_live_queue()
         w = self._worker
         w.all_progress_changed.connect(self._on_batch_progress)
         w.video_started.connect(self._on_batch_video_started)
@@ -1331,6 +1534,7 @@ class MainWindow(QMainWindow):
         w.eta_changed.connect(self._on_eta)
         w.size_changed.connect(self._on_size)
         w.status_changed.connect(self._on_status)
+        w.total_changed.connect(self._on_batch_total_changed)
         w.all_finished.connect(self._on_batch_all_finished)
         self._batch_progress_bar.setValue(0)
         self._paused = False
@@ -1347,7 +1551,17 @@ class MainWindow(QMainWindow):
         # 取消 = 整批停止；worker 仍在跑，收尾交给 all_finished
         self._cancelled = True
         self._csv_queue.clear()
+        if self._worker is not None:
+            self._worker.close_queue()
         self._downloader.cancel()
+        # 活动队列里还没开始的项不会再被消费，行状态要复位
+        for vid in self._batch_video_ids:
+            row = self._row_for_video(vid)
+            if row is None:
+                continue
+            item = self._table.item(row, 3)
+            if item is not None and item.text() in ("排队中", "等待中"):
+                self._set_row_status(vid, "已取消")
         self._cancel_btn.setEnabled(False)
         self._pause_btn.setEnabled(False)
         self._progress_bar.setValue(0)
@@ -1371,8 +1585,9 @@ class MainWindow(QMainWindow):
         self._downloading = downloading
         self._load_csv_btn.setEnabled(not downloading)
         self._load_folder_btn.setEnabled(not downloading)
-        self._add_url_btn.setEnabled(not downloading)
-        self._paste_btn.setEnabled(not downloading)
+        # 下载中仍可继续追加任务（活动队列）
+        self._add_url_btn.setEnabled(True)
+        self._paste_btn.setEnabled(True)
         self._download_btn.setEnabled(
             not downloading and self._env_ok and bool(self._csv_queue or self._csv_ids)
         )
@@ -1500,6 +1715,10 @@ class MainWindow(QMainWindow):
 
     def _on_batch_progress(self, pct: int) -> None:
         self._batch_progress_bar.setValue(pct)
+
+    def _on_batch_total_changed(self, total: int) -> None:
+        self._batch_total = total
+        self._csv_label.setText(f"活动队列 {total} 个视频")
 
     def _on_batch_video_started(
         self, index: int, total: int, video_id: str, cookie: bool

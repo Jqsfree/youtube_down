@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import threading
 import time
+import tempfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from PySide6.QtCore import QThread, Signal
 
@@ -201,7 +203,12 @@ class BatchDownloadWorker(QThread):
         eta_changed(str): 预计剩余时间。
         size_changed(str): 已下载/总大小。
         status_changed(str): 状态文字。
+        total_changed(int): 运行中追加任务后新的总任务数。
         all_finished(int, int, int, str): (downloaded, fail, skipped, overview_path)。
+
+    活动队列：任务列表排空后 worker 不会立即退出，而是在
+    ``_idle_exit_seconds`` 内等待 ``enqueue()`` 追加的新任务（持续下载）。
+    ``close_queue()``（取消/用户停止）会立即结束等待。
     """
 
     all_progress_changed = Signal(int)
@@ -213,6 +220,7 @@ class BatchDownloadWorker(QThread):
     eta_changed = Signal(str)
     size_changed = Signal(str)
     status_changed = Signal(str)
+    total_changed = Signal(int)
     all_finished = Signal(int, int, int, str)  # (downloaded, fail, skipped, overview_path)
 
     def __init__(
@@ -254,6 +262,18 @@ class BatchDownloadWorker(QThread):
         }
         self._pause_event = threading.Event()
         self._pause_event.set()
+
+        # 活动队列：run() 期间可继续 enqueue 新任务
+        self._live_cond = threading.Condition()
+        self._live: deque[tuple[int, str]] = deque()
+        self._seen_ids: set[str] = set(video_ids)
+        self._next_index = len(video_ids)
+        self._expected = len(video_ids)
+        self._accepting = False
+        self._queue_open = False
+        self._idle_exit_seconds = 3.0
+        # 整体进度：已完成条数 / 期望总数（含续传跳过项）
+        self._progress_done = 0
 
     @property
     def overview_path(self) -> Path:
@@ -303,10 +323,158 @@ class BatchDownloadWorker(QThread):
             return dl._is_cancelled()
         return bool(getattr(dl, "_cancelled", False))
 
+    # ------------------------------------------------------------------
+    # 活动队列（运行中持续追加）
+    # ------------------------------------------------------------------
+
+    def enable_live_queue(self) -> None:
+        """开启活动队列：run() 排空后等待 enqueue() 追加的新任务。"""
+        with self._live_cond:
+            self._queue_open = True
+            self._accepting = True
+
+    def enqueue(
+        self,
+        video_ids: list[str],
+        row_numbers: dict[str, int] | None = None,
+        cookie_overrides: dict[str, dict[str, str]] | None = None,
+    ) -> bool:
+        """运行中追加任务；worker 已收尾或已取消时返回 False。"""
+        given = row_numbers or {}
+        added = 0
+        with self._live_cond:
+            if not (self._queue_open and self._accepting) or self._is_cancelled():
+                return False
+            for vid in video_ids:
+                if not vid or vid in self._seen_ids:
+                    continue
+                self._seen_ids.add(vid)
+                index = self._next_index
+                self._next_index += 1
+                self._row_numbers[vid] = given.get(vid) or index + 1
+                self._live.append((index, vid))
+                added += 1
+            if not added:
+                return True
+            if cookie_overrides:
+                # 整体替换而非原地 update：别的线程可能在遍历 .values()
+                self._cookie_overrides = {**self._cookie_overrides, **cookie_overrides}
+            self._expected = self._next_index
+            self._live_cond.notify_all()
+        self.total_changed.emit(self._expected)
+        return True
+
+    def close_queue(self) -> None:
+        """停止等待新任务并丢弃尚未开始的任务（取消时调用）。"""
+        with self._live_cond:
+            self._accepting = False
+            self._live.clear()
+            self._live_cond.notify_all()
+
+    def _live_open(self) -> bool:
+        return self._queue_open and self._accepting
+
+    def _live_pending(self) -> bool:
+        with self._live_cond:
+            return bool(self._live)
+
+    def _wait_for_live_work(self) -> bool:
+        """阻塞等待新任务；返回 False 表示队列关闭 / 取消 / 空闲超时。"""
+        deadline: float | None = None
+        while True:
+            with self._live_cond:
+                if self._live:
+                    return True
+                if not self._accepting or self._is_cancelled():
+                    self._accepting = False
+                    return False
+                if not self._pause_event.is_set():
+                    # 暂停期间不计空闲超时
+                    deadline = None
+                    self._live_cond.wait(0.2)
+                    continue
+                now = time.monotonic()
+                if deadline is None:
+                    deadline = now + self._idle_exit_seconds
+                elif now >= deadline:
+                    self._accepting = False
+                    self._live_cond.notify_all()
+                    return False
+                self._live_cond.wait(0.2)
+
+    def _next_live_item(self, block: bool = True) -> tuple[int, str] | None:
+        """取下一个追加任务；队列关闭 / 空闲超时返回 None。"""
+        deadline: float | None = None
+        while True:
+            with self._live_cond:
+                if self._live:
+                    return self._live.popleft()
+                if not self._accepting or self._is_cancelled():
+                    self._accepting = False
+                    return None
+                if not block:
+                    return None
+                if not self._pause_event.is_set():
+                    deadline = None
+                    self._live_cond.wait(0.2)
+                    continue
+                now = time.monotonic()
+                if deadline is None:
+                    deadline = now + self._idle_exit_seconds
+                elif now >= deadline:
+                    self._accepting = False
+                    self._live_cond.notify_all()
+                    return None
+                self._live_cond.wait(0.2)
+
+    def _iter_work(
+        self, pending: list[tuple[int, str]],
+    ) -> Iterator[tuple[int, str]]:
+        """先跑初始列表；随后进入活动队列（仅 _queue_open 时等待新任务）。"""
+        yield from pending
+        if not self._queue_open:
+            return
+        while True:
+            item = self._next_live_item()
+            if item is None:
+                return
+            yield item
+
+    def _denominator(self, total: int) -> int:
+        """进度分母：活动队列模式下取当前期望总数。"""
+        if not self._queue_open:
+            return max(1, total)
+        with self._live_cond:
+            return max(1, self._expected)
+
+    def _advance_progress(self, count: int = 1) -> None:
+        """推进整体进度：分子含续传跳过项，分母是期望总数。
+
+        旧实现用「本轮待下载条数」当分母，一旦有续传跳过就永远到不了 100%。
+        """
+        if count <= 0:
+            return
+        with self._live_cond:
+            self._progress_done += count
+            done = self._progress_done
+            total = max(1, self._expected)
+        self.all_progress_changed.emit(min(100, int(done / total * 100)))
+
+    def _overall_pct(self, current_pct: float = 0.0) -> int:
+        """当前视频内部进度折算成整体百分比。"""
+        with self._live_cond:
+            done = self._progress_done + current_pct / 100
+            total = max(1, self._expected)
+        return min(100, int(done / total * 100))
+
     def run(self) -> None:
         """按顺序或暴力并行下载所有 video_id。增量写入 + 续传。"""
         if hasattr(self._downloader, "clear_cancel"):
             self._downloader.clear_cancel()
+        with self._live_cond:
+            self._expected = max(self._expected, self._next_index)
+            if self._queue_open:
+                self._accepting = True
         total = len(self._video_ids)
         overview_done = self._overview.completed_ids(self._source_rel)
         legacy_done = self._load_completed_ids()
@@ -346,7 +514,11 @@ class BatchDownloadWorker(QThread):
                     continue
             pending.append((i, vid))
 
-        if self._brutal_mode and pending:
+        # 续传跳过也是「已完成」，否则分母含它而分子不含，进度到不了 100%
+        if resumed:
+            self._advance_progress(resumed)
+
+        if self._brutal_mode and (pending or self._queue_open):
             d, f, s, results = self._run_brutal_parallel(pending, total, results)
             downloaded, fail_count, skip_count = d, f, s
         else:
@@ -354,6 +526,7 @@ class BatchDownloadWorker(QThread):
                 pending, total, results,
             )
 
+        self.close_queue()
         overview_path = str(self._overview.path)
         cancelled = self._is_cancelled()
         if not cancelled:
@@ -381,15 +554,30 @@ class BatchDownloadWorker(QThread):
         pacer = AdaptivePacer(_GUI_SLEEP_MIN, _GUI_SLEEP_MAX, bot_pause_sec=30.0)
         bot_streak = 0
         downloaded = fail_count = skip_count = 0
-        for idx, (i, vid) in enumerate(pending):
+        work = self._iter_work(pending)
+        idx = -1
+        while True:
             self._wait_if_paused()
             if self._is_cancelled():
                 break
+            item = next(work, None)
+            if item is None:
+                break
+            idx += 1
+            i, vid = item
             if bot_streak >= BOT_STREAK_LIMIT:
                 self.status_changed.emit(
                     "连续触发机器人验证/限流，已停止本批剩余任务"
                 )
-                for _, left_vid in pending[idx:]:
+                # 停止接收新任务，并把队列里剩下的标记为跳过
+                self.close_queue()
+                leftovers = [vid]
+                while True:
+                    nxt = next(work, None)
+                    if nxt is None:
+                        break
+                    leftovers.append(nxt[1])
+                for left_vid in leftovers:
                     row = self._result_row(
                         left_vid, "skipped", "BOT_VERIFICATION",
                         "风控熔断：连续 bot/限流，已跳过", False, "",
@@ -402,7 +590,7 @@ class BatchDownloadWorker(QThread):
                     skip_count += 1
                 break
 
-            row = self._process_one_video(i, vid, total)
+            row = self._process_one_video(i, vid, self._denominator(total))
             results.append(row)
             if row["status"] == "success":
                 downloaded += 1
@@ -423,9 +611,12 @@ class BatchDownloadWorker(QThread):
                 else:
                     bot_streak = 0
 
-            if idx < len(pending) - 1 and not self._is_cancelled():
-                pacer.wait()
-            self.all_progress_changed.emit(int((idx + 1) / max(1, len(pending)) * 100))
+            if not self._is_cancelled():
+                # 活动队列模式：只有确实还有待跑任务时才节流
+                more = self._live_pending() if self._queue_open else idx < len(pending) - 1
+                if more:
+                    pacer.wait()
+            self._advance_progress()
 
         return downloaded, fail_count, skip_count, results
 
@@ -447,11 +638,21 @@ class BatchDownloadWorker(QThread):
         stop_bot = threading.Event()
         pending_iter = iter(pending)
 
+        def _take(block: bool = False) -> tuple[int, str] | None:
+            try:
+                return next(pending_iter)
+            except StopIteration:
+                pass
+            if not self._queue_open:
+                return None
+            return self._next_live_item(block=block)
+
         def _job(index: int, vid: str) -> dict[str, str]:
-            row = self._process_one_video_brutal(index, vid, total)
+            row = self._process_one_video_brutal(
+                index, vid, self._denominator(total),
+            )
             with stats_lock:
                 stats["completed"] += 1
-                pct = int(stats["completed"] / len(pending) * 100)
                 status = row["status"]
                 if status == "success":
                     stats["downloaded"] += 1
@@ -467,7 +668,7 @@ class BatchDownloadWorker(QThread):
                             stop_bot.set()
                     else:
                         stats["bot_streak"] = 0
-            self.all_progress_changed.emit(pct)
+            self._advance_progress()
             self._record(
                 vid, row.get("title", ""), status, row["error_category"],
                 row["error_message"], row.get("output_file", ""),
@@ -479,21 +680,31 @@ class BatchDownloadWorker(QThread):
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             inflight: dict = {}
 
-            def _submit() -> None:
+            def _submit(block: bool = False) -> bool:
                 self._wait_if_paused()
                 if stop_bot.is_set() or self._is_cancelled():
-                    return
-                try:
-                    index, vid = next(pending_iter)
-                except StopIteration:
-                    return
+                    return False
+                item = _take(block)
+                if item is None:
+                    return False
+                index, vid = item
                 fut = pool.submit(_job, index, vid)
                 inflight[fut] = (index, vid)
+                return True
 
             for _ in range(max_workers):
-                _submit()
+                if not _submit():
+                    break
 
-            while inflight:
+            while inflight or self._live_open():
+                if not inflight:
+                    # 活动队列暂时为空：等新任务，避免忙等
+                    if not self._wait_for_live_work():
+                        break
+                    for _ in range(max_workers):
+                        if not _submit():
+                            break
+                    continue
                 for fut in as_completed(inflight):
                     index, vid = inflight.pop(fut)
                     if self._is_cancelled() or stop_bot.is_set():
@@ -526,7 +737,14 @@ class BatchDownloadWorker(QThread):
 
             # 未提交的剩余任务标记为风控熔断跳过
             if stop_bot.is_set():
-                for index, vid in pending_iter:
+                self.close_queue()
+                leftovers: list[tuple[int, str]] = []
+                while True:
+                    item = _take()
+                    if item is None:
+                        break
+                    leftovers.append(item)
+                for index, vid in leftovers:
                     row = self._result_row(
                         vid, "skipped", "BOT_VERIFICATION",
                         "风控熔断：连续 bot/限流，已跳过", False, "",
@@ -777,8 +995,9 @@ class BatchDownloadWorker(QThread):
                 if total_b > 0:
                     cur_pct = int(downloaded / total_b * 100)
                     self.progress_changed.emit(cur_pct)
-                    all_pct = int((index + cur_pct / 100) / total * 100)
-                    self.all_progress_changed.emit(all_pct)
+                    # 整体进度按「已完成条数 + 当前视频内部进度」折算，
+                    # index/total 只用于信号展示，不参与这里的分母。
+                    self.all_progress_changed.emit(self._overall_pct(cur_pct))
 
                 speed = d.get("speed") or ""
                 if speed and isinstance(speed, (int, float)):
@@ -957,3 +1176,67 @@ class YtdlpUpdateWorker(QThread):
                 self.check_done.emit(False, "", "", str(exc))
             else:
                 self.apply_done.emit(False, str(exc))
+
+
+class AppUpdateWorker(QThread):
+    """后台检查 / 下载应用更新包（GitHub Release），不在 GUI 线程访问网络。
+
+    action:
+        ``check``    → 只比较版本，结果放在 ``self.check`` / ``self.release``。
+        ``download`` → 下载 ``release`` 对应平台的资产，结果路径放在 ``self.payload``。
+    """
+
+    check_done = Signal(bool, str, str, str, str)  # available, current, latest, notes, error
+    progress = Signal(int)
+    download_done = Signal(bool, str)  # ok, message-or-path
+
+    def __init__(
+        self,
+        action: str = "check",
+        release: Any = None,
+        dest_dir: Path | None = None,
+        parent: QThread | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._action = action
+        self._release = release
+        self._dest_dir = dest_dir
+        self.check: Any = None
+        self.release: Any = None
+        self.payload: Path | None = None
+
+    def run(self) -> None:
+        import app_updater as updater
+
+        try:
+            if self._action == "check":
+                result = updater.check_for_app_update()
+                self.check = result
+                self.release = result.release
+                notes = (result.release.notes if result.release else "") or ""
+                self.check_done.emit(
+                    result.available,
+                    result.current,
+                    result.latest,
+                    notes,
+                    result.error,
+                )
+                return
+
+            release = self._release
+            if release is None:
+                self.download_done.emit(False, "没有可用的发布信息")
+                return
+            dest = self._dest_dir or (Path(tempfile.gettempdir()) / f"ytdown-update-{release.version}")
+            # download_update 会在 release 带 SHA256SUMS.txt 时校验完整性
+            payload = updater.download_update(
+                release, dest, progress=self.progress.emit,
+            )
+            self.payload = payload
+            self.download_done.emit(True, str(payload))
+        except Exception as exc:
+            if self._action == "check":
+                self.check_done.emit(False, "", "", "", str(exc))
+            else:
+                self.download_done.emit(False, str(exc))
+

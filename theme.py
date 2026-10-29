@@ -5,10 +5,12 @@ Persists selection via QSettings. No third-party theme frameworks.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from PySide6.QtCore import QRectF, QSettings, Qt
-from PySide6.QtGui import QColor, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import QApplication
 
 ORG = "vid_download"
@@ -150,6 +152,35 @@ PRESETS: dict[str, ThemePalette] = {
 
 def settings() -> QSettings:
     return QSettings(ORG, APP)
+
+
+def asset_path(name: str) -> Path | None:
+    """定位打包或源码目录中的静态资源（如 ``icon.png``）。
+
+    PyInstaller onefile 解包到 ``sys._MEIPASS``；源码运行时在仓库根目录。
+    """
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "assets" / name)
+    here = Path(__file__).resolve().parent
+    candidates.append(here / "assets" / name)
+    candidates.append(here / name)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def app_icon() -> QIcon:
+    """应用图标；缺少资产时返回空图标（Qt 会回退到默认）。"""
+    for name in ("icon.png", "icon.ico", "icon.icns"):
+        path = asset_path(name)
+        if path is not None:
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
+    return QIcon()
 
 
 def load_palette() -> ThemePalette:
