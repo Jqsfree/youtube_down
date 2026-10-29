@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -310,6 +311,29 @@ def test_should_auto_check_throttles() -> None:
 
 def test_current_version_reads_version_file() -> None:
     assert app_updater.current_version().count(".") >= 1 or app_updater.current_version() == ""
+
+
+@pytest.mark.parametrize(
+    ("exc", "needle"),
+    [
+        (
+            urllib.error.HTTPError(
+                "https://api.github.com/x", 403, "rate limit exceeded", {}, None,
+            ),
+            "过于频繁",
+        ),
+        (urllib.error.HTTPError("https://api.github.com/x", 404, "Not Found", {}, None),
+         "还没有发布过正式版本"),
+        (urllib.error.HTTPError("https://api.github.com/x", 500, "boom", {}, None),
+         "HTTP 500"),
+        (urllib.error.URLError("timed out"), "网络连接失败"),
+        (TimeoutError("slow"), "超时"),
+        (ValueError("disallowed host: evil"), "disallowed host"),
+    ],
+)
+def test_friendly_error_is_actionable(exc: Exception, needle: str) -> None:
+    """未认证 API 是 60 次/小时，撞上 403 时要给出人话而不是 HTTP Error。"""
+    assert needle in app_updater._friendly_error(exc)  # noqa: SLF001
 
 
 def test_is_prerelease_only_checks_suffix() -> None:

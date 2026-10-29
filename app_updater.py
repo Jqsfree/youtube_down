@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -217,6 +218,25 @@ def _urlopen(url: str, timeout: float = 30):
     return resp
 
 
+def _friendly_error(exc: Exception) -> str:
+    """把底层异常翻成用户能看懂的一句话。
+
+    实测未认证访问 api.github.com 是 60 次/小时/IP，公司 NAT 或反复点「检查更新」
+    很容易撞上 403；直接抛 ``HTTP Error 403`` 用户完全无从下手。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 403 and "rate limit" in str(exc).lower():
+            return "GitHub 接口调用过于频繁，请稍后再试（或到 Releases 页面手动下载）"
+        if exc.code == 404:
+            return "还没有发布过正式版本"
+        return f"GitHub 返回 HTTP {exc.code}，请稍后再试"
+    if isinstance(exc, urllib.error.URLError):
+        return f"网络连接失败：{exc.reason}（可配置代理后重试）"
+    if isinstance(exc, TimeoutError):
+        return "请求超时，请检查网络或代理"
+    return str(exc)
+
+
 def fetch_latest_release(timeout: float = 20) -> Release:
     with _urlopen(RELEASES_API, timeout=timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
@@ -231,7 +251,7 @@ def check_for_app_update(
     try:
         release = fetch_latest_release(timeout=timeout)
     except Exception as exc:  # 网络 / 解析 / 白名单
-        return UpdateCheck(False, current, "", None, str(exc))
+        return UpdateCheck(False, current, "", None, _friendly_error(exc))
     latest = release.version
     if not latest:
         return UpdateCheck(False, current, "", release, "release 缺少版本号")
