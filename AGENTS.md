@@ -1,6 +1,7 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+Single source of truth for agent guidance in this repository. `CLAUDE.md` only
+points here — keep project docs in this file, not in per-agent copies.
 
 ## Commands
 
@@ -17,9 +18,13 @@ python -m pytest tests/test_format_selection.py -v
 # Build Windows EXE (local, Linux — validation only)
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "YouTubeDownloader" \
+  --icon assets/icon.ico --add-data "assets:assets" --add-data "VERSION:." \
   --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
   --hidden-import yt_dlp --hidden-import yt_dlp.extractor --hidden-import yt_dlp.downloader \
   main.py
+
+# Regenerate icon assets (png / ico / icns)
+python scripts/make_icon.py
 ```
 
 ## Architecture
@@ -37,6 +42,8 @@ platforms/ + downloader.py  ← Pure logic. Must NOT import PySide6.
   platforms/facade.py       ← routes by platform (YoutubeDownloader alias)
   downloader.py             ← shared yt-dlp ops, validation, CSV, cookies
   batch_io.py               ← input discovery, output mirroring, 下载总览.csv
+  app_updater.py            ← GitHub Release check / download / self-replace
+  yt_dlp_updater.py         ← yt-dlp overlay hot update (PyPI)
 ```
 
 `downloader.py` / platform plugins are reusable by non-GUI consumers (CLI, web). Unit tests do not need a display server.
@@ -52,15 +59,26 @@ If a "copy chrome cookie" error occurs, `_cookie_broken` is set to `True` and al
 
 ## Error Classification
 
-`_CATEGORY_RULES` in `downloader.py` defines 10 error categories (including `ENVIRONMENT` for missing ffprobe) with priority-ordered keyword matching. Each category specifies `retry_cookie` (bool). `classify_error()` returns an `ErrorCategory` dataclass. All results are written to the output root's `下载总览.csv` (`错误类型` column).
+`_CATEGORY_RULES` in `downloader.py` defines 8 priority-ordered error categories with keyword matching: `CANCELLED`, `ENVIRONMENT` (missing ffprobe), `BOT_VERIFICATION`, `AUTH_REQUIRED`, `PRIVATE_VIDEO`, `RATE_LIMIT`, `VIDEO_UNAVAILABLE`, `NETWORK_ERROR`. Each category specifies `retry_cookie` (bool). `classify_error()` returns an `ErrorCategory` dataclass. All results are written to the output root's `下载总览.csv` (`错误类型` column).
 
 ## Download Validation
 
 After download, four checks run in sequence:
 1. File exists and size > 1KB
-2. `ffprobe` can parse duration (valid media)
+2. `ffprobe` can parse duration (valid media) — ffprobe is a fatal dependency, missing it raises `ENVIRONMENT`
 3. Actual duration matches expected within 5% tolerance
 4. If `min_height` is set, actual video height is verified via ffprobe
+
+Audio-only mode (`audio_only=True`) replaces the video-track check with an audio-track check.
+
+## Download Options (yt-dlp built-ins)
+
+UI/CLI extras are passed through `YoutubeDownloader.set_ydl_opt_overrides(...)`:
+subtitles (`FFmpegEmbedSubtitle`), metadata (`FFmpegMetadata`), thumbnail
+(`EmbedThumbnail`), `proxy`, `ratelimit`. Postprocessor lists are merged with the
+download-time audio converter rather than replaced. Playlist/channel URLs expand
+one level via `expand_playlist` (`extract_flat`) before entering the queue.
+`impersonate` (curl-cffi) applies to extraction only, never to downloads.
 
 ## Format Selection
 
@@ -76,6 +94,36 @@ After download, four checks run in sequence:
 ## Testing
 
 Tests use `YoutubeDownloader.__new__()` to create instances without `__init__` (avoids browser detection / cookie setup). No Qt event loop needed for `downloader.py` tests. GUI tests require a display server.
+
+## Live Download Queue
+
+`BatchDownloadWorker` is a live queue, not a fixed list:
+
+- `enable_live_queue()` (called by the GUI before `start()`) makes `run()` keep waiting for new items after the initial list drains.
+- `enqueue(video_ids, row_numbers=None, cookie_overrides=None)` appends thread-safely and returns `False` once the worker has finished or was cancelled — the GUI then falls back to the next `_csv_queue` group.
+- `close_queue()` ends the wait immediately (cancel path). Idle exit defaults to 3s (`_idle_exit_seconds`).
+- `total_changed(int)` reports the new denominator so the progress bar grows instead of jumping.
+- `_queue_open == False` keeps the legacy behavior, which is what direct `_run_sequential` / `_run_brutal_parallel` calls in tests rely on.
+- GUI keeps「加入队列」/「粘贴」enabled while downloading; new IDs go to `_enqueue_live()` first.
+
+## App Self-Update (GitHub Releases)
+
+`app_updater.py` (no PySide6, no yt_dlp):
+
+- `check_for_app_update()` compares `VERSION` with the latest GitHub release; prereleases are skipped.
+- `download_release_asset()` streams to a temp dir and verifies the byte count against the API-reported size.
+- `install_and_restart()` writes a platform script (Windows `.bat` retry-loop rename, macOS `.sh` ditto + `xattr -dr`) and spawns it detached, then the GUI quits.
+- `cleanup_old()` removes leftover `*.old` on startup (`main.py`).
+- Source-tree runs never self-replace — they open the Releases page instead.
+- Asset names must stay in sync with `.github/workflows/build.yml`: `YouTubeDownloader-Windows.exe`, `YouTubeDownloader-macOS.zip`.
+- GUI: 「设置 → 检查更新」button plus a silent 24h check (`QSettings` key `update/last_check`).
+
+## Icons
+
+- Source of truth: `assets/icon.svg`; committed outputs `icon.png` (1024), `icon.ico` (7 sizes), `icon.icns`.
+- Regenerate with `python scripts/make_icon.py` (needs PySide6; `icns` only builds on macOS). `--check` validates existing assets.
+- `theme.asset_path()` resolves `sys._MEIPASS/assets` for frozen builds; `theme.app_icon()` is applied in `main.py` and `MainWindow`.
+- `build.yml` passes `--icon` and `--add-data "assets"` on both platforms.
 
 ## CI/CD
 

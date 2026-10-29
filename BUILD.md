@@ -33,6 +33,18 @@ Stage 2: 仅对 BOT_VERIFICATION / AUTH_REQUIRED / PRIVATE_VIDEO
 
 若浏览器 Cookie 读取失败（如「copy chrome cookie」错误），本次会话跳过后续所有 Cookie 尝试。
 
+## 活动下载队列
+
+`BatchDownloadWorker` 运行中可持续追加任务：
+
+- GUI 启动 worker 前调用 `enable_live_queue()`；初始列表跑完后 worker 不会退出，
+  而是在 `_idle_exit_seconds`（默认 3s）内等待 `enqueue()`。
+- 下载中「加入队列」「粘贴」保持可用；新 ID 经 `_enqueue_live()` 直接进活动队列，
+  进度分母由 `total_changed` 同步增长。
+- `enqueue()` 在 worker 已收尾 / 已取消时返回 `False`，GUI 回退到下一组 `_csv_queue`。
+- `close_queue()`（取消）立即结束等待；`_queue_open=False` 时保持旧的「一次性列表」行为，
+  直接调用 `_run_sequential` / `_run_brutal_parallel` 的测试不受影响。
+
 ## 错误分类（10 类）
 
 `_CATEGORY_RULES` 按优先级匹配关键词，每类带 `retry_cookie`：
@@ -55,6 +67,8 @@ youtube_down/
 ├── worker.py               # BatchDownloadWorker、PlaylistExpandWorker 等
 ├── downloader.py           # yt-dlp 封装、错误分类、校验、环境检测
 ├── batch_io.py             # 输入发现、输出镜像、下载总览.csv
+├── app_updater.py          # GitHub Release 检查 / 下载 / 自替换
+├── yt_dlp_updater.py       # yt-dlp overlay 热更新
 ├── platforms/
 │   ├── base.py             # Platform / MediaInput / ABC
 │   ├── youtube.py
@@ -62,7 +76,8 @@ youtube_down/
 │   ├── tiktok.py
 │   └── facade.py           # 按平台路由（YoutubeDownloader）
 ├── download_cli.py         # 命令行入口
-├── scripts/                # 诊断与压力测试脚本（不参与 pytest 收集）
+├── assets/                 # 图标（svg 源 + png/ico/icns 产物）
+├── scripts/                # 诊断、压力测试与图标生成脚本
 ├── tests/                  # 单元测试
 ├── smoke_test.py           # CI 冒烟测试
 └── .github/workflows/build.yml
@@ -96,8 +111,20 @@ Cookie 由 yt-dlp 直接读取浏览器 Cookie 数据库（`cookiesfrombrowser`�
 
 ```bash
 pip install pyinstaller
+# Windows
 pyinstaller --onefile --windowed --name "YouTubeDownloader" \
-  --add-data "VERSION:." \
+  --icon assets/icon.ico --add-data "assets;assets" --add-data "VERSION;." \
+  --collect-all yt_dlp --collect-all yt_dlp_ejs --collect-all curl_cffi \
+  --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
+  --hidden-import platforms --hidden-import platforms.youtube \
+  --hidden-import platforms.bilibili --hidden-import platforms.tiktok \
+  --hidden-import theme --hidden-import batch_io \
+  main.py
+
+# macOS
+pyinstaller --onedir --windowed --name "YouTubeDownloader" \
+  --osx-bundle-identifier com.jqsfree.youtubedownloader \
+  --icon assets/icon.icns --add-data "assets:assets" --add-data "VERSION:." \
   --collect-all yt_dlp --collect-all yt_dlp_ejs --collect-all curl_cffi \
   --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
   --hidden-import platforms --hidden-import platforms.youtube \
@@ -106,7 +133,60 @@ pyinstaller --onefile --windowed --name "YouTubeDownloader" \
   main.py
 ```
 
-Windows 用 `;` 作为 `--add-data` 分隔符；macOS/Linux 用 `:`。
+平台差异：
+
+- Windows 用 `--onefile`（单 exe 是 Windows 的惯例）。
+- **macOS 必须用 `--onedir`**：`--onefile --windowed` 已被 PyInstaller 6.22 标记弃用
+  （v7 会直接报错），且每次启动都要把上百 MB 解包到临时目录。两者产出的 zip 体积
+  基本一致（实测 113 MB vs 116 MB）。
+- `--add-data` 分隔符：Windows `;`，macOS/Linux `:`；图标：Windows `icon.ico`，
+  macOS `icon.icns`。
+
+## 图标资产
+
+`assets/icon.svg` 是唯一源文件，`scripts/make_icon.py` 生成其余格式：
+
+```bash
+python scripts/make_icon.py      # png(1024) / ico(7 尺寸) / icns(仅 macOS)
+python scripts/make_icon.py --check
+```
+
+- 运行时通过 `theme.asset_path()` 定位（frozen 时读 `sys._MEIPASS/assets`），
+  `theme.app_icon()` 在 `main.py` 与主窗口上设置。
+- ICO 用纯 Python 写 PNG-in-ICO，不依赖 Pillow；ICNS 依赖 macOS 的 `iconutil`。
+- 生成结果需提交进仓库，CI 不再重复生成。
+
+## 应用自更新
+
+`app_updater.py` 读取 `VERSION` 与 GitHub latest release 比较，下载对应平台资产后
+用一个分离脚本「等旧进程退出 → 替换 → 重启」：
+
+| 平台 | 资产 | 替换方式 |
+|------|------|---------|
+| Windows | `YouTubeDownloader-Windows.exe` | `update-*.bat` 重命名重试循环 |
+| macOS | `YouTubeDownloader-macOS.zip` | `ditto -x -k` 解压 + `xattr -dr` 去隔离 |
+
+资产名必须与 `build.yml` 的 `artifact_name` 一致，否则更新会提示「没有本平台安装包」。
+
+### 完整性校验
+
+`build.yml` 为每个产物生成 `SHA256SUMS.txt`（格式 `<sha256>  <文件名>`），两张清单
+在 release job 合并成一个资产。`download_update()` 下载完会查清单校验 sha256，
+不符则删包并报错；老 release 没有清单时跳过校验（向后兼容）。
+
+替换前会先停掉所有后台线程（`_shutdown_for_update`）：`QApplication.quit()`
+不触发 `closeEvent`，运行中的 `QThread` 被析构会 abort，Windows 上还会因为
+exe 仍被占用导致脚本替换失败。
+
+### 完整性校验
+
+`build.yml` 为每个产物生成 `SHA256SUMS.txt`（格式 `<sha256>  <文件名>`），两张清单
+在 release job 合并成一个资产。`download_update()` 下载完会查清单校验 sha256，
+不符则删包并报错；老 release 没有清单时跳过校验（向后兼容）。
+
+替换前会先停掉所有后台线程（`_shutdown_for_update`）：`QApplication.quit()`
+不触发 `closeEvent`，运行中的 `QThread` 被析构会 abort，Windows 上还会因为
+exe 仍被占用导致脚本替换失败。
 
 ### CI
 
@@ -117,10 +197,10 @@ Windows 用 `;` 作为 `--add-data` 分隔符；macOS/Linux 用 `:`。
 3. 单元测试（`QT_QPA_PLATFORM=offscreen`）
 4. 下载 ffmpeg / ffprobe / deno 并内嵌
 5. `smoke_test.py`
-6. PyInstaller 单文件打包 → 上传 artifact
-7. `release` job 按 `VERSION` 创建 GitHub Release
+6. PyInstaller 单文件打包 → 生成 `SHA256SUMS.txt` → 上传 artifact
+7. `release` job 按 `VERSION` 创建 GitHub Release（含合并后的 `SHA256SUMS.txt`）
 
-产物：`YouTubeDownloader-Windows.exe`、`YouTubeDownloader-macOS.zip`。
+产物：`YouTubeDownloader-Windows.exe`、`YouTubeDownloader-macOS.zip`、`SHA256SUMS.txt`。
 
 ## 下载总览.csv
 
