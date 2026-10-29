@@ -94,7 +94,9 @@ jobs:
         run: |
           pyinstaller --onefile --windowed `
             --name "${{ matrix.pyinstaller_name }}" `
+            --icon "assets\icon.ico" `
             --add-data "VERSION;." `
+            --add-data "assets;assets" `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
             --add-binary "deno.exe;." `
@@ -119,9 +121,14 @@ jobs:
         if: matrix.platform == 'macos'
         shell: bash
         run: |
-          pyinstaller --onefile --windowed \
+          # macOS 用 onedir：onefile + .app 已被 PyInstaller 标记弃用（v7 报错），
+          # 且每次启动都要解包上百 MB。打出来的 zip 体积基本一致。
+          pyinstaller --onedir --windowed \
             --name "${{ matrix.pyinstaller_name }}" \
+            --osx-bundle-identifier "com.jqsfree.youtubedownloader" \
+            --icon "assets/icon.icns" \
             --add-data "VERSION:." \
+            --add-data "assets:assets" \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --add-binary "deno:." \
@@ -157,11 +164,29 @@ jobs:
           fi
           ls -la "dist/${{ matrix.artifact_name }}"
 
+      - name: Write checksums (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/${{ matrix.artifact_name }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact_name }}" | Out-File -FilePath dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Write checksums (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          cd dist
+          shasum -a 256 "${{ matrix.artifact_name }}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.pyinstaller_name }}-v${{ steps.version.outputs.version }}
-          path: dist/${{ matrix.artifact_name }}
+          path: |
+            dist/${{ matrix.artifact_name }}
+            dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -197,6 +222,12 @@ jobs:
           ls -la staged
           test -f staged/YouTubeDownloader-Windows.exe
           test -f staged/YouTubeDownloader-macOS.zip
+          # 每个平台各上传一份 SHA256SUMS.txt，合并成一份清单
+          find release-assets -name 'SHA256SUMS.txt' -exec cat {} + > staged/SHA256SUMS.txt
+          echo "--- SHA256SUMS.txt ---"
+          cat staged/SHA256SUMS.txt
+          grep -q 'YouTubeDownloader-Windows.exe' staged/SHA256SUMS.txt
+          grep -q 'YouTubeDownloader-macOS.zip' staged/SHA256SUMS.txt
           echo "files=$(find staged -type f | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
@@ -212,6 +243,17 @@ jobs:
             |------|------|
             | Windows (x64) | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
             | macOS (Apple Silicon) | `YouTubeDownloader-macOS.zip`（解压后打开 `.app`；内嵌 ffmpeg / ffprobe / deno） |
+            | 校验 | `SHA256SUMS.txt`（应用内更新会自动校验） |
+
+            ## 本版亮点
+            - **应用内更新**：设置页「检查更新」一键下载、替换、重启（附 sha256 校验、失败回滚）
+            - **活动下载队列**：下载中可继续「加入队列」/粘贴新 ID，任务立刻接着跑
+            - **应用图标**：Windows `.ico`、macOS `.icns`、窗口图标统一
+            - 修复进度条因续传跳过而到不了 100%、安装更新时后台线程未停等问题
+
+            完整变更见 [`CHANGELOG.md`](https://github.com/Jqsfree/youtube_down/blob/main/CHANGELOG.md)。
+
+            > 从 v1.2.0 及更早版本升级需手动下载本版一次，之后即可在软件内更新。
 
             ## 使用
             ### Windows
