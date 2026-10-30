@@ -1,6 +1,6 @@
 # youtube_down 渐进改进方案
 
-日期：2026-10-30。基线：当前工作区 v1.3.1。状态：实施建议，尚未执行。
+日期：2026-10-30。基线：当前工作区 v1.3.1。状态：第二批代码与双平台构建验收通过；第一批真实升级验证仍为发布前待办。
 
 ## 1. 架构判断与目标
 
@@ -200,3 +200,7 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 最终本机验证：297 passed（`QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests/ -q`）；actionlint 三条工作流检查和 git diff --check 通过。准备提交独立分支并手动触发 create_draft=false 的远程构建，不推 main、不创建 tag、不创建真实 Release。
 
 远程验证第 1 次：独立分支提交 d7f5490，手动 create_draft=false，run 40997491092。macOS 完整构建/清单工具安装/内嵌工具运行/上传均成功；Windows 在离线测试有 3 项因默认 cp1252 读取 UTF-8 文本失败，未进入工具安装。已补 legacy locale 复现测试并显式 UTF-8 读取，修复后本机 298 passed。准备推送修复并重新触发仅构建验证。
+
+第二批最终验证：提交 3b6d5b2，run [40998035345](https://github.com/Jqsfree/youtube_down/actions/runs/40998035345) 成功。Windows 与 macOS 均实际通过锁定依赖安装、离线测试、清单工具安装、PyInstaller 打包、内嵌工具启动与版本/摘要检查、校验清单生成及 artifact 上传；Release job 因 create_draft=false 按预期跳过。本机最终 298 passed，actionlint 和 git diff --check 通过。第二批实现与双平台构建验收完成；没有创建真实 Release/草稿，没有合并 main。正式草稿创建逻辑已由离线测试覆盖，但尚未以真实版本 tag 执行；第一批真实升级演练也仍待完成。第三批尚未启动。
+
+分支：architecture-batch-1（已推送）。第二批远程运行测试的是 3b6d5b2；随后仅追加本文验证记录，未修改被验证的程序或流水线。
