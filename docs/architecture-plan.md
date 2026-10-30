@@ -1,6 +1,6 @@
 # youtube_down 渐进改进方案
 
-日期：2026-10-30。基线：当前工作区 v1.3.1。状态：五批代码、双平台构建及真实安装替换/回滚验收通过；准备 v1.4.0 发布。
+日期：2026-10-30。基线：当前工作区 v1.3.1。状态：五批改进已合并 main，真实安装替换/回滚验收通过，v1.4.0 已正式发布。
 
 ## 1. 架构判断与目标
 
@@ -264,3 +264,9 @@ Windows 后续真实测试发现 mkdtemp 目录带显式 OWNER/SYSTEM/Administra
 收尾原生最终验收：提交 6abbe53，run [41006095823](https://github.com/Jqsfree/youtube_down/actions/runs/41006095823) 成功。Windows success/rollback/occupied 三用例、实际 SID ACL 检查，macOS success/rollback 两用例均通过，使用真实 v1.3.1 旧包和 v1.4.0 新包；特殊路径相邻文件保留、摘要匹配及新/回滚进程存活断言通过，打包与产物上传成功。此前 41005769957、41005848334 由修正版本替代后取消，不作通过证据。第一批实际替换演练待办现已补齐。
 
 最终本机 348 passed，actionlint、uv lock --check 与 git diff --check 通过。另以 FFmpeg 生成的真实媒体经本地 HTTP 服务和实际 yt-dlp 下载，再用 ffprobe 验证时长/高度通过（27097 bytes）；外部 W3C/Google 样例均返回 403，不能报告外网站点下载成功。独立联网冒烟待合并后运行，不把外部站点可用性混同安装/回归结果。当前准备合并 #4 与 v1.4.0 草稿，尚未报告公开发布完成。
+
+最终交付：PR [#4](https://github.com/Jqsfree/youtube_down/pull/4) 已合并 main（d5fb05b），合并后本机 348 passed。正式 tag [v1.4.0](https://github.com/Jqsfree/youtube_down/releases/tag/v1.4.0) 的 run [41006805219](https://github.com/Jqsfree/youtube_down/actions/runs/41006805219) 完整成功，双平台离线测试、实际 ACL、打包、冻结模块/工具验证、真实旧/新包替换与回滚、Windows 占用重试以及草稿创建全部通过。独立联网 run [41006784147](https://github.com/Jqsfree/youtube_down/actions/runs/41006784147) 在 Windows/macOS 均成功，范围为环境检查与真实 YouTube 信息提取，不代表所有平台的完整下载验收。
+
+发布前下载 SHA256SUMS 和两份 build-info，核对其自身 GitHub 资产摘要，以及两平台 payload 的 GitHub 摘要/清单/build-info 摘要一致，版本 1.4.0 与源提交 d5fb05b 一致。五项资产齐全后于 2026-10-30 正式公开并设为 latest，未覆盖旧版资产。发布后认证 GitHub latest API 确认 v1.4.0、draft=false、prerelease=false；本机应用未认证更新检查受到当前出口 GitHub API 限流，返回既有友好提示，不能报告该调用成功，用户可从 Release 页面下载。
+
+开发、合并与发布收尾完成。真实包演练验证脚本替换、回滚与启动存活；未将其写成所有机器/全部界面/全部平台下载的保证。后续本文记录提交仅更新文档，不改变 v1.4.0 tag 与安装包。
