@@ -12,6 +12,9 @@ def test_private_directory_permissions_and_cleanup():
         assert path.is_dir()
         if os.name != "nt":
             assert path.stat().st_mode & 0o777 == 0o700
+        else:
+            from scripts.check_install import check_acl
+            check_acl(path)
     assert not path.exists()
 
 
