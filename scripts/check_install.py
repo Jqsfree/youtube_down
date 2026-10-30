@@ -25,7 +25,8 @@ def native_env(**updates: str) -> dict[str, str]:
     # Do not feed PowerShell 7 module directories to Windows PowerShell 5.1.
     env = dict(os.environ, **updates)
     if os.name == 'nt':
-        env.pop('PSModulePath', None)
+        env = {key: value for key, value in env.items()
+               if key.casefold() != 'psmodulepath'}
     return env
 
 

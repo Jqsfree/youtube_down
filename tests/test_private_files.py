@@ -37,3 +37,13 @@ def test_windows_acl_failure_stops_creation(tmp_path, monkeypatch):
     monkeypatch.setattr(private_files.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=b"invalid"))
     with pytest.raises(RuntimeError, match="权限"):
         private_files.restrict_directory(tmp_path)
+
+
+def test_native_check_removes_case_insensitive_powershell_module_path(monkeypatch):
+    from scripts import check_install
+    source = {'PSMODULEPATH': 'PowerShell7/modules', 'PATH': 'system'}
+    monkeypatch.setattr(check_install, 'os', SimpleNamespace(name='nt', environ=source))
+    env = check_install.native_env(CHECK_DIR='temporary')
+    assert not any(key.casefold() == 'psmodulepath' for key in env)
+    assert env['PATH'] == 'system' and env['CHECK_DIR'] == 'temporary'
+    assert source['PSMODULEPATH'] == 'PowerShell7/modules'
