@@ -1,6 +1,6 @@
 # youtube_down 渐进改进方案
 
-日期：2026-10-30。基线：当前工作区 v1.3.1。状态：第五批代码与双平台构建验收通过；第一批真实升级验证仍为发布前待办。
+日期：2026-10-30。基线：当前工作区 v1.3.1。状态：五批代码、双平台构建及真实安装替换/回滚验收通过；准备 v1.4.0 发布。
 
 ## 1. 架构判断与目标
 
@@ -260,3 +260,7 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 首次演练 run 41004976218 失败，未进入发布；原因为 macOS /var 与 /private/var 路径别名使进程识别失败，以及 Windows runner 的 PSModulePath 导致 Windows PowerShell 无法加载 Get-Acl。macOS 在 run [41005457493](https://github.com/Jqsfree/youtube_down/actions/runs/41005457493) 中，路径规范化后已实际通过 v1.3.1→v1.4.0 替换与失败回滚，Windows 仍待验证。独立审查提出的命令注入标记检查目录问题已修复并故障注入验证。Windows 实际 ACL 检查已纳入离线测试，避免只检查 icacls 参数。演练证明脚本替换与进程启动存活，不等价于人工 GUI 完整验收，也不覆盖新进程启动失败的自动健康回滚。
 
 Windows 后续真实测试发现 mkdtemp 目录带显式 OWNER/SYSTEM/Administrators ACE，原 inheritance:r 不会移除这些显式项。已在仍为空的新临时目录先 icacls /reset、再移除继承并授予当前 SID；只影响 make_private_directory 新建目录，不调整导入原件或现有安装。新增原生 ACL 检查先失败，本机 348 项通过，云端修复验证待结果。PowerShell 环境清理也有大小写变量名的失败复现与回归测试。
+
+收尾原生最终验收：提交 6abbe53，run [41006095823](https://github.com/Jqsfree/youtube_down/actions/runs/41006095823) 成功。Windows success/rollback/occupied 三用例、实际 SID ACL 检查，macOS success/rollback 两用例均通过，使用真实 v1.3.1 旧包和 v1.4.0 新包；特殊路径相邻文件保留、摘要匹配及新/回滚进程存活断言通过，打包与产物上传成功。此前 41005769957、41005848334 由修正版本替代后取消，不作通过证据。第一批实际替换演练待办现已补齐。
+
+最终本机 348 passed，actionlint、uv lock --check 与 git diff --check 通过。另以 FFmpeg 生成的真实媒体经本地 HTTP 服务和实际 yt-dlp 下载，再用 ffprobe 验证时长/高度通过（27097 bytes）；外部 W3C/Google 样例均返回 403，不能报告外网站点下载成功。独立联网冒烟待合并后运行，不把外部站点可用性混同安装/回归结果。当前准备合并 #4 与 v1.4.0 草稿，尚未报告公开发布完成。
