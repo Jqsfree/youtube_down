@@ -4,13 +4,13 @@
 
 ## 下载安装包（推荐）
 
-最新版：[v1.3.1](https://github.com/Jqsfree/youtube_down/releases/tag/v1.3.1)
+最新版：[v1.4.0](https://github.com/Jqsfree/youtube_down/releases/tag/v1.4.0)
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| Windows (x64) | [YouTubeDownloader-Windows.exe](https://github.com/Jqsfree/youtube_down/releases/download/v1.3.1/YouTubeDownloader-Windows.exe) | 双击运行；已内嵌 ffmpeg / ffprobe / deno |
-| macOS (Apple Silicon) | [YouTubeDownloader-macOS.zip](https://github.com/Jqsfree/youtube_down/releases/download/v1.3.1/YouTubeDownloader-macOS.zip) | 解压后打开 `.app`；已内嵌 ffmpeg / ffprobe / deno |
-| 校验 | [SHA256SUMS.txt](https://github.com/Jqsfree/youtube_down/releases/download/v1.3.1/SHA256SUMS.txt) | 应用内更新会自动校验 |
+| Windows (x64) | [YouTubeDownloader-Windows.exe](https://github.com/Jqsfree/youtube_down/releases/download/v1.4.0/YouTubeDownloader-Windows.exe) | 双击运行；已内嵌 ffmpeg / ffprobe / deno |
+| macOS (Apple Silicon) | [YouTubeDownloader-macOS.zip](https://github.com/Jqsfree/youtube_down/releases/download/v1.4.0/YouTubeDownloader-macOS.zip) | 解压后打开 `.app`；已内嵌 ffmpeg / ffprobe / deno |
+| 校验 | [SHA256SUMS.txt](https://github.com/Jqsfree/youtube_down/releases/download/v1.4.0/SHA256SUMS.txt) | 应用内更新会自动校验 |
 
 > **v1.3.0 起支持应用内更新。** 1.2.0 及更早版本没有更新入口，需手动下载一次
 > v1.3.0；之后即可在「设置 → 检查更新」一键升级。

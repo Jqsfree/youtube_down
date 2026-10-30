@@ -149,7 +149,7 @@ def exercise(old: Path, new: Path) -> None:
                 command = (['powershell.exe', '-NoProfile', '-NonInteractive',
                             '-ExecutionPolicy', 'Bypass', '-File', str(script)]
                            if os.name == 'nt' else ['/bin/sh', str(script)])
-                installer = subprocess.Popen(command, env=env)
+                installer = subprocess.Popen(command, env=env, cwd=root)
                 if handle is not None:
                     time.sleep(5)
                     assert installer.poll() is None, 'installer did not wait for file lock'
