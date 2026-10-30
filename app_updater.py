@@ -15,8 +15,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform as host_platform
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from private_files import make_private_directory
+
 from yt_dlp_updater import version_newer
 
 REPO = "Jqsfree/youtube_down"
@@ -37,7 +41,7 @@ RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
 # 资产名与 .github/workflows/build.yml 的 artifact_name 保持一致
 ASSET_WINDOWS = "YouTubeDownloader-Windows.exe"
 ASSET_MACOS = "YouTubeDownloader-macOS.zip"
-# release 里记录各资产 sha256 的清单（build.yml 生成），有则强制校验
+# release 必须提供当前资产的有效 sha256（build.yml 生成）
 ASSET_CHECKSUMS = "SHA256SUMS.txt"
 
 ALLOWED_HOSTS = frozenset({
@@ -106,6 +110,12 @@ def install_root() -> Path | None:
 
 def asset_name_for(platform: str | None = None) -> str:
     plat = platform or sys.platform
+    if platform is None:
+        cpu = host_platform.machine().lower()
+        if plat.startswith("win") and cpu not in {"amd64", "x86_64"}:
+            return ""
+        if plat == "darwin" and cpu not in {"arm64", "aarch64"}:
+            return ""
     if plat.startswith("win"):
         return ASSET_WINDOWS
     if plat == "darwin":
@@ -314,6 +324,8 @@ def parse_checksums(text: str) -> dict[str, str]:
             continue
         name = parts[-1].lstrip("*").strip()
         if name:
+            if name in result and result[name] != digest:
+                raise ValueError(f"校验清单条目冲突：{name}")
             result[name] = digest
     return result
 
@@ -336,15 +348,16 @@ def fetch_checksums(release: Release, dest_dir: Path) -> dict[str, str]:
 
 def download_update(release: Release, dest_dir: Path,
                      progress: ProgressCb | None = None) -> Path:
-    """下载当前平台的更新包；release 带清单时强制校验 sha256。"""
+    """仅下载具有有效校验条目的更新包。"""
     asset = release.asset_for()
     if asset is None:
         raise ValueError(f"release 里没有当前平台的安装包：{asset_name_for()}")
-    path = download_release_asset(asset, dest_dir, progress=progress)
     checksums = fetch_checksums(release, dest_dir)
     expected = checksums.get(asset.name)
-    if expected:
-        verify_asset_checksum(path, expected)
+    if not expected:
+        raise ValueError(f"缺少有效校验信息：{asset.name}，请手动下载更新")
+    path = download_release_asset(asset, dest_dir, progress=progress)
+    verify_asset_checksum(path, expected)
     return path
 
 
@@ -358,7 +371,8 @@ def _spawn_detached(script: Path, args: list[str] | None = None) -> None:
         for flag in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
             creation |= int(getattr(subprocess, flag, 0))
         subprocess.Popen(  # noqa: S603 - 固定脚本
-            ["cmd", "/c", str(script)] + list(args or []),
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+             "Bypass", "-File", str(script)] + list(args or []),
             creationflags=creation,
             close_fds=True,
         )
@@ -373,51 +387,63 @@ def _spawn_detached(script: Path, args: list[str] | None = None) -> None:
 
 
 def _write_windows_script(payload: Path, target: Path) -> Path:
-    """写一个批处理：等旧进程退出 → 替换 exe → 启动新 exe → 自删。"""
-    script = Path(tempfile.gettempdir()) / f"ytdown-update-{os.getpid()}.bat"
-    old = target.with_name(target.name + ".old")
-    lines = [
-        "@echo off",
-        "setlocal",
-        "ping 127.0.0.1 -n 4 >nul",
-        f'set "NEW={payload}"',
-        f'set "TARGET={target}"',
-        f'set "OLD={old}"',
-        'if exist "%OLD%" del /f /q "%OLD%" >nul 2>&1',
-        "set /a tries=0",
-        ":retry",
-        'move /y "%TARGET%" "%OLD%" >nul 2>&1',
-        'if errorlevel 1 (',
-        "  set /a tries+=1",
-        "  if %tries% GEQ 30 goto rollback",
-        "  ping 127.0.0.1 -n 2 >nul",
-        "  goto retry",
-        ")",
-        'copy /y "%NEW%" "%TARGET%" >nul 2>&1',
-        # 复制失败时 TARGET 已被搬走，必须搬回来，否则用户两头落空
-        "if errorlevel 1 goto rollback",
-        'if exist "%OLD%" del /f /q "%OLD%" >nul 2>&1',
-        'start "" "%TARGET%"',
-        "goto done",
-        ":rollback",
-        'if not exist "%TARGET%" move /y "%OLD%" "%TARGET%" >nul 2>&1',
-        'start "" "%TARGET%"',
-        ":done",
-        'del /f /q "%~f0" >nul 2>&1',
-    ]
-    script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    """路径通过 JSON 数据传入 PowerShell，不参与命令解析。"""
+    directory = make_private_directory("ytdown-update-")
+    script = directory / "install.ps1"
+    script.with_suffix(".json").write_text(
+        json.dumps({"payload": str(payload), "target": str(target)}, ensure_ascii=True),
+        encoding="utf-8",
+    )
+    script.write_text(r'''$ErrorActionPreference = 'Stop'
+$data = Get-Content -LiteralPath ([IO.Path]::ChangeExtension($PSCommandPath, '.json')) -Raw | ConvertFrom-Json
+$target = $data.target
+$old = $target + '.old'
+$moved = $false
+try {
+    Start-Sleep -Seconds 2
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }
+    for ($tries = 0; $tries -lt 30; $tries++) {
+        try {
+            Move-Item -LiteralPath $target -Destination $old
+            $moved = $true
+            break
+        } catch {
+            if ($tries -eq 29) { throw }
+            Start-Sleep -Seconds 1
+        }
+    }
+    Copy-Item -LiteralPath $data.payload -Destination $target
+    # ProcessStartInfo uses the executable path directly, without a command shell.
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $target
+    $start.UseShellExecute = $false
+    [System.Diagnostics.Process]::Start($start) | Out-Null
+} catch {
+    if ($moved) {
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
+        Move-Item -LiteralPath $old -Destination $target
+        $start = New-Object System.Diagnostics.ProcessStartInfo
+        $start.FileName = $target
+        $start.UseShellExecute = $false
+        [System.Diagnostics.Process]::Start($start) | Out-Null
+    }
+    exit 1
+} finally {
+    Remove-Item -LiteralPath $PSScriptRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+''', encoding="utf-8-sig")
     return script
 
 
 def _write_macos_script(payload: Path, target: Path) -> Path:
     """解压 zip → 备份旧 .app → 覆盖 → 去隔离属性 → 打开。"""
-    script = Path(tempfile.gettempdir()) / f"ytdown-update-{os.getpid()}.sh"
+    script = make_private_directory("ytdown-update-") / "install.sh"
     old = target.with_name(target.name + ".old")
     lines = [
         "#!/bin/sh",
-        f'NEW="{payload}"',
-        f'TARGET="{target}"',
-        f'OLD="{old}"',
+        f"NEW={shlex.quote(str(payload))}",
+        f"TARGET={shlex.quote(str(target))}",
+        f"OLD={shlex.quote(str(old))}",
         "sleep 2",
         'rm -rf "$OLD"',
         'WORK=$(mktemp -d)',

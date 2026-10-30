@@ -1,0 +1,35 @@
+name: Offline checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.12.8'
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Check version and generated requirements
+        shell: bash
+        run: |
+          uv run --no-sync python scripts/release_checks.py version
+          uv export --locked --no-dev --no-emit-project --no-header -o requirements.check.txt > /dev/null
+          git diff --no-index --exit-code requirements.txt requirements.check.txt
+      - name: Offline tests
+        run: uv run --no-sync python -m pytest tests/ -q
+        env:
+          QT_QPA_PLATFORM: offscreen

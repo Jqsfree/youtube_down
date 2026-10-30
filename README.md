@@ -82,15 +82,19 @@ powershell -ExecutionPolicy Bypass -File scripts\win_test.ps1 -SkipNetwork
 可选（Cookie 重试模式）：
 
 - **deno**：Cookie 模式下 YouTube JS 挑战需要
-- **Chrome/Edge/Safari**：用于读取浏览器 Cookie
-- **手动 Cookie 文件**：若无法自动读取浏览器 Cookie，可在 GUI 导入 Netscape 格式的 `cookies.txt`（可用扩展 **Get cookies.txt LOCALLY** 导出）。Cookie 模式还需要 deno（`scripts\setup_dev.ps1` 会一并下载，或 `winget install Denoland.Deno` / `brew install deno`）
+- **Chrome/Edge/Safari**：在 GUI 点击重新读取后才启用浏览器 Cookie，默认不读取、不自动导出。CLI 需显式指定 `--cookies-from-browser chrome`。
+- **手动 Cookie 文件**：若不使用浏览器读取，可在 GUI 导入 Netscape 格式的 `cookies.txt`（可用扩展 **Get cookies.txt LOCALLY** 导出）。Cookie 模式还需要 deno（`scripts\setup_dev.ps1` 会一并下载，或 `winget install Denoland.Deno` / `brew install deno`）
+
+Cookie 等同账号凭据。导入文件保持原样，yt-dlp 仅操作按平台过滤的临时副本，并在该次操作结束（含异常、取消）后清理。CLI 显式浏览器导出只保存受支持平台域名，存于当前进程私有临时目录，退出时清理；强制杀进程可能留下临时目录。旧版 `~/.youtube_downloader/auto_browser_cookies.txt` 或输出目录 `.yt_cookies.txt` 不再自动读取；确认无旧进程使用后可手动删除。
+
+应用内更新必须提供有效的 SHA256 清单和当前资产条目；缺失时只能手动下载。SHA256 用于完整性验证，不等同发布者身份认证。安装脚本目前只处理替换失败回滚，不保证新版本启动后的健康回滚。尚未提供 Intel Mac 和 Windows ARM 的对应更新包。
 
 ### 手动分步测试
 
 ```bash
-python -m pip install -r requirements.txt pytest
-python -m pytest tests/ -v
-python smoke_test.py
+uv sync --locked --group build
+uv run --no-sync python -m pytest tests/ -v
+uv run --no-sync python smoke_test.py
 python main.py
 ```
 
@@ -149,4 +153,8 @@ youtube_down/
 - 下载逻辑在 `downloader.py` / `platforms/`，可供 CLI 复用
 - `worker.py` 负责后台线程，通过 Qt Signals 更新 GUI
 
-推送到 `main` 会自动构建 Windows `.exe` 与 macOS `.zip`，并发布到 [Releases](https://github.com/Jqsfree/youtube_down/releases)。
+推送 `vX.Y.Z` tag 会构建 Windows `.exe` 与 macOS `.zip`，通过检查后仅创建 [Releases](https://github.com/Jqsfree/youtube_down/releases) 草稿；维护者验收后手动发布。
+
+### 开发检查与发布
+
+PR 和 main 普通提交仅运行离线测试；真实 YouTube 冒烟独立每日/手动运行。发布使用 `vX.Y.Z` tag，构建成功后只创建草稿，需完成人工升级验证再发布。手动构建默认不创建发布，同版本资产禁止覆盖。依赖和工具更新方式见 [BUILD.md](BUILD.md#依赖与外部工具)。

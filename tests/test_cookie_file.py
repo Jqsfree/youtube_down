@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,7 @@ def test_set_cookiefile_clears_browser_spec(cookie_txt: Path, monkeypatch: pytes
     assert dl.cookie_source() == f"YouTube:{cookie_txt.name}"
 
 
-def test_clear_cookiefile_redetects_browser(cookie_txt: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_clear_cookiefile_disables_browser(cookie_txt: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         YoutubeDownloader, "detect_browser", staticmethod(lambda: ("chrome", "Default"))
     )
@@ -55,7 +56,7 @@ def test_clear_cookiefile_redetects_browser(cookie_txt: Path, monkeypatch: pytes
     dl.set_cookiefile(cookie_txt, persist=False)
     dl.clear_cookiefile(persist=False)
     assert dl._cookiefile_path is None
-    assert dl._cookies_spec == "chrome:Default"
+    assert dl._cookies_spec is None
 
 
 def test_persist_cookiefile(tmp_path: Path, cookie_txt: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -119,3 +120,85 @@ def test_validate_cookies_requires_deno_for_file(cookie_txt: Path, monkeypatch: 
     ok, msg = dl.validate_cookies()
     assert not ok
     assert "deno" in msg.lower()
+
+
+def test_default_does_not_select_browser(monkeypatch):
+    monkeypatch.setattr(YoutubeDownloader, "_load_saved_cookiefiles", staticmethod(lambda: {}))
+    monkeypatch.setattr(YoutubeDownloader, "_load_saved_cookiefile", staticmethod(lambda: None))
+    monkeypatch.setattr(YoutubeDownloader, "detect_browser", staticmethod(lambda: (_ for _ in ()).throw(AssertionError("browser accessed"))))
+    assert YoutubeDownloader()._cookies_spec is None
+
+
+def test_cookie_copy_filtered_and_removed_on_exception(cookie_txt, monkeypatch):
+    import downloader
+    cookie_txt.write_text(cookie_txt.read_text() + ".evil-youtube.com\tTRUE\t/\tTRUE\t1893456000\tSECRET\tprivate\n")
+    original = cookie_txt.read_bytes()
+    seen = []
+    class FakeYDL:
+        def __init__(self, opts):
+            self.path = Path(opts["cookiefile"])
+            seen.append(self.path)
+            assert self.path != cookie_txt
+            assert "SECRET" not in self.path.read_text()
+            if os.name != "nt":
+                assert self.path.stat().st_mode & 0o777 == 0o600
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.path.write_text("changed by yt-dlp")
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYDL)
+    import pytest
+    with pytest.raises(RuntimeError):
+        with downloader._open_ydl({"cookiefile": str(cookie_txt)}, "youtube"):
+            assert seen[0].exists()
+            raise RuntimeError("cancelled")
+    assert not seen[0].exists()
+    assert cookie_txt.read_bytes() == original
+
+
+def test_concurrent_cookie_copies_have_independent_lifetimes(cookie_txt, monkeypatch):
+    import downloader
+    class FakeYDL:
+        def __init__(self, opts): self.path = Path(opts["cookiefile"])
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYDL)
+    with downloader._open_ydl({"cookiefile": str(cookie_txt)}, "youtube") as first:
+        with downloader._open_ydl({"cookiefile": str(cookie_txt)}, "youtube") as second:
+            assert first.path != second.path
+        assert first.path.exists()
+        assert not second.path.exists()
+    assert not first.path.exists()
+
+
+def test_export_filters_before_saving(tmp_path, monkeypatch):
+    from http.cookiejar import Cookie
+    from yt_dlp.cookies import YoutubeDLCookieJar
+    import downloader
+    jar = YoutubeDLCookieJar()
+    for domain in (".youtube.com", ".bilibili.com", ".tiktok.com", ".example.com", ".evilyoutube.com"):
+        jar.set_cookie(Cookie(0, "SID", "fake", None, False, domain, True, True, "/", True, False, 1893456000, False, None, None, {}))
+    class FakeYDL:
+        def __init__(self, opts):
+            assert "cookiefile" not in opts  # prevents automatic full-jar persistence
+            self.cookiejar = jar
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYDL)
+    dest = tmp_path / "export.txt"
+    downloader.dump_browser_cookies("chrome", dest)
+    text = dest.read_text()
+    assert "example.com" not in text and "evilyoutube.com" not in text
+    assert "youtube.com" in text and "bilibili.com" in text and "tiktok.com" in text
+    if os.name != "nt":
+        assert dest.stat().st_mode & 0o777 == 0o600
+
+
+def test_export_never_overwrites_existing_file(tmp_path, monkeypatch):
+    import downloader
+    dest = tmp_path / "original.txt"
+    dest.write_text("original")
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", lambda *args: (_ for _ in ()).throw(RuntimeError("browser locked")))
+    with pytest.raises((ValueError, FileExistsError)):
+        downloader.dump_browser_cookies("chrome", dest)
+    assert dest.read_text() == "original"

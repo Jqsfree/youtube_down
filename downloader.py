@@ -13,6 +13,7 @@ GUI 层不允许直接 import yt_dlp。所有视频信息获取和下载操作
 from __future__ import annotations
 
 import csv
+import glob
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
+from private_files import private_directory
 from logger_utils import AppLogger
 from yt_dlp_updater import overlay_source_label
 from platforms.base import MediaInput
@@ -135,14 +138,14 @@ def _stash_existing_files(
 ) -> list[tuple[Path, Path]]:
     """下载前暂存同名旧文件，失败时恢复；上次异常退出遗留的 .bak 先还原。"""
     stashed: list[tuple[Path, Path]] = []
-    for bak in output_dir.glob(f".{stem}.*.bak"):
+    for bak in output_dir.glob(f".{glob.escape(stem)}.*.bak"):
         original = bak.with_name(bak.name[1:-4])
         if not original.exists():
             try:
                 bak.replace(original)
             except OSError:
                 pass
-    for path in output_dir.glob(f"{stem}.*"):
+    for path in output_dir.glob(f"{glob.escape(stem)}.*"):
         if path.suffix.lower() not in exts:
             continue
         bak = path.with_name(f".{path.name}.bak")
@@ -504,8 +507,34 @@ BRUTAL_MAX_WORKERS = 8
 BRUTAL_EXTRA_RETRIES = 2
 BOT_STREAK_LIMIT = 2
 
-# macOS 自动导出的 Netscape Cookie 落盘路径（不强制 persist 到用户「记住」配置）
-_AUTO_BROWSER_COOKIE_FILE = _COOKIE_CONFIG_DIR / "auto_browser_cookies.txt"
+def _allowed_cookie_domain(domain: str, platform: str | None) -> bool:
+    domains = (_PLATFORM_COOKIE_DOMAINS.get(platform, ()) if platform else
+               tuple(d for group in _PLATFORM_COOKIE_DOMAINS.values() for d in group))
+    domain = domain.lower().lstrip(".")
+    return any(domain == d or domain.endswith("." + d) for d in domains)
+
+
+@contextmanager
+def _open_ydl(opts: dict[str, Any], platform: str | None = None):
+    """Own the mutable yt-dlp cookie file for exactly one operation."""
+    source = opts.get("cookiefile")
+    if not source:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            yield ydl
+        return
+    with private_directory("ytdown-cookie-") as private_dir:
+        copy = Path(private_dir) / "cookies.txt"
+        text = YoutubeDownloader._read_cookie_text(Path(source))
+        lines = ["# Netscape HTTP Cookie File"]
+        for line in text.splitlines():
+            fields = line.removeprefix("#HttpOnly_").split("\t")
+            if len(fields) == 7 and _allowed_cookie_domain(fields[0], platform):
+                lines.append(line)
+        fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        with yt_dlp.YoutubeDL({**opts, "cookiefile": str(copy)}) as ydl:
+            yield ydl
 
 
 def dump_browser_cookies(browser_spec: str, dest: Path) -> Path:
@@ -513,29 +542,30 @@ def dump_browser_cookies(browser_spec: str, dest: Path) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
-        dest.unlink()
+        raise FileExistsError("Cookie 导出目标已存在，请使用新的私有临时文件")
     parts = tuple(p for p in browser_spec.split(":") if p)
     opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": True,
-        "skip_download": True,
+        "quiet": True, "no_warnings": True, "skip_download": True,
         "cookiesfrombrowser": parts,
-        "cookiefile": str(dest),
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        try:
-            ydl.cookiejar  # 触发从浏览器加载
-        except Exception:
-            pass
-        cookiejar = getattr(ydl, "cookiejar", None)
-        if cookiejar is not None and hasattr(cookiejar, "save"):
-            cookiejar.save(filename=str(dest), ignore_discard=True, ignore_expires=True)
-    if not dest.is_file() or dest.stat().st_size < 80:
-        raise RuntimeError(
-            f"无法从浏览器导出 Cookie（{browser_spec}）。"
-            "请关闭浏览器后重试，或改用导入 cookies.txt"
-        )
+    created = False
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            jar = ydl.cookiejar
+            for cookie in list(jar):
+                if not _allowed_cookie_domain(cookie.domain, None):
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+            # Create privately before save; never change permissions after writing secrets.
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+            created = True
+            jar.save(filename=str(dest), ignore_discard=True, ignore_expires=True)
+        if not dest.is_file() or dest.stat().st_size < 80:
+            raise RuntimeError("无法导出有效 Cookie，请检查浏览器或改用导入文件")
+    except BaseException:
+        if created:
+            dest.unlink(missing_ok=True)
+        raise
     return dest
 
 
@@ -607,7 +637,7 @@ class YoutubeDownloader:
 
         Args:
             cookies_from_browser: 浏览器名称:profile 格式。
-                None 时自动检测，'' 时不使用 cookie。
+                None 时仅加载已保存文件，'' 时不使用 Cookie。
             cookiefile: Netscape 格式 cookie 文件路径。
                 比 cookiesfrombrowser 更可靠，优先使用。
             ydl_opt_overrides: 覆盖 yt-dlp 默认选项（CLI 快节奏用）。
@@ -632,11 +662,7 @@ class YoutubeDownloader:
             if saved:
                 self.set_cookiefile(saved, persist=False)
             else:
-                info = self.detect_browser()
-                self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
-                # macOS：尽量导出一次为 cookie 文件；失败则保留 cookiesfrombrowser
-                if sys.platform == "darwin" and self._cookies_spec:
-                    self._try_autoload_browser_cookies()
+                self._cookies_spec = None
         else:
             self._cookies_spec = cookies_from_browser
         self._cancel_coordinator: YoutubeDownloader | None = None
@@ -1028,7 +1054,7 @@ class YoutubeDownloader:
                         cookies_from_browser_override=cookies_from_browser_override,
                         for_extraction=True,
                     )
-                    with yt_dlp.YoutubeDL(opts) as ydl:
+                    with _open_ydl(opts, media.platform) as ydl:
                         info = ydl.extract_info(url, download=False)
                         if info and len(info.get("formats", [])) > 0:
                             info.setdefault("_platform", media.platform)
@@ -1146,7 +1172,7 @@ class YoutubeDownloader:
         )
         try:
             with self._yt_dlp_lock:
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with _open_ydl(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
         except Exception:
             return fallback
@@ -1284,7 +1310,7 @@ class YoutubeDownloader:
         ok = False
         try:
             with self._yt_dlp_lock:
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with _open_ydl(opts, media.platform) as ydl:
                     try:
                         info = ydl.extract_info(url, download=True)
                     except Exception as exc:
@@ -1297,7 +1323,7 @@ class YoutubeDownloader:
                     preferred_exts = AUDIO_EXTS if audio_only else VIDEO_EXTS
                     if not path.exists() or path.suffix.lower() not in preferred_exts:
                         stem = path.stem
-                        candidates = list(output_dir.glob(f"{stem}.*"))
+                        candidates = list(output_dir.glob(f"{glob.escape(stem)}.*"))
                         preferred = [
                             c for c in candidates if c.suffix.lower() in preferred_exts
                         ]
@@ -1629,7 +1655,7 @@ class YoutubeDownloader:
 
 
     def clear_cookiefile(self, *, persist: bool = True) -> None:
-        """清除 cookie 文件，恢复自动检测浏览器 Cookie。"""
+        """清除 Cookie 文件，不自动启用浏览器读取。"""
         old_platform = self._cookiefile_platform
         self._cookiefile_path = None
         self._cookiefile_platform = None
@@ -1639,8 +1665,7 @@ class YoutubeDownloader:
                 self._platform_cookiefiles.pop(old_platform, None)
                 self._persist_platform_cookiefile(old_platform, None)
             self._persist_cookiefile(None)
-        info = self.detect_browser()
-        self._cookies_spec = f"{info[0]}:{info[1]}" if info else None
+        self._cookies_spec = None
 
     def validate_cookies(self) -> tuple[bool, str]:
         """联网探测 Cookie 是否能让当前平台返回格式列表。"""
@@ -2004,27 +2029,8 @@ class YoutubeDownloader:
             return media.url
         return ""
 
-    def _try_autoload_browser_cookies(self) -> bool:
-        """尝试把浏览器 Cookie 导出为文件；成功返回 True。
-
-        仅应在已设置 ``_cookies_spec`` 且尚无 cookie 文件时调用。
-        """
-        if not self._cookies_spec:
-            return False
-        try:
-            dump_browser_cookies(self._cookies_spec, _AUTO_BROWSER_COOKIE_FILE)
-            self.set_cookiefile(
-                _AUTO_BROWSER_COOKIE_FILE,
-                persist=False,
-                preferred_platform="youtube",
-            )
-            return True
-        except Exception:
-            # 锁库 / 钥匙串拒绝 / 无 youtube 域名：保留 cookiesfrombrowser
-            return False
-
     def redetect_browser(self) -> bool:
-        """重新检测浏览器（Profile 可能已切换），macOS 上会再尝试导出文件。
+        """按用户操作重新检测浏览器，不导出 Cookie 文件。
 
         返回 True 表示检测到了可用的 Cookie 源（文件或浏览器）。
         """
@@ -2033,8 +2039,6 @@ class YoutubeDownloader:
         self._browser_cookie_broken = False
         if not self._cookies_spec:
             return False
-        if sys.platform == "darwin" and self._try_autoload_browser_cookies():
-            return True
         return True
 
     # ------------------------------------------------------------------

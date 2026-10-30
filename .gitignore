@@ -21,3 +21,12 @@ resources/ffmpeg/
 resources/deno/
 *.egg-info/
 .cursor/
+
+# CI-local tool inputs and dependency comparison output
+/ffmpeg
+/ffprobe
+/deno
+/brew-build-info.json
+/requirements.check.txt
+/release-assets/
+/staged/

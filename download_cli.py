@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""独立批量下载：默认带 Cookie、自适应节流、跳过已完成文件。
+"""独立批量下载：Cookie 显式授权、自适应节流、跳过已完成文件。
 
 不依赖 GUI。输入可为表格文件、文件夹（递归）或直接的链接/ID；
 输出目录镜像输入层级，文件名为 ``<原表行号>_<媒体ID>``，结果写入输出根的 ``下载总览.csv``。
-Cookie 由 ``--cookies`` 或浏览器导出准备，下载时始终启用。
+Cookie 仅由 ``--cookies`` 或显式 ``--cookies-from-browser`` 启用。
 
 示例::
 
@@ -20,6 +20,7 @@ import json
 import socket
 import sys
 import threading
+import uuid
 import time
 import urllib.parse
 import urllib.request
@@ -54,6 +55,7 @@ from downloader import (
     looks_like_playlist,
     proxy_reachable,
 )
+from private_files import private_directory
 from pacing import AdaptivePacer
 
 # 兼容旧测试名：正常模式与 NORMAL_YDL_OPTS 对齐（视频间间隔交给 AdaptivePacer）
@@ -301,7 +303,7 @@ def _pot_extractor_args(enabled: bool) -> dict[str, Any]:
 
 
 def _make_downloader(
-    cookiefile: Path,
+    cookiefile: Path | None,
     *,
     use_pot: bool = False,
     fragment_workers: int = 8,
@@ -342,7 +344,7 @@ def _is_generic_source(source: str) -> bool:
 def _download_one(
     video_id: str,
     output_dir: Path,
-    cookiefile: Path,
+    cookiefile: Path | None,
     min_height: int,
     *,
     use_pot: bool = False,
@@ -511,7 +513,7 @@ def _iter_sources(
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="批量下载（默认 Cookie、自适应节流、可续传）")
+    parser = argparse.ArgumentParser(description="批量下载（Cookie 按需授权、自适应节流、可续传）")
     parser.add_argument("sources", nargs="+", help="CSV/TSV/TXT、包含它们的文件夹，或视频 URL/ID")
     parser.add_argument(
         "-o", "--output-dir", type=Path, required=True,
@@ -584,8 +586,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--cookies-from-browser",
-        default="chrome",
-        help="从浏览器导出 Cookie（workers=1 且未指定 --cookies 时）",
+        default="",
+        help="显式授权从指定浏览器读取 Cookie，仅临时保存目标平台域名",
     )
     parser.add_argument(
         "--cookies", type=Path, default=None,
@@ -651,11 +653,13 @@ def _resolve_cookiefile(
     results_dir: Path,
     *,
     force_refresh: bool = False,
-) -> Path:
+) -> Path | None:
+    if not args.cookies and not args.cookies_from_browser:
+        return None
     dest = (
         args.cookies.expanduser().resolve()
         if args.cookies
-        else (results_dir / ".yt_cookies.txt")
+        else (args._cookie_temp_dir / f"cookies-{uuid.uuid4().hex}.txt")
     )
     if args.cookies and not force_refresh:
         if not dest.is_file():
@@ -675,6 +679,12 @@ def _resolve_cookiefile(
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    with private_directory("ytdown-cookie-cli-") as directory:
+        args._cookie_temp_dir = Path(directory)
+        return _run(args)
+
+
+def _run(args: argparse.Namespace) -> int:
     if not proxy_reachable(args.proxy):
         print(f"代理不可用: {args.proxy}（请检查端口，或去掉 --proxy 直连）", file=sys.stderr)
         return 2
@@ -805,7 +815,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     stop_bot = False
     downloads_since_cookie_refresh = 0
     cookie_lock = threading.Lock()
-    use_browser_cookies = args.cookies is None
+    use_browser_cookies = args.cookies is None and bool(args.cookies_from_browser)
     clash = ClashClient(
         unix_socket=args.clash_socket,
         secret=args.clash_secret,
@@ -817,7 +827,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     def _maybe_refresh_cookies() -> None:
         nonlocal cookiefile, downloads_since_cookie_refresh
-        if args.cookies:
+        if args.cookies or not args.cookies_from_browser:
             return
         if args.refresh_cookies_every <= 0:
             return
@@ -906,15 +916,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                                     print(f"bot 后切换 Clash 节点: {args.clash_group} -> {new_node}", flush=True)
                             except Exception as exc:
                                 print(f"Clash 换节点失败: {exc}", flush=True)
-                            try:
-                                with cookie_lock:
-                                    cookiefile = _resolve_cookiefile(
-                                        args, results_dir, force_refresh=True,
-                                    )
-                                    downloads_since_cookie_refresh = 0
-                                recovered = True
-                            except Exception as exc:
-                                print(f"bot 后 Cookie 刷新失败: {exc}", flush=True)
+                            recovered = bool(new_node)
+                            if use_browser_cookies:
+                                try:
+                                    with cookie_lock:
+                                        cookiefile = _resolve_cookiefile(
+                                            args, results_dir, force_refresh=True,
+                                        )
+                                        downloads_since_cookie_refresh = 0
+                                    recovered = recovered or cookiefile is not None
+                                except Exception as exc:
+                                    print(f"bot 后 Cookie 刷新失败: {exc}", flush=True)
                             ip, org = ("", "")
                             if args.proxy_check_url:
                                 ip, org = check_exit_ip(args.proxy_check_url)

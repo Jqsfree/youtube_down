@@ -315,7 +315,8 @@ class MainWindow(QMainWindow):
         page, layout = self._page(
             "平台 Cookie",
             "公开视频无需 Cookie；遇到登录、年龄或机器人验证时才会使用。"
-            "macOS 会尝试自动读取浏览器 Cookie；也可导入 Netscape 格式的 cookies.txt。"
+            "浏览器 Cookie 仅在点击重新读取后启用；也可导入 Netscape 格式的 cookies.txt。"
+            "Cookie 等同账号凭据，请勿分享。"
             "Windows 请手动导入 Cookie 文件。",
         )
         self._platform_buttons: dict[str, QPushButton] = {}
@@ -1016,7 +1017,7 @@ class MainWindow(QMainWindow):
             return
         self._cookie_persisted = self._remember_cookie_checkbox.isChecked()
         self._refresh_cookie_ui()
-        self._log(f"已导入 Cookie ({self._selected_platform.label}): {filepath}")
+        self._log(f"已导入 Cookie ({self._selected_platform.label})")
         self._status_label.setText("Cookie 已加载，正在后台验证...")
         self._import_cookie_btn.setEnabled(False)
         self._clear_cookie_btn.setEnabled(False)

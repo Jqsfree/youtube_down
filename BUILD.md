@@ -103,16 +103,16 @@ youtube_down/
 | ffprobe | `shutil.which` | 下载后校验（致命依赖） |
 | yt-dlp-ejs + deno | 探测 | YouTube JS 挑战 |
 
-Cookie 由 yt-dlp 直接读取浏览器 Cookie 数据库（`cookiesfrombrowser`），不使用 `browser_cookie3`。
+浏览器 Cookie 必须由 GUI 重新读取操作或显式 CLI 参数授权，不使用 `browser_cookie3`。导入文件由每次 yt-dlp 操作使用按平台过滤的独立临时副本；CLI 浏览器导出仅包含支持的平台域名，快照随 CLI 会话结束删除。`private_files.py` 负责 POSIX/Windows 私有目录权限。
 
 ## 构建
 
 ### 本地（验证打包逻辑）
 
 ```bash
-pip install pyinstaller
+uv sync --locked --group build
 # Windows
-pyinstaller --onefile --windowed --name "YouTubeDownloader" \
+uv run --no-sync pyinstaller --onefile --windowed --name "YouTubeDownloader" \
   --icon assets/icon.ico --add-data "assets;assets" --add-data "VERSION;." \
   --collect-all yt_dlp --collect-all yt_dlp_ejs --collect-all curl_cffi \
   --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
@@ -122,7 +122,7 @@ pyinstaller --onefile --windowed --name "YouTubeDownloader" \
   main.py
 
 # macOS
-pyinstaller --onedir --windowed --name "YouTubeDownloader" \
+uv run --no-sync pyinstaller --onedir --windowed --name "YouTubeDownloader" \
   --osx-bundle-identifier com.jqsfree.youtubedownloader \
   --icon assets/icon.icns --add-data "assets:assets" --add-data "VERSION:." \
   --collect-all yt_dlp --collect-all yt_dlp_ejs --collect-all curl_cffi \
@@ -163,7 +163,7 @@ python scripts/make_icon.py --check
 
 | 平台 | 资产 | 替换方式 |
 |------|------|---------|
-| Windows | `YouTubeDownloader-Windows.exe` | `update-*.bat` 重命名重试循环 |
+| Windows | `YouTubeDownloader-Windows.exe` | 私有目录 `.ps1` 重命名重试循环，JSON 传递路径 |
 | macOS | `YouTubeDownloader-macOS.zip` | `ditto -x -k` 解压 + `xattr -dr` 去隔离 |
 
 资产名必须与 `build.yml` 的 `artifact_name` 一致，否则更新会提示「没有本平台安装包」。
@@ -172,43 +172,43 @@ python scripts/make_icon.py --check
 
 `build.yml` 为每个产物生成 `SHA256SUMS.txt`（格式 `<sha256>  <文件名>`），两张清单
 在 release job 合并成一个资产。`download_update()` 下载完会查清单校验 sha256，
-不符则删包并报错；老 release 没有清单时跳过校验（向后兼容）。
+不符则删包并报错；没有有效清单或资产条目时拒绝自动更新，提示手动下载。
 
 替换前会先停掉所有后台线程（`_shutdown_for_update`）：`QApplication.quit()`
 不触发 `closeEvent`，运行中的 `QThread` 被析构会 abort，Windows 上还会因为
 exe 仍被占用导致脚本替换失败。
 
-### 完整性校验
+### CI 与草稿发布
 
-`build.yml` 为每个产物生成 `SHA256SUMS.txt`（格式 `<sha256>  <文件名>`），两张清单
-在 release job 合并成一个资产。`download_update()` 下载完会查清单校验 sha256，
-不符则删包并报错；老 release 没有清单时跳过校验（向后兼容）。
+- `ci.yml`：PR、main 普通提交和手动触发，仅运行离线测试与版本/依赖同步检查。安装依赖需要访问包源，“离线”指测试不请求真实站点。
+- `smoke.yml`：每日 UTC 03:17 或手动触发，独立运行现有 YouTube 联网冒烟；不创建发布。
+- `build.yml`：推送 `vX.Y.Z` tag 后构建双平台产物并创建草稿；手动运行默认只构建。手动创建草稿必须填写已存在的 tag 并显式勾选 `create_draft`。
+- tag、VERSION、pyproject 必须一致；手动传入 tag 时 checkout 该 tag，提交必须与 tag 指向一致。普通检查/构建只读，只有 release job 有 contents:write。
+- 发布前重新校验两平台安装包摘要及构建记录，生成合并清单。已有相同 tag 的正式发布或草稿均拒绝覆盖；中断或失败后使用新补丁版本恢复，不修改历史资产。
+- 草稿说明从当前版本 CHANGELOG 条目生成。维护者完成 Windows/macOS 启动、下载、升级验收后再在 GitHub 手动发布；流水线不自动将草稿设为公开最新版。
 
-替换前会先停掉所有后台线程（`_shutdown_for_update`）：`QApplication.quit()`
-不触发 `closeEvent`，运行中的 `QThread` 被析构会 abort，Windows 上还会因为
-exe 仍被占用导致脚本替换失败。
+### 依赖与外部工具
 
-### CI
+发布环境使用 Python 3.12、uv 0.12.8。`pyproject.toml` 是依赖声明，`uv.lock` 锁定运行、dev（pytest/PyYAML）、build（PyInstaller）依赖。CI 和打包均使用 `uv sync --locked`，不在构建时升级 yt-dlp。
 
-推送到 `main` 触发 `.github/workflows/build.yml`：
-
-1. Windows / macOS 矩阵，Python 3.12
-2. `pip install -r requirements.txt pytest pyinstaller`
-3. 单元测试（`QT_QPA_PLATFORM=offscreen`）
-4. 下载 ffmpeg / ffprobe / deno 并内嵌
-5. `smoke_test.py`
-6. PyInstaller 单文件打包 → 生成 `SHA256SUMS.txt` → 上传 artifact
-7. `release` job 按 `VERSION` 创建 GitHub Release（含合并后的 `SHA256SUMS.txt`）
-
-产物：`YouTubeDownloader-Windows.exe`、`YouTubeDownloader-macOS.zip`、`SHA256SUMS.txt`。
-
-## 下载总览.csv
-
-utf-8-sig，输出根目录唯一一份，按 `(来源文件, video_id)` upsert：
-
-```csv
-来源文件,行号,video_id,平台,链接,标题,状态,错误类型,错误信息,输出文件,更新时间
-videos.csv,2,dQw4w9WgXcQ,youtube,https://www.youtube.com/watch?v=dQw4w9WgXcQ,标题,成功,,,out/videos/0002_dQw4w9WgXcQ.mp4,2026-01-01 12:00:00
+```bash
+uv sync --locked --group build
+uv run --no-sync python -m pytest tests/ -q
 ```
 
-写入带跨进程文件锁（`fcntl.flock` / `msvcrt.locking`），原子替换。
+修改依赖后执行：
+
+```bash
+uv lock
+uv export --locked --no-dev --no-emit-project --no-header -o requirements.txt > /dev/null
+```
+
+requirements.txt 是带哈希的运行依赖导出文件，不手工编辑。CI 重新导出并比较，避免与锁文件分叉。
+
+`scripts/build-tools.json` 固定 Windows FFmpeg、双平台 Deno 的归档 URL 和 SHA256；下载后先校验归档摘要，再只提取指定工具文件。macOS 沿用 Homebrew FFmpeg，要求版本精确为清单中的 `formula_version`，版本漂移时拒绝构建；记录已安装 Homebrew 配方信息。Homebrew 的传递依赖和 runner 镜像仍可能变化，本批不承诺字节一致重建，也不会静默放宽版本检查。
+
+工具安装在单元测试之后，避免本地二进制干扰工具解析测试。构建后从 Windows onefile 归档提取内嵌工具到临时目录运行；macOS 从 `.app` 中定位工具运行。Windows 核对内嵌工具与构建输入摘要一致；macOS 因 PyInstaller 会重写 Mach-O 路径并签名，改为验证 app 签名及工具实际版本/启动，同时分别记录输入和产物摘要。此处签名验证仅检查打包完整性，不代表已具备 Developer ID 公证。
+
+每个平台上传 `build-info-<平台>.json`，包含源提交、uv.lock 摘要、实际 Python 包版本、工具下载来源、工具版本与摘要、最终资产摘要；macOS 另含 Homebrew 信息。源码 tag 和这两份记录共同用于追溯。
+
+本地依赖解析、YAML/发布逻辑测试不能替代远程 Actions 双平台构建。第一批真实升级验收继续作为正式发布前门槛。

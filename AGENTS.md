@@ -6,6 +6,9 @@ points here — keep project docs in this file, not in per-agent copies.
 ## Commands
 
 ```bash
+# Install locked development/build dependencies
+uv sync --locked --group build
+
 # Run the app
 python main.py
 
@@ -16,8 +19,8 @@ python -m pytest tests/ -v
 python -m pytest tests/test_format_selection.py -v
 
 # Build Windows EXE (local, Linux — validation only)
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "YouTubeDownloader" \
+uv sync --locked --group build
+uv run --no-sync pyinstaller --onefile --windowed --name "YouTubeDownloader" \
   --icon assets/icon.ico --add-data "assets:assets" --add-data "VERSION:." \
   --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
   --hidden-import yt_dlp --hidden-import yt_dlp.extractor --hidden-import yt_dlp.downloader \
@@ -56,6 +59,8 @@ Theme: `theme.py` (Light/Dark/Nord + accent) via `QSettings`; applied in `main.p
 2. **Stage 2**: Retry with browser cookies — only for 3 error types: `BOT_VERIFICATION`, `AUTH_REQUIRED`, `PRIVATE_VIDEO`.
 
 If a "copy chrome cookie" error occurs, `_cookie_broken` is set to `True` and all subsequent cookie attempts are skipped for the session.
+
+Browser access is opt-in (GUI reload action or explicit CLI option). Cookie files passed to yt-dlp are per-operation, platform-filtered private copies; never overwrite or delete the imported original. `private_files.py` owns private directory permissions (POSIX 0700; Windows current-user ACL).
 
 ## Error Classification
 
@@ -111,8 +116,8 @@ Tests use `YoutubeDownloader.__new__()` to create instances without `__init__` (
 `app_updater.py` (no PySide6, no yt_dlp):
 
 - `check_for_app_update()` compares `VERSION` with the latest GitHub release; prereleases are skipped.
-- `download_release_asset()` streams to a temp dir and verifies the byte count against the API-reported size.
-- `install_and_restart()` writes a platform script (Windows `.bat` retry-loop rename, macOS `.sh` ditto + `xattr -dr`) and spawns it detached, then the GUI quits.
+- `download_release_asset()` streams to a temp dir and verifies the byte count against the API-reported size. `download_update()` requires a valid SHA256 entry before downloading the payload; missing/conflicting entries refuse the update.
+- `install_and_restart()` writes a platform script (Windows `.ps1` retry-loop rename with JSON path data, macOS `.sh` ditto + `xattr -dr`) and spawns it detached, then the GUI quits.
 - `cleanup_old()` removes leftover `*.old` on startup (`main.py`).
 - Source-tree runs never self-replace — they open the Releases page instead.
 - Asset names must stay in sync with `.github/workflows/build.yml`: `YouTubeDownloader-Windows.exe`, `YouTubeDownloader-macOS.zip`.
@@ -127,4 +132,4 @@ Tests use `YoutubeDownloader.__new__()` to create instances without `__init__` (
 
 ## CI/CD
 
-Push to `main` triggers `.github/workflows/build.yml`: unit tests → smoke test (`smoke_test.py`) → PyInstaller single-file app (Windows + macOS) → artifact upload → GitHub Release keyed off `VERSION`. The smoke test validates env detection and `get_info()` on a known public video.
+PR/main commits run `.github/workflows/ci.yml`: locked dependencies, generated-requirements consistency and offline tests. Network smoke is isolated in `smoke.yml` (daily/manual). `build.yml` runs for `v*` tags or manual builds: validate tag/VERSION/pyproject, locked tests/build, pinned tools, verify embedded tools, upload artifacts and build-info. Only the release job has write permission; tags create a new draft release, manual builds create no release unless `create_draft` is explicitly selected with an existing matching tag. Existing releases/drafts are never overwritten. Actual cross-platform upgrade checks are required before a maintainer publishes a draft. See BUILD.md for dependency/tool updates and release recovery.
