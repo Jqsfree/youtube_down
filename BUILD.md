@@ -242,3 +242,11 @@ GUI 和 CLI 共用 CompletionPool 的提交、完成、取消和线程池关闭�
 总览写入失败会中止本批，保留媒体，关闭入队，向 Python 调用方抛原错误；GUI 接收失败汇总并停止后续文件组，不显示成功完成或 100%。并发记录失败不会重写为 UNKNOWN 下载失败。风控熔断会停止接收新任务，将已接收但未开始的任务记为跳过；取消等待队列不触发新下载，退避取消后不再重新获取信息。CLI Ctrl-C 返回 130。
 
 浏览器 Cookie 来源既限制初始 worker 数，也使用本批共享锁保护后来加入的浏览器任务；文件 Cookie 任务保留原并发配置。冻结归档检查包含 batch_runner 模块。tests/test_batch_runner.py 使用 FakeDownloader/事件同步验证以上行为，原 worker 和 CLI 回归继续保留。
+
+### 原生安装演练
+
+手动 build.yml 选择 `check_install=true` 可在两个 runner 上下载 v1.3.1 旧包，
+用当前真实产物执行 `scripts/check_install.py`：特殊路径替换、失败回滚后启动，
+Windows 另检验私有目录 ACL 与占用重试。tag 构建默认执行该检查。
+所有操作限于临时安装副本，不改本机已有安装。检查证明生成的安装脚本与真实
+安装包可配合工作，不替代发布后在线更新检查或真实站点下载验收。
