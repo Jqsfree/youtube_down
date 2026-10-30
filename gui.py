@@ -61,7 +61,7 @@ from downloader import (
     looks_like_playlist,
     proxy_reachable,
 )
-from logger_utils import AppLogger
+from logger_utils import AppLogger, redact
 from platforms.base import Platform
 from theme import (
     PRESETS,
@@ -107,9 +107,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self._downloader = YoutubeDownloader()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._log_path = Path.home() / "Downloads" / f"youtube_downloader_{ts}.log"
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_path = Path.home() / "Downloads" / "youtube_downloader.log"
         AppLogger.attach_file(self._log_path)
         self._worker: BatchDownloadWorker | None = None
         self._validate_cookie_worker: ValidateCookieWorker | None = None
@@ -176,7 +174,7 @@ class MainWindow(QMainWindow):
             f"{i.name}={i.version}" if i.version else i.name for i in env_items
         )
         print(f"[env] {versions}")
-        AppLogger.get_logger().info("应用启动")
+        AppLogger.start_session("GUI")
         for i in env_items:
             icon = "✗" if i.status == "error" else ("⚠" if i.status == "warning" else "✓")
             extra = f" {i.message}" if i.message else ""
@@ -315,7 +313,8 @@ class MainWindow(QMainWindow):
         page, layout = self._page(
             "平台 Cookie",
             "公开视频无需 Cookie；遇到登录、年龄或机器人验证时才会使用。"
-            "macOS 会尝试自动读取浏览器 Cookie；也可导入 Netscape 格式的 cookies.txt。"
+            "浏览器 Cookie 仅在点击重新读取后启用；也可导入 Netscape 格式的 cookies.txt。"
+            "Cookie 等同账号凭据，请勿分享。"
             "Windows 请手动导入 Cookie 文件。",
         )
         self._platform_buttons: dict[str, QPushButton] = {}
@@ -612,6 +611,8 @@ class MainWindow(QMainWindow):
         self._history_btn = QPushButton("历史")
         self._history_btn.setToolTip("查看当前输出目录的下载总览")
         self._open_dir_btn = QPushButton("打开目录")
+        self._open_log_dir_btn = QPushButton("打开日志目录")
+        self._open_log_dir_btn.clicked.connect(self._on_open_log_dir)
         self._log_toggle_btn = QPushButton("收起日志")
         action_row.addWidget(self._download_btn)
         action_row.addWidget(self._pause_btn)
@@ -619,6 +620,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self._history_btn)
         action_row.addWidget(self._open_dir_btn)
         action_row.addStretch(1)
+        action_row.addWidget(self._open_log_dir_btn)
         action_row.addWidget(self._log_toggle_btn)
         progress_layout.addLayout(action_row)
         layout.addWidget(progress_card)
@@ -1016,7 +1018,7 @@ class MainWindow(QMainWindow):
             return
         self._cookie_persisted = self._remember_cookie_checkbox.isChecked()
         self._refresh_cookie_ui()
-        self._log(f"已导入 Cookie ({self._selected_platform.label}): {filepath}")
+        self._log(f"已导入 Cookie ({self._selected_platform.label})")
         self._status_label.setText("Cookie 已加载，正在后台验证...")
         self._import_cookie_btn.setEnabled(False)
         self._clear_cookie_btn.setEnabled(False)
@@ -1758,7 +1760,20 @@ class MainWindow(QMainWindow):
     def _on_batch_all_finished(
         self, success: int, fail: int, skipped: int, overview_path: str
     ) -> None:
-        self._batch_progress_bar.setValue(100)
+        fatal_error = getattr(self._worker, "_fatal_error", "") if self._worker else ""
+        if fatal_error:
+            self._csv_queue.clear()
+            self._queue_results.clear()
+            self._csv_ids = []
+            self._csv_label.setText("")
+            for row in range(self._table.rowCount()):
+                status = self._table.item(row, 3)
+                if status is not None and status.text() in ("排队中", "等待中"):
+                    status.setText("未执行")
+            self._status_label.setText(fatal_error)
+            self._log(fatal_error)
+            self._set_downloading_ui(False)
+            return
         self._batch_errors.clear()
 
         if self._cancelled:
@@ -1770,6 +1785,7 @@ class MainWindow(QMainWindow):
             self._set_downloading_ui(False)
             return
 
+        self._batch_progress_bar.setValue(100)
         self._status_label.setText(f"批量完成：成功 {success}，失败 {fail}")
 
         if self._csv_queue:
@@ -1807,6 +1823,10 @@ class MainWindow(QMainWindow):
         self._csv_ids = []
         self._csv_label.setText("")
         self._set_downloading_ui(False)
+
+    def _on_open_log_dir(self) -> None:
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._log_path.parent))):
+            QMessageBox.warning(self, "无法打开", "日志目录暂时不可用。")
 
     def _on_open_dir(self) -> None:
         path = Path(self._output_input.text()).expanduser()
@@ -1943,12 +1963,11 @@ class MainWindow(QMainWindow):
     def _append_log_line(self, text: str) -> None:
         if not hasattr(self, "_log_view"):
             return
-        self._log_view.appendPlainText(text)
+        self._log_view.appendPlainText(redact(text))
         self._log_view.ensureCursorVisible()
 
     def _log(self, text: str) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        self._append_log_line(f"[{ts}] {text}")
+        AppLogger.get_logger().info("%s", text)
 
     # ------------------------------------------------------------------
     # Env wizard (kept from previous GUI)

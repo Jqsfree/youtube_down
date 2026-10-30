@@ -34,43 +34,10 @@ def test_detect_browser_macos_prefers_chrome_over_edge(tmp_path: Path, monkeypat
     assert YoutubeDownloader.detect_browser() == ("chrome", "Default")
 
 
-def test_try_autoload_browser_cookies_success(tmp_path: Path, monkeypatch) -> None:
-    dest = tmp_path / "auto.txt"
-    netscape = (
-        "# Netscape HTTP Cookie File\n"
-        ".youtube.com\tTRUE\t/\tFALSE\t0\tSID\txvalue\n"
-        ".youtube.com\tTRUE\t/\tFALSE\t0\tHSID\tyvalue\n"
-    )
-    monkeypatch.setattr("downloader._AUTO_BROWSER_COOKIE_FILE", dest)
-    monkeypatch.setattr(
-        "downloader.dump_browser_cookies",
-        lambda spec, path: path.write_text(netscape, encoding="utf-8") or path,
-    )
-    dl = YoutubeDownloader.__new__(YoutubeDownloader)
-    dl._cookiefile_path = None
-    dl._cookiefile_platform = None
-    dl._platform_cookiefiles = {}
-    dl._cookies_spec = "chrome:Default"
-    dl._browser_cookie_broken = False
-    dl._ydl_opt_overrides = {}
-
-    assert dl._try_autoload_browser_cookies() is True
-    assert dl._cookiefile_path == dest
-    assert dl._cookies_spec is None
-
-
-def test_try_autoload_browser_cookies_keeps_spec_on_failure(monkeypatch) -> None:
-    def boom(spec, path):
-        raise RuntimeError("locked")
-
-    monkeypatch.setattr("downloader.dump_browser_cookies", boom)
-    dl = YoutubeDownloader.__new__(YoutubeDownloader)
-    dl._cookiefile_path = None
-    dl._cookiefile_platform = None
-    dl._platform_cookiefiles = {}
-    dl._cookies_spec = "chrome:Default"
-    dl._browser_cookie_broken = False
-    dl._ydl_opt_overrides = {}
-
-    assert dl._try_autoload_browser_cookies() is False
+def test_explicit_redetect_does_not_export(monkeypatch):
+    monkeypatch.setattr(YoutubeDownloader, "detect_browser", staticmethod(lambda: ("chrome", "Default")))
+    monkeypatch.setattr("downloader.dump_browser_cookies", lambda *args: (_ for _ in ()).throw(AssertionError("unexpected export")))
+    dl = YoutubeDownloader(cookies_from_browser="")
+    assert dl.redetect_browser()
     assert dl._cookies_spec == "chrome:Default"
+    assert dl._cookiefile_path is None

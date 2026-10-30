@@ -192,3 +192,80 @@ def test_pick_next_clash_node_prefers_unused_residential() -> None:
     assert nxt == "hy2台湾01"
     nxt2 = pick_next_clash_node("hy2台湾01", candidates, {"hy2台湾01"})
     assert nxt2 == "hy2台湾02"
+
+
+def test_default_cli_does_not_export_browser_cookies(tmp_path, monkeypatch):
+    import download_cli
+    args = download_cli.parse_args(["dQw4w9WgXcQ", "-o", str(tmp_path)])
+    monkeypatch.setattr(download_cli, "dump_browser_cookies", lambda *a: (_ for _ in ()).throw(AssertionError("unexpected export")))
+    assert args.cookies_from_browser == ""
+    assert download_cli._resolve_cookiefile(args, tmp_path) is None
+
+
+def test_browser_refresh_keeps_old_snapshot_for_inflight_jobs(tmp_path, monkeypatch):
+    import argparse
+    import download_cli
+    args = argparse.Namespace(cookies=None, cookies_from_browser="chrome", _cookie_temp_dir=tmp_path)
+    monkeypatch.setattr(download_cli, "dump_browser_cookies", lambda browser, path: path.write_text("cookie snapshot"))
+    first = download_cli._resolve_cookiefile(args, tmp_path)
+    second = download_cli._resolve_cookiefile(args, tmp_path, force_refresh=True)
+    assert first != second
+    assert first.read_text() == "cookie snapshot"
+    assert second.read_text() == "cookie snapshot"
+
+
+def test_cli_cookie_session_cleans_up_on_exception(tmp_path, monkeypatch):
+    import download_cli
+    import pytest
+    seen = []
+    def fail(args):
+        seen.append(args._cookie_temp_dir)
+        (args._cookie_temp_dir / "cookies.txt").write_text("fake cookie")
+        raise RuntimeError("cancelled")
+    monkeypatch.setattr(download_cli, "_run", fail)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        download_cli.main(["dQw4w9WgXcQ", "-o", str(tmp_path)])
+    assert not seen[0].exists()
+
+
+def test_no_cookie_failed_rotation_still_backs_off_and_stops(tmp_path, monkeypatch):
+    import download_cli
+    args = download_cli.parse_args(["unused", "-o", str(tmp_path), "--workers", "1"])
+    args.proxy_check_url = ""
+    monkeypatch.setattr(download_cli, "parse_args", lambda argv: args)
+    jobs = [download_cli.Job(f"https://example.com/{n}.mp4", "paste", n, tmp_path)
+            for n in range(download_cli.BOT_STREAK_LIMIT + 2)]
+    monkeypatch.setattr(download_cli, "_iter_sources", lambda *a: (jobs, []))
+    monkeypatch.setattr(download_cli, "collect_completed_files", lambda *a, **k: {})
+    monkeypatch.setattr(download_cli.ClashClient, "rotate", lambda *a: None)
+    backoffs = []
+    class Pacer:
+        def __init__(self, *args): pass
+        def on_bot_or_rate_limit(self): backoffs.append(True)
+        def wait(self): pass
+    monkeypatch.setattr(download_cli, "AdaptivePacer", Pacer)
+    downloads = []
+    def fail(*args, **kwargs):
+        downloads.append(args[0])
+        return {"status": "failed", "error_category": "BOT_VERIFICATION", "error_message": "not a bot"}
+    monkeypatch.setattr(download_cli, "_download_one", fail)
+    assert download_cli.main([]) == 1
+    assert len(downloads) == download_cli.BOT_STREAK_LIMIT
+    assert len(backoffs) == download_cli.BOT_STREAK_LIMIT
+
+
+def test_keyboard_interrupt_returns_cancel_status_not_success(tmp_path, monkeypatch, capsys):
+    import download_cli
+    args=download_cli.parse_args(['unused','-o',str(tmp_path),'--workers','1'])
+    args.proxy_check_url=''
+    monkeypatch.setattr(download_cli,'parse_args',lambda argv:args)
+    job=download_cli.Job('https://example.com/a.mp4','paste',1,tmp_path)
+    monkeypatch.setattr(download_cli,'_iter_sources',lambda *a:([job],[]))
+    monkeypatch.setattr(download_cli,'collect_completed_files',lambda *a,**k:{})
+    class InterruptedPool:
+        def __init__(self,*a,**k):pass
+        def __enter__(self):raise KeyboardInterrupt
+        def __exit__(self,*a):pass
+    monkeypatch.setattr(download_cli,'CompletionPool',InterruptedPool)
+    assert download_cli.main([])==130
+    assert '完成 success=' not in capsys.readouterr().out

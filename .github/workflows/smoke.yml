@@ -1,0 +1,31 @@
+name: Network smoke (independent)
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+          - os: macos-latest
+            platform: macOS
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.12.8'
+      - run: uv sync --locked
+      - run: uv run --no-sync python scripts/build_tools.py install --platform ${{ matrix.platform }}
+      - run: uv run --no-sync python smoke_test.py
+        env:
+          QT_QPA_PLATFORM: offscreen

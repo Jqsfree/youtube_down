@@ -2,97 +2,115 @@ name: Build Multi-Platform
 
 on:
   push:
-    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing vX.Y.Z tag (empty means build current ref only)'
+        type: string
+        default: ''
+      check_install:
+        description: 'Exercise native installer using v1.3.1 and the new real artifact'
+        type: boolean
+        default: false
+      create_draft:
+        description: 'Create a draft release for the supplied existing tag'
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate release version and tag
+        id: version
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          CREATE_DRAFT: ${{ inputs.create_draft }}
+        run: |
+          RELEASE_TAG="$INPUT_TAG"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then RELEASE_TAG="$GITHUB_REF_NAME"; fi
+          if [ "$CREATE_DRAFT" = true ] && [ -z "$RELEASE_TAG" ]; then
+            echo 'Draft creation requires an existing version tag' >&2
+            exit 1
+          fi
+          VERSION=$(python scripts/release_checks.py version --tag "$RELEASE_TAG")
+          if [ -n "$RELEASE_TAG" ]; then
+            test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             platform: windows
+            tools_platform: Windows
             artifact_name: YouTubeDownloader-Windows.exe
             pyinstaller_name: YouTubeDownloader-Windows
           - os: macos-latest
             platform: macos
+            tools_platform: macOS
             artifact_name: YouTubeDownloader-macOS.zip
             pyinstaller_name: YouTubeDownloader-macOS
-
     runs-on: ${{ matrix.os }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Read version
-        id: version
-        shell: bash
-        run: echo "version=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest pyinstaller
-          pip install -U yt-dlp yt-dlp-ejs
-
-      - name: Run unit tests
-        shell: bash
-        run: python -m pytest tests/ -q
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.12.8'
+      - name: Install locked dependencies
+        run: uv sync --locked --group build
+      - name: Run offline tests
+        run: uv run --no-sync python -m pytest tests/ -q
         env:
           QT_QPA_PLATFORM: offscreen
-
-      # After tests: local ffmpeg would otherwise shadow PATH in tool-resolution tests.
-      - name: Install deno + ffmpeg (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
-          Expand-Archive deno.zip -DestinationPath .
-          if (-not (Test-Path deno.exe)) {
-            Get-ChildItem -Recurse -Filter deno.exe | Select-Object -First 1 | Move-Item -Destination deno.exe
-          }
-          # BtbN builds are more reliable than gyan.dev on CI
-          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip -DestinationPath .
-          $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
-          Copy-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" ffmpeg.exe
-          Copy-Item "$($ffmpegDir.Name)\bin\ffprobe.exe" ffprobe.exe
-          if (-not (Test-Path ffmpeg.exe)) { throw "ffmpeg.exe missing after extract" }
-
-      - name: Install deno + ffmpeg (macOS)
-        if: matrix.platform == 'macos'
+      - name: Verify native private directory permissions
+        if: inputs.check_install || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
-          brew install ffmpeg deno
-          cp "$(brew --prefix)/bin/ffmpeg" ./ffmpeg
-          cp "$(brew --prefix)/bin/ffprobe" ./ffprobe
-          cp "$(brew --prefix)/bin/deno" ./deno
-          chmod +x ffmpeg ffprobe deno
-          ./ffmpeg -version | head -1
-          ./deno --version | head -1
-
-      - name: Smoke test
-        shell: bash
-        run: python smoke_test.py
-        env:
-          QT_QPA_PLATFORM: offscreen
+          uv run --no-sync python - <<'PYCODE'
+          from scripts.check_install import check_acl
+          from private_files import private_directory
+          with private_directory("ytdown-native-acl-") as directory:
+              check_acl(directory)
+          PYCODE
+      # Tools must be installed after resolution tests so local binaries cannot shadow fixtures.
+      - name: Install pinned external tools
+        run: uv run --no-sync python scripts/build_tools.py install --platform ${{ matrix.tools_platform }}
 
       - name: Build EXE (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          pyinstaller --onefile --windowed `
+          uv run --no-sync pyinstaller --onefile --windowed `
             --name "${{ matrix.pyinstaller_name }}" `
             --icon "assets\icon.ico" `
             --add-data "VERSION;." `
@@ -123,7 +141,7 @@ jobs:
         run: |
           # macOS 用 onedir：onefile + .app 已被 PyInstaller 标记弃用（v7 报错），
           # 且每次启动都要解包上百 MB。打出来的 zip 体积基本一致。
-          pyinstaller --onedir --windowed \
+          uv run --no-sync pyinstaller --onedir --windowed \
             --name "${{ matrix.pyinstaller_name }}" \
             --osx-bundle-identifier "com.jqsfree.youtubedownloader" \
             --icon "assets/icon.icns" \
@@ -164,6 +182,26 @@ jobs:
           fi
           ls -la "dist/${{ matrix.artifact_name }}"
 
+      - name: Verify embedded tools and record build sources
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            uv run --no-sync python scripts/build_tools.py verify --platform Windows --bundle "dist/${{ matrix.artifact_name }}" --asset "dist/${{ matrix.artifact_name }}"
+          else
+            uv run --no-sync python scripts/build_tools.py verify --platform macOS --bundle "dist/${{ matrix.pyinstaller_name }}.app" --asset "dist/${{ matrix.artifact_name }}"
+          fi
+
+      - name: Exercise native upgrade and rollback
+        if: inputs.check_install || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          mkdir -p upgrade-old
+          gh release download v1.3.1 --pattern "${{ matrix.artifact_name }}" --dir upgrade-old
+          uv run --no-sync python scripts/check_install.py --old "upgrade-old/${{ matrix.artifact_name }}" --new "dist/${{ matrix.artifact_name }}"
+
       - name: Write checksums (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -183,90 +221,44 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.pyinstaller_name }}-v${{ steps.version.outputs.version }}
+          name: ${{ matrix.pyinstaller_name }}-v${{ needs.validate.outputs.version }}
           path: |
             dist/${{ matrix.artifact_name }}
             dist/SHA256SUMS.txt
+            dist/build-info-*.json
           if-no-files-found: error
           retention-days: 30
 
   release:
-    needs: build
+    needs: [validate, build]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_draft)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Read version
-        id: version
-        run: echo "version=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: false
-
-      - name: Stage release files
-        id: stage
+      - name: Validate and stage release assets
         run: |
-          mkdir -p staged
-          find release-assets -type f \( -name 'YouTubeDownloader-*' -o -name '*.exe' -o -name '*.zip' \) -print
-          while IFS= read -r -d '' f; do
-            base="$(basename "$f")"
-            cp "$f" "staged/$base"
-          done < <(find release-assets -type f \( \
-            -name 'YouTubeDownloader-Windows.exe' -o \
-            -name 'YouTubeDownloader-macOS.zip' \
-          \) -print0)
-          ls -la staged
-          test -f staged/YouTubeDownloader-Windows.exe
-          test -f staged/YouTubeDownloader-macOS.zip
-          # 每个平台各上传一份 SHA256SUMS.txt，合并成一份清单
-          find release-assets -name 'SHA256SUMS.txt' -exec cat {} + > staged/SHA256SUMS.txt
-          echo "--- SHA256SUMS.txt ---"
-          cat staged/SHA256SUMS.txt
-          grep -q 'YouTubeDownloader-Windows.exe' staged/SHA256SUMS.txt
-          grep -q 'YouTubeDownloader-macOS.zip' staged/SHA256SUMS.txt
-          echo "files=$(find staged -type f | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Multi-Platform Downloader v${{ steps.version.outputs.version }}
-          body: |
-            Windows / macOS 下载器 v${{ steps.version.outputs.version }}（YouTube / Bilibili / TikTok）
-
-            ## 下载
-            | 平台 | 文件 |
-            |------|------|
-            | Windows (x64) | `YouTubeDownloader-Windows.exe`（内嵌 ffmpeg / ffprobe / deno） |
-            | macOS (Apple Silicon) | `YouTubeDownloader-macOS.zip`（解压后打开 `.app`；内嵌 ffmpeg / ffprobe / deno） |
-            | 校验 | `SHA256SUMS.txt`（应用内更新会自动校验） |
-
-            ## 本版亮点
-            - **应用内更新**：设置页「检查更新」一键下载、替换、重启（附 sha256 校验、失败回滚）
-            - **活动下载队列**：下载中可继续「加入队列」/粘贴新 ID，任务立刻接着跑
-            - **应用图标**：Windows `.ico`、macOS `.icns`、窗口图标统一
-            - 修复进度条因续传跳过而到不了 100%、安装更新时后台线程未停等问题
-
-            完整变更见 [`CHANGELOG.md`](https://github.com/Jqsfree/youtube_down/blob/main/CHANGELOG.md)。
-
-            > 从 v1.2.0 及更早版本升级需手动下载本版一次，之后即可在软件内更新。
-
-            ## 使用
-            ### Windows
-            1. 下载 `YouTubeDownloader-Windows.exe`
-            2. 双击运行
-
-            ### macOS
-            1. 下载并解压 `YouTubeDownloader-macOS.zip`
-            2. 首次打开若提示未验证：右键 → 打开，或在「系统设置 → 隐私与安全性」允许
-            3. 会员/风控视频请按平台导入 Cookie
-          files: staged/*
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          make_latest: true
-          overwrite_files: true
+          python scripts/release_checks.py stage
+          python scripts/release_checks.py notes
+      - name: Create new draft only
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          python scripts/release_checks.py ensure-absent --tag "$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" --verify-tag --draft --latest=false \
+            --title "Multi-Platform Downloader $RELEASE_TAG" \
+            --notes-file staged/RELEASE_NOTES.md \
+            staged/YouTubeDownloader-Windows.exe staged/YouTubeDownloader-macOS.zip \
+            staged/SHA256SUMS.txt staged/build-info-Windows.json staged/build-info-macOS.json

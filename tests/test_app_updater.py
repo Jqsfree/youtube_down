@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import urllib.error
+import os
 from pathlib import Path
 
 import pytest
@@ -183,43 +184,21 @@ def test_install_and_restart_without_payload(tmp_path: Path, monkeypatch: pytest
     assert "安装包缺失" in app_updater.install_and_restart(None)
 
 
-def test_windows_script_contains_move_and_restart(tmp_path: Path) -> None:
-    script = app_updater._write_windows_script(  # noqa: SLF001
-        tmp_path / "new.exe", tmp_path / "app.exe",
-    )
-    text = script.read_text(encoding="utf-8")
-    assert 'move /y "%TARGET%" "%OLD%"' in text
-    assert 'start "" "%TARGET%"' in text
-    assert "del /f /q \"%~f0\"" in text
-    script.unlink()
-
-
-def test_windows_script_rolls_back_on_failed_copy(tmp_path: Path) -> None:
-    """copy 失败时 TARGET 已被 move 走，必须搬回来再启动，否则用户没有可用 exe。"""
-    script = app_updater._write_windows_script(  # noqa: SLF001
-        tmp_path / "new.exe", tmp_path / "app.exe",
-    )
-    text = script.read_text(encoding="utf-8")
-    assert "goto rollback" in text
-    assert ":rollback" in text
-    assert 'if not exist "%TARGET%" move /y "%OLD%" "%TARGET%"' in text
-    # 失败路径不能再直接 start（那时 TARGET 不存在）
-    assert "goto giveup" not in text
-    script.unlink()
-
-
-def test_windows_script_rolls_back_on_failed_copy(tmp_path: Path) -> None:
-    """copy 失败时 TARGET 已被 move 走，必须搬回来再启动，否则用户没有可用 exe。"""
-    script = app_updater._write_windows_script(  # noqa: SLF001
-        tmp_path / "new.exe", tmp_path / "app.exe",
-    )
-    text = script.read_text(encoding="utf-8")
-    assert "goto rollback" in text
-    assert ":rollback" in text
-    assert 'if not exist "%TARGET%" move /y "%OLD%" "%TARGET%"' in text
-    # 失败路径不能再直接 start（那时 TARGET 不存在）
-    assert "goto giveup" not in text
-    script.unlink()
+def test_windows_script_paths_are_data(tmp_path):
+    import json
+    payload = tmp_path / "new %PATH% ! & ' 中.exe"
+    target = tmp_path / "app %PATH% ! & ' 中.exe"
+    script = app_updater._write_windows_script(payload, target)
+    text = script.read_text(encoding="utf-8-sig")
+    assert script.suffix == ".ps1"
+    assert str(payload) not in text
+    assert str(target) not in text
+    data = json.loads(script.with_suffix(".json").read_text(encoding="utf-8"))
+    assert data["payload"] == str(payload)
+    assert data["target"] == str(target)
+    assert "-LiteralPath" in text
+    assert "if ($moved)" in text
+    assert "Move-Item -LiteralPath $old -Destination $target" in text
 
 
 def test_macos_script_rolls_back_on_failed_copy(tmp_path: Path) -> None:
@@ -408,10 +387,10 @@ def test_download_update_rejects_bad_hash(tmp_path: Path, monkeypatch: pytest.Mo
     assert not (tmp_path / app_updater.ASSET_WINDOWS).exists(), "坏包必须删除"
 
 
-def test_download_update_tolerates_missing_checksums(
+def test_download_update_rejects_missing_checksums(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """老 release 没有清单时仍可更新，只是不校验。"""
+    """没有清单时不得下载未经校验的安装包。"""
     def fake_download(asset, dest_dir, progress=None, chunk_size=1 << 20):
         path = Path(dest_dir) / asset.name
         path.write_bytes(b"data")
@@ -423,7 +402,9 @@ def test_download_update_tolerates_missing_checksums(
         version="1.0.0", tag="v1.0.0", page_url="x",
         assets=[app_updater.Asset(app_updater.ASSET_WINDOWS, "https://github.com/a")],
     )
-    assert app_updater.download_update(release, tmp_path).read_bytes() == b"data"
+    with pytest.raises(ValueError, match="校验"):
+        app_updater.download_update(release, tmp_path)
+    assert not (tmp_path / app_updater.ASSET_WINDOWS).exists()
 
 
 def test_download_update_without_platform_asset_raises(
@@ -432,3 +413,75 @@ def test_download_update_without_platform_asset_raises(
     monkeypatch.setattr(app_updater, "asset_name_for", lambda p=None: "Other.exe")
     with pytest.raises(ValueError, match="没有当前平台的安装包"):
         app_updater.download_update(_release_with_checksums(), tmp_path)
+
+
+@pytest.mark.parametrize("text", ["", "invalid  app.exe", "0" * 64 + "  other.exe"])
+def test_missing_checksum_entry_prevents_payload_download(tmp_path, monkeypatch, text):
+    calls = []
+    def download(asset, dest_dir, *args):
+        calls.append(asset.name)
+        path = dest_dir / asset.name
+        path.write_text(text)
+        return path
+    monkeypatch.setattr(app_updater, "asset_name_for", lambda p=None: app_updater.ASSET_WINDOWS)
+    monkeypatch.setattr(app_updater, "download_release_asset", download)
+    with pytest.raises(ValueError, match="校验"):
+        app_updater.download_update(_release_with_checksums(), tmp_path)
+    assert calls == [app_updater.ASSET_CHECKSUMS]
+
+
+def test_conflicting_checksums_rejected():
+    with pytest.raises(ValueError, match="冲突"):
+        app_updater.parse_checksums("0" * 64 + "  a.exe\n" + "1" * 64 + "  a.exe\n")
+
+
+def test_macos_script_quotes_paths(tmp_path):
+    import shlex
+    payload = tmp_path / "new ' $(touch INJECTED).zip"
+    target = tmp_path / 'app `touch INJECTED` 中.app'
+    script = app_updater._write_macos_script(payload, target)
+    text = script.read_text(encoding="utf-8")
+    assert "NEW=" + shlex.quote(str(payload)) in text
+    assert "TARGET=" + shlex.quote(str(target)) in text
+    if os.name != "nt":
+        assert script.parent.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("copy_fails", [False, True])
+def test_macos_installer_executes_special_paths_safely(tmp_path, copy_fails):
+    import os
+    import subprocess
+    import sys
+    if sys.platform != "darwin":
+        pytest.skip("macOS shell installation simulation")
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    for name, body in {
+        "sleep": "exit 0",
+        "xattr": "exit 0",
+        "open": "exit 0",
+        "ditto": 'mkdir -p "$4/New.app"; printf new > "$4/New.app/marker"',
+        **({"cp": "exit 1"} if copy_fails else {}),
+    }.items():
+        command = commands / name
+        command.write_text("#!/bin/sh\n" + body + "\n")
+        command.chmod(0o700)
+    target = tmp_path / "应用 ' $(touch INJECTED) `touch INJECTED`.app"
+    target.mkdir()
+    (target / "marker").write_text("old")
+    payload = tmp_path / "新包 ' $(touch INJECTED).zip"
+    payload.write_text("fake zip")
+    script = app_updater._write_macos_script(payload, target)
+    result = subprocess.run(["/bin/sh", str(script)], cwd=tmp_path,
+                            env={**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"]},
+                            capture_output=True)
+    assert result.returncode == (1 if copy_fails else 0), result.stderr
+    assert (target / "marker").read_text(encoding="utf-8") == ("old" if copy_fails else "new")
+    assert not (tmp_path / "INJECTED").exists()
+
+
+@pytest.mark.parametrize("system,cpu", [("darwin", "x86_64"), ("win32", "ARM64")])
+def test_unsupported_runtime_architecture_has_no_asset(monkeypatch, system, cpu):
+    monkeypatch.setattr(app_updater.sys, "platform", system)
+    monkeypatch.setattr(app_updater.host_platform, "machine", lambda: cpu)
+    assert app_updater.asset_name_for() == ""

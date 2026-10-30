@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""独立批量下载：默认带 Cookie、自适应节流、跳过已完成文件。
+"""独立批量下载：Cookie 显式授权、自适应节流、跳过已完成文件。
 
 不依赖 GUI。输入可为表格文件、文件夹（递归）或直接的链接/ID；
 输出目录镜像输入层级，文件名为 ``<原表行号>_<媒体ID>``，结果写入输出根的 ``下载总览.csv``。
-Cookie 由 ``--cookies`` 或浏览器导出准备，下载时始终启用。
+Cookie 仅由 ``--cookies`` 或显式 ``--cookies-from-browser`` 启用。
 
 示例::
 
@@ -20,6 +20,7 @@ import json
 import socket
 import sys
 import threading
+import uuid
 import time
 import urllib.parse
 import urllib.request
@@ -43,6 +44,7 @@ from downloader import (
     AUDIO_EXTS,
     BOT_STREAK_LIMIT,
     BRUTAL_YDL_OPTS,
+    BRUTAL_MAX_WORKERS,
     NORMAL_YDL_OPTS,
     VIDEO_EXTS,
     YoutubeDownloader,
@@ -54,7 +56,17 @@ from downloader import (
     looks_like_playlist,
     proxy_reachable,
 )
+from private_files import private_directory
+from logger_utils import AppLogger, redact
+import batch_runner as batch_ops
+from batch_runner import CompletionPool, parallel_workers
 from pacing import AdaptivePacer
+
+def _print(*args, **kwargs) -> None:
+    """Keep CLI output formatting while applying the shared credential policy."""
+    separator = kwargs.pop("sep", " ")
+    print(redact(separator.join(str(value) for value in args)), **kwargs)
+
 
 # 兼容旧测试名：正常模式与 NORMAL_YDL_OPTS 对齐（视频间间隔交给 AdaptivePacer）
 CLI_YDL_OPTS: dict[str, Any] = dict(NORMAL_YDL_OPTS)
@@ -111,22 +123,7 @@ _SKIP_NODE_CONTAINS = (
 
 
 def _probe_short_side(path: Path) -> int | None:
-    """ffprobe 视频短边；无法解析视频轨时返回 None。"""
-    ok, out = _run_probe(
-        ["-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
-        timeout=10,
-    )
-    if not ok:
-        return None
-    try:
-        parts = [p.strip() for p in out.strip().split(",") if p.strip()]
-        dims = [int(p) for p in parts[:2]]
-        if len(dims) >= 2:
-            return min(dims)
-        return dims[0] if dims else None
-    except ValueError:
-        return None
+    return batch_ops._probe_short_side(path, probe=_run_probe)
 
 
 def collect_completed_ids(*dirs: Path, min_height: int = 0) -> set[str]:
@@ -185,7 +182,7 @@ def check_exit_ip(proxy: str = "http://127.0.0.1:7897") -> tuple[str, str]:
 def warn_datacenter_ip(org: str) -> None:
     lower = org.lower()
     if any(kw in lower for kw in _DATACENTER_ORG_KEYWORDS):
-        print(
+        _print(
             f"警告: 当前代理出口疑似机房 IP ({org})。"
             "YouTube 批量下载建议切换 Clash 到住宅/家庭宽带节点后再跑。",
             file=sys.stderr,
@@ -301,7 +298,7 @@ def _pot_extractor_args(enabled: bool) -> dict[str, Any]:
 
 
 def _make_downloader(
-    cookiefile: Path,
+    cookiefile: Path | None,
     *,
     use_pot: bool = False,
     fragment_workers: int = 8,
@@ -332,17 +329,13 @@ def _ui_overrides(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _is_generic_source(source: str) -> bool:
-    """直链没有分辨率元数据，不能按清晰度档位筛选或校验。"""
-    try:
-        return YoutubeDownloader.parse_input(source).platform == "generic"
-    except Exception:
-        return False
+    return batch_ops.is_generic_source(source)
 
 
 def _download_one(
     video_id: str,
     output_dir: Path,
-    cookiefile: Path,
+    cookiefile: Path | None,
     min_height: int,
     *,
     use_pot: bool = False,
@@ -357,53 +350,10 @@ def _download_one(
         cookiefile, use_pot=use_pot, fragment_workers=fragment_workers, brutal=brutal,
         extra_overrides=extra_overrides,
     )
-    effective_min = 0 if _is_generic_source(video_id) else min_height
-    last_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            path = dl.download(
-                video_id=video_id,
-                format_id="best",
-                output_dir=output_dir,
-                filename_stem=stem,
-                use_cookies=True,
-                needs_audio_merge=True,
-                min_height=effective_min,
-                expected_height=effective_min if effective_min > 0 else None,
-                strict_quality=True,
-                brutal=brutal,
-                audio_only=audio_only,
-                audio_format=audio_format,
-            )
-            return {
-                "video_id": video_id,
-                "status": "success",
-                "error_category": "SUCCESS",
-                "error_message": "",
-                "cookie_used": "true",
-                "output_dir": str(output_dir),
-                "title": "",
-                "path": str(path),
-            }
-        except Exception as exc:
-            last_exc = exc
-            cat = classify_error(exc)
-            msg = clean_error(exc)
-            if "低于最低要求" in msg or ("低于" in msg and str(effective_min) in msg):
-                return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
-            if "requested format is not available" in msg.lower():
-                return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
-            if cat.code == "RATE_LIMIT" and attempt == 0:
-                time.sleep(10)
-                continue
-            return _result(
-                video_id, output_dir,
-                "failed" if cat.code != "SKIPPED" else "skipped",
-                cat.code, msg,
-            )
-    assert last_exc is not None
-    cat = classify_error(last_exc)
-    return _result(video_id, output_dir, "failed", cat.code, clean_error(last_exc))
+    return batch_ops.download_direct_item(
+        dl, video_id, output_dir, min_height, brutal=brutal, stem=stem,
+        audio_only=audio_only, audio_format=audio_format,
+    )
 
 
 def _result(
@@ -413,16 +363,7 @@ def _result(
     category: str,
     msg: str,
 ) -> dict[str, str]:
-    return {
-        "video_id": video_id,
-        "status": status,
-        "error_category": category,
-        "error_message": msg,
-        "cookie_used": "true",
-        "output_dir": str(output_dir),
-        "title": "",
-        "path": "",
-    }
+    return batch_ops.direct_result(video_id, output_dir, status, category, msg)
 
 
 @dataclass
@@ -468,7 +409,7 @@ def _iter_sources(
             continue
         inputs, errors = discover_inputs(path)
         for err in errors:
-            print(f"跳过输入: {err}", file=sys.stderr, flush=True)
+            _print(f"跳过输入: {err}", file=sys.stderr, flush=True)
         for inp in inputs:
             rel = _rel_for(inp, input_root)
             out_dir = output_dir_for(output_dir, rel)
@@ -478,7 +419,7 @@ def _iter_sources(
 
     valid, invalid = parse_pasted_text("\n".join(pasted))
     for token in invalid:
-        print(f"跳过无效来源: {token}", file=sys.stderr, flush=True)
+        _print(f"跳过无效来源: {token}", file=sys.stderr, flush=True)
     if valid:
         expander = YoutubeDownloader(cookies_from_browser="")
         limit = getattr(args, "playlist_limit", 0) or None
@@ -486,7 +427,7 @@ def _iter_sources(
         for token in valid:
             if looks_like_playlist(token):
                 urls = expander.expand_playlist(token, limit=limit)
-                print(f"展开播放列表 {token}: {len(urls)} 条", flush=True)
+                _print(f"展开播放列表 {token}: {len(urls)} 条", flush=True)
                 expanded.extend(urls)
             else:
                 expanded.append(token)
@@ -511,7 +452,7 @@ def _iter_sources(
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="批量下载（默认 Cookie、自适应节流、可续传）")
+    parser = argparse.ArgumentParser(description="批量下载（Cookie 按需授权、自适应节流、可续传）")
     parser.add_argument("sources", nargs="+", help="CSV/TSV/TXT、包含它们的文件夹，或视频 URL/ID")
     parser.add_argument(
         "-o", "--output-dir", type=Path, required=True,
@@ -584,8 +525,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--cookies-from-browser",
-        default="chrome",
-        help="从浏览器导出 Cookie（workers=1 且未指定 --cookies 时）",
+        default="",
+        help="显式授权从指定浏览器读取 Cookie，仅临时保存目标平台域名",
     )
     parser.add_argument(
         "--cookies", type=Path, default=None,
@@ -651,11 +592,13 @@ def _resolve_cookiefile(
     results_dir: Path,
     *,
     force_refresh: bool = False,
-) -> Path:
+) -> Path | None:
+    if not args.cookies and not args.cookies_from_browser:
+        return None
     dest = (
         args.cookies.expanduser().resolve()
         if args.cookies
-        else (results_dir / ".yt_cookies.txt")
+        else (args._cookie_temp_dir / f"cookies-{uuid.uuid4().hex}.txt")
     )
     if args.cookies and not force_refresh:
         if not dest.is_file():
@@ -667,22 +610,31 @@ def _resolve_cookiefile(
         if not dest.is_file():
             raise FileNotFoundError(f"Cookie 文件不存在: {dest}")
         return dest
-    print(f"从浏览器导出 Cookie: {args.cookies_from_browser}", flush=True)
+    _print(f"从浏览器导出 Cookie: {args.cookies_from_browser}", flush=True)
     dump_browser_cookies(args.cookies_from_browser, dest)
-    print(f"Cookie 已写入 {dest} ({dest.stat().st_size} bytes)", flush=True)
+    _print(f"Cookie 已写入 {dest} ({dest.stat().st_size} bytes)", flush=True)
     return dest
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    log_root = (args.results_dir or args.output_dir).expanduser().resolve()
+    AppLogger.attach_file(log_root / "youtube_downloader.log")
+    AppLogger.start_session("CLI")
+    with private_directory("ytdown-cookie-cli-") as directory:
+        args._cookie_temp_dir = Path(directory)
+        return _run(args)
+
+
+def _run(args: argparse.Namespace) -> int:
     if not proxy_reachable(args.proxy):
-        print(f"代理不可用: {args.proxy}（请检查端口，或去掉 --proxy 直连）", file=sys.stderr)
+        _print(f"代理不可用: {args.proxy}（请检查端口，或去掉 --proxy 直连）", file=sys.stderr)
         return 2
     if args.workers is None:
-        args.workers = 8 if args.brutal else 1
+        args.workers = BRUTAL_MAX_WORKERS if args.brutal else 1
     ui_overrides = _ui_overrides(args)
     if args.fragment_workers is None:
-        args.fragment_workers = 8 if args.brutal else int(
+        args.fragment_workers = int(BRUTAL_YDL_OPTS["concurrent_fragment_downloads"]) if args.brutal else int(
             NORMAL_YDL_OPTS["concurrent_fragment_downloads"]
         )
     output_dir = args.output_dir.expanduser().resolve()
@@ -691,17 +643,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         results_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        print(f"目录不可用: {exc}", file=sys.stderr)
+        _print(f"目录不可用: {exc}", file=sys.stderr)
         return 2
 
     if args.proxy_check_url:
         ip, org = check_exit_ip(args.proxy_check_url)
         if ip:
-            print(f"代理出口: {ip} ({org})", flush=True)
+            _print(f"代理出口: {ip} ({org})", flush=True)
             warn_datacenter_ip(org)
 
     if args.pot:
-        print(
+        _print(
             "已强制 player_client=mweb（若需 PO Token 请另装 bgutil-ytdlp-pot-provider；"
             "注意 mweb 可能减少可用清晰度）",
             flush=True,
@@ -709,21 +661,21 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     sources, duplicates = _iter_sources(args, output_dir)
     if not sources and not duplicates:
-        print("没有可下载的视频", file=sys.stderr)
+        _print("没有可下载的视频", file=sys.stderr)
         return 2
 
     overview = OverviewStore(output_dir)
     skip_n = 0
     for dup in duplicates:
         # 总览键为 (来源, video_id)，重复行无法单独成行；只计数并提示
-        print(
+        _print(
             f"跳过重复行: {dup.source}#{dup.row_no} {dup.media_id}",
             file=sys.stderr,
             flush=True,
         )
         skip_n += 1
     if not sources:
-        print(f"没有可下载的视频（重复跳过 {skip_n}）", file=sys.stderr)
+        _print(f"没有可下载的视频（重复跳过 {skip_n}）", file=sys.stderr)
         return 0 if skip_n else 2
 
     def _record(job: Job, result: dict[str, str]) -> None:
@@ -769,7 +721,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 continue
         pending.append(job)
 
-    print(
+    _print(
         f"总计 {len(sources)}，已完成/跳过 {len(sources) - len(pending)}，"
         f"待下载 {len(pending)}，workers={args.workers}，"
         f"sleep={args.sleep_min}-{args.sleep_max}s，"
@@ -777,27 +729,27 @@ def main(argv: Iterable[str] | None = None) -> int:
         flush=True,
     )
     if not pending:
-        print("没有剩余视频")
+        _print("没有剩余视频")
         return 0
 
     try:
         cookiefile = _resolve_cookiefile(args, results_dir)
         if args.cookies:
-            print(f"使用 Cookie 文件: {cookiefile}", flush=True)
-            print(
+            _print(f"使用 Cookie 文件: {cookiefile}", flush=True)
+            _print(
                 "提示: 稳定 Cookie 请用无痕窗口登录 YouTube 后导出 cookies.txt，"
                 "详见 yt-dlp Wiki Extractors#exporting-youtube-cookies",
                 flush=True,
             )
     except Exception as exc:
-        print(f"Cookie 准备失败: {exc}", file=sys.stderr)
+        _print(f"Cookie 准备失败: {exc}", file=sys.stderr)
         return 4
 
-    print(f"下载总览: {overview.path}", flush=True)
+    _print(f"下载总览: {overview.path}", flush=True)
 
     pacer = AdaptivePacer(args.sleep_min, args.sleep_max)
     ok = fail = 0
-    workers = max(1, args.workers)
+    workers = parallel_workers(args.workers)
     pending_iter = iter(pending)
     total = len(pending)
     done_n = 0
@@ -805,7 +757,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     stop_bot = False
     downloads_since_cookie_refresh = 0
     cookie_lock = threading.Lock()
-    use_browser_cookies = args.cookies is None
+    use_browser_cookies = args.cookies is None and bool(args.cookies_from_browser)
     clash = ClashClient(
         unix_socket=args.clash_socket,
         secret=args.clash_secret,
@@ -817,7 +769,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     def _maybe_refresh_cookies() -> None:
         nonlocal cookiefile, downloads_since_cookie_refresh
-        if args.cookies:
+        if args.cookies or not args.cookies_from_browser:
             return
         if args.refresh_cookies_every <= 0:
             return
@@ -826,12 +778,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         with cookie_lock:
             if downloads_since_cookie_refresh < args.refresh_cookies_every:
                 return
-            print(f"已处理 {downloads_since_cookie_refresh} 条，刷新浏览器 Cookie…", flush=True)
+            _print(f"已处理 {downloads_since_cookie_refresh} 条，刷新浏览器 Cookie…", flush=True)
             try:
                 cookiefile = _resolve_cookiefile(args, results_dir, force_refresh=True)
                 downloads_since_cookie_refresh = 0
             except Exception as exc:
-                print(f"Cookie 刷新失败: {exc}", flush=True)
+                _print(f"Cookie 刷新失败: {exc}", flush=True)
 
     def _download_job(job: Job) -> dict[str, str]:
         with cookie_lock:
@@ -852,17 +804,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             job = next(pending_iter)
         except StopIteration:
             return
-        fut = pool.submit(_download_job, job)
-        inflight[fut] = job
+        pool.submit(job, _download_job, job)
 
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            inflight: dict = {}
+        with CompletionPool(workers, pool_factory=ThreadPoolExecutor, completed=as_completed) as pool:
+            inflight = pool.inflight
             for _ in range(workers):
                 _submit(pool, inflight)
             while inflight:
-                fut = next(as_completed(inflight))
-                job = inflight.pop(fut)
+                fut = next(pool.completed())
+                job = pool.pop(fut)
                 src = job.src
                 done_n += 1
                 downloads_since_cookie_refresh += 1
@@ -903,23 +854,25 @@ def main(argv: Iterable[str] | None = None) -> int:
                             try:
                                 new_node = clash.rotate(tried_nodes) or ""
                                 if new_node:
-                                    print(f"bot 后切换 Clash 节点: {args.clash_group} -> {new_node}", flush=True)
+                                    _print(f"bot 后切换 Clash 节点: {args.clash_group} -> {new_node}", flush=True)
                             except Exception as exc:
-                                print(f"Clash 换节点失败: {exc}", flush=True)
-                            try:
-                                with cookie_lock:
-                                    cookiefile = _resolve_cookiefile(
-                                        args, results_dir, force_refresh=True,
-                                    )
-                                    downloads_since_cookie_refresh = 0
-                                recovered = True
-                            except Exception as exc:
-                                print(f"bot 后 Cookie 刷新失败: {exc}", flush=True)
+                                _print(f"Clash 换节点失败: {exc}", flush=True)
+                            recovered = bool(new_node)
+                            if use_browser_cookies:
+                                try:
+                                    with cookie_lock:
+                                        cookiefile = _resolve_cookiefile(
+                                            args, results_dir, force_refresh=True,
+                                        )
+                                        downloads_since_cookie_refresh = 0
+                                    recovered = recovered or cookiefile is not None
+                                except Exception as exc:
+                                    _print(f"bot 后 Cookie 刷新失败: {exc}", flush=True)
                             ip, org = ("", "")
                             if args.proxy_check_url:
                                 ip, org = check_exit_ip(args.proxy_check_url)
                                 if ip:
-                                    print(f"换节点后出口: {ip} ({org})", flush=True)
+                                    _print(f"换节点后出口: {ip} ({org})", flush=True)
                                     warn_datacenter_ip(org)
                             if recovered:
                                 bot_streak = 0
@@ -933,33 +886,32 @@ def main(argv: Iterable[str] | None = None) -> int:
                                         )
                                         downloads_since_cookie_refresh = 0
                                 except Exception as exc:
-                                    print(f"bot 后 Cookie 刷新失败: {exc}", flush=True)
+                                    _print(f"bot 后 Cookie 刷新失败: {exc}", flush=True)
                     else:
                         bot_streak = 0
 
                 extra = result.get("error_message") or result.get("path") or ""
-                print(f"[{done_n}/{total}] {mark} {job.source}#{job.row_no} {job.media_id} {extra[:120]}", flush=True)
+                _print(f"[{done_n}/{total}] {mark} {job.source}#{job.row_no} {job.media_id} {extra[:120]}", flush=True)
                 _record(job, result)
 
                 if bot_streak >= BOT_STREAK_LIMIT:
                     stop_bot = True
-                    print(
+                    _print(
                         "连续触发 YouTube 机器人验证/限流，已停止以免刷爆。"
                         "请换住宅节点、更新 cookies.txt，过几分钟后重跑同一命令续传。",
                         flush=True,
                     )
-                    for leftover in inflight:
-                        leftover.cancel()
-                    inflight.clear()
+                    pool.cancel_pending()
                     break
 
                 _maybe_refresh_cookies()
                 pacer.wait()
                 _submit(pool, inflight)
     except KeyboardInterrupt:
-        print("已中断，重跑同一命令可续传", flush=True)
+        _print("已中断，重跑同一命令可续传", flush=True)
+        return 130
 
-    print(f"完成 success={ok} failed={fail} skipped={skip_n} 总览={overview.path}", flush=True)
+    _print(f"完成 success={ok} failed={fail} skipped={skip_n} 总览={overview.path}", flush=True)
     return 0 if fail == 0 else 1
 
 

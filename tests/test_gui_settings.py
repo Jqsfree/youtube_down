@@ -103,3 +103,32 @@ def test_finished_batch_clears_queue_ids_but_keeps_rows(tmp_path, monkeypatch) -
     assert window._csv_ids == []
     assert not window._download_btn.isEnabled()
     assert window._table.rowCount() == 1  # 失败行保留，可右键重试
+
+
+def test_open_log_directory_uses_actual_log_path(tmp_path, monkeypatch):
+    from pathlib import Path
+    import gui
+    window = _window(tmp_path, monkeypatch)
+    target = tmp_path / "logs" / "app.log"
+    window._log_path = target
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()) or True)
+    window._open_log_dir_btn.click()
+    assert [Path(value) for value in opened] == [target.parent]
+
+
+def test_fatal_batch_failure_stops_following_groups_without_100(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import gui
+    window = _window(tmp_path, monkeypatch)
+    window._worker = SimpleNamespace(_fatal_error='总览写入失败', isRunning=lambda: False)
+    window._csv_queue = ['next group']
+    window._batch_progress_bar.setValue(37)
+    called=[]
+    monkeypatch.setattr(window, '_start_queue', lambda *a: called.append(True))
+    monkeypatch.setattr(gui.QMessageBox, 'information', lambda *a: None)
+    window._on_batch_all_finished(0,1,0,str(tmp_path/'下载总览.csv'))
+    assert not called and not window._csv_queue
+    assert not window._downloading
+    assert window._batch_progress_bar.value()==37
+    assert '写入失败' in window._status_label.text()

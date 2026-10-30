@@ -1,0 +1,25 @@
+{
+  "Windows": {
+    "ffmpeg": {
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-29-19-17/ffmpeg-N-128198-g37515cfd87-win64-gpl.zip",
+      "sha256": "ce2fb4d3b2b761417e4893aa1db0b063e4074f9eafb077966fd4d5ab81cedd02",
+      "version": "N-128198-g37515cfd87",
+      "binaries": ["ffmpeg.exe", "ffprobe.exe"]
+    },
+    "deno": {
+      "url": "https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-pc-windows-msvc.zip",
+      "sha256": "cba84b26e0df5ae7f74fc66b86a95b866872a86292ebd84fa1e959927edd93bf",
+      "version": "2.9.8",
+      "binaries": ["deno.exe"]
+    }
+  },
+  "macOS": {
+    "ffmpeg": {"provider": "homebrew", "formula_version": "9.0.2_1", "version": "9.0.2"},
+    "deno": {
+      "url": "https://github.com/denoland/deno/releases/download/v2.9.8/deno-aarch64-apple-darwin.zip",
+      "sha256": "9f0bf660393da2eaff044cdc7444cb08c73f235849b61d224d825a194ce7c98e",
+      "version": "2.9.8",
+      "binaries": ["deno"]
+    }
+  }
+}

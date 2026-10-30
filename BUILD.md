@@ -65,7 +65,11 @@ youtube_down/
 ├── gui.py                  # 主窗口（纯 UI）
 ├── theme.py                # 主题 / QSS / QSettings
 ├── worker.py               # BatchDownloadWorker、PlaylistExpandWorker 等
-├── downloader.py           # yt-dlp 封装、错误分类、校验、环境检测
+├── batch_runner.py         # 无 Qt 批量执行、活动队列与并发完成处理
+├── downloader.py           # 下载编排、CSV、环境检测与兼容入口
+├── cookies.py              # Cookie 副本、浏览器探测、配置和文件 IO
+├── media_probe.py          # 工具解析、ffprobe 与媒体校验
+├── download_errors.py      # 错误类别与分类函数
 ├── batch_io.py             # 输入发现、输出镜像、下载总览.csv
 ├── app_updater.py          # GitHub Release 检查 / 下载 / 自替换
 ├── yt_dlp_updater.py       # yt-dlp overlay 热更新
@@ -103,16 +107,16 @@ youtube_down/
 | ffprobe | `shutil.which` | 下载后校验（致命依赖） |
 | yt-dlp-ejs + deno | 探测 | YouTube JS 挑战 |
 
-Cookie 由 yt-dlp 直接读取浏览器 Cookie 数据库（`cookiesfrombrowser`），不使用 `browser_cookie3`。
+浏览器 Cookie 必须由 GUI 重新读取操作或显式 CLI 参数授权，不使用 `browser_cookie3`。导入文件由每次 yt-dlp 操作使用按平台过滤的独立临时副本；CLI 浏览器导出仅包含支持的平台域名，快照随 CLI 会话结束删除。`private_files.py` 负责 POSIX/Windows 私有目录权限。
 
 ## 构建
 
 ### 本地（验证打包逻辑）
 
 ```bash
-pip install pyinstaller
+uv sync --locked --group build
 # Windows
-pyinstaller --onefile --windowed --name "YouTubeDownloader" \
+uv run --no-sync pyinstaller --onefile --windowed --name "YouTubeDownloader" \
   --icon assets/icon.ico --add-data "assets;assets" --add-data "VERSION;." \
   --collect-all yt_dlp --collect-all yt_dlp_ejs --collect-all curl_cffi \
   --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
@@ -122,7 +126,7 @@ pyinstaller --onefile --windowed --name "YouTubeDownloader" \
   main.py
 
 # macOS
-pyinstaller --onedir --windowed --name "YouTubeDownloader" \
+uv run --no-sync pyinstaller --onedir --windowed --name "YouTubeDownloader" \
   --osx-bundle-identifier com.jqsfree.youtubedownloader \
   --icon assets/icon.icns --add-data "assets:assets" --add-data "VERSION:." \
   --collect-all yt_dlp --collect-all yt_dlp_ejs --collect-all curl_cffi \
@@ -163,7 +167,7 @@ python scripts/make_icon.py --check
 
 | 平台 | 资产 | 替换方式 |
 |------|------|---------|
-| Windows | `YouTubeDownloader-Windows.exe` | `update-*.bat` 重命名重试循环 |
+| Windows | `YouTubeDownloader-Windows.exe` | 私有目录 `.ps1` 重命名重试循环，JSON 传递路径 |
 | macOS | `YouTubeDownloader-macOS.zip` | `ditto -x -k` 解压 + `xattr -dr` 去隔离 |
 
 资产名必须与 `build.yml` 的 `artifact_name` 一致，否则更新会提示「没有本平台安装包」。
@@ -172,43 +176,81 @@ python scripts/make_icon.py --check
 
 `build.yml` 为每个产物生成 `SHA256SUMS.txt`（格式 `<sha256>  <文件名>`），两张清单
 在 release job 合并成一个资产。`download_update()` 下载完会查清单校验 sha256，
-不符则删包并报错；老 release 没有清单时跳过校验（向后兼容）。
+不符则删包并报错；没有有效清单或资产条目时拒绝自动更新，提示手动下载。
 
 替换前会先停掉所有后台线程（`_shutdown_for_update`）：`QApplication.quit()`
 不触发 `closeEvent`，运行中的 `QThread` 被析构会 abort，Windows 上还会因为
 exe 仍被占用导致脚本替换失败。
 
-### 完整性校验
+### CI 与草稿发布
 
-`build.yml` 为每个产物生成 `SHA256SUMS.txt`（格式 `<sha256>  <文件名>`），两张清单
-在 release job 合并成一个资产。`download_update()` 下载完会查清单校验 sha256，
-不符则删包并报错；老 release 没有清单时跳过校验（向后兼容）。
+- `ci.yml`：PR、main 普通提交和手动触发，仅运行离线测试与版本/依赖同步检查。安装依赖需要访问包源，“离线”指测试不请求真实站点。
+- `smoke.yml`：每日 UTC 03:17 或手动触发，独立运行现有 YouTube 联网冒烟；不创建发布。
+- `build.yml`：推送 `vX.Y.Z` tag 后构建双平台产物并创建草稿；手动运行默认只构建。手动创建草稿必须填写已存在的 tag 并显式勾选 `create_draft`。
+- tag、VERSION、pyproject 必须一致；手动传入 tag 时 checkout 该 tag，提交必须与 tag 指向一致。普通检查/构建只读，只有 release job 有 contents:write。
+- 发布前重新校验两平台安装包摘要及构建记录，生成合并清单。已有相同 tag 的正式发布或草稿均拒绝覆盖；中断或失败后使用新补丁版本恢复，不修改历史资产。
+- 草稿说明从当前版本 CHANGELOG 条目生成。维护者完成 Windows/macOS 启动、下载、升级验收后再在 GitHub 手动发布；流水线不自动将草稿设为公开最新版。
 
-替换前会先停掉所有后台线程（`_shutdown_for_update`）：`QApplication.quit()`
-不触发 `closeEvent`，运行中的 `QThread` 被析构会 abort，Windows 上还会因为
-exe 仍被占用导致脚本替换失败。
+### 依赖与外部工具
 
-### CI
+发布环境使用 Python 3.12、uv 0.12.8。`pyproject.toml` 是依赖声明，`uv.lock` 锁定运行、dev（pytest/PyYAML）、build（PyInstaller）依赖。CI 和打包均使用 `uv sync --locked`，不在构建时升级 yt-dlp。
 
-推送到 `main` 触发 `.github/workflows/build.yml`：
-
-1. Windows / macOS 矩阵，Python 3.12
-2. `pip install -r requirements.txt pytest pyinstaller`
-3. 单元测试（`QT_QPA_PLATFORM=offscreen`）
-4. 下载 ffmpeg / ffprobe / deno 并内嵌
-5. `smoke_test.py`
-6. PyInstaller 单文件打包 → 生成 `SHA256SUMS.txt` → 上传 artifact
-7. `release` job 按 `VERSION` 创建 GitHub Release（含合并后的 `SHA256SUMS.txt`）
-
-产物：`YouTubeDownloader-Windows.exe`、`YouTubeDownloader-macOS.zip`、`SHA256SUMS.txt`。
-
-## 下载总览.csv
-
-utf-8-sig，输出根目录唯一一份，按 `(来源文件, video_id)` upsert：
-
-```csv
-来源文件,行号,video_id,平台,链接,标题,状态,错误类型,错误信息,输出文件,更新时间
-videos.csv,2,dQw4w9WgXcQ,youtube,https://www.youtube.com/watch?v=dQw4w9WgXcQ,标题,成功,,,out/videos/0002_dQw4w9WgXcQ.mp4,2026-01-01 12:00:00
+```bash
+uv sync --locked --group build
+uv run --no-sync python -m pytest tests/ -q
 ```
 
-写入带跨进程文件锁（`fcntl.flock` / `msvcrt.locking`），原子替换。
+修改依赖后执行：
+
+```bash
+uv lock
+uv export --locked --no-dev --no-emit-project --no-header -o requirements.txt > /dev/null
+```
+
+requirements.txt 是带哈希的运行依赖导出文件，不手工编辑。CI 重新导出并比较，避免与锁文件分叉。
+
+`scripts/build-tools.json` 固定 Windows FFmpeg、双平台 Deno 的归档 URL 和 SHA256；下载后先校验归档摘要，再只提取指定工具文件。macOS 沿用 Homebrew FFmpeg，要求版本精确为清单中的 `formula_version`，版本漂移时拒绝构建；记录已安装 Homebrew 配方信息。Homebrew 的传递依赖和 runner 镜像仍可能变化，本批不承诺字节一致重建，也不会静默放宽版本检查。
+
+工具安装在单元测试之后，避免本地二进制干扰工具解析测试。构建后从 Windows onefile 归档提取内嵌工具到临时目录运行；macOS 从 `.app` 中定位工具运行。Windows 核对内嵌工具与构建输入摘要一致；macOS 因 PyInstaller 会重写 Mach-O 路径并签名，改为验证 app 签名及工具实际版本/启动，同时分别记录输入和产物摘要。此处签名验证仅检查打包完整性，不代表已具备 Developer ID 公证。
+
+每个平台上传 `build-info-<平台>.json`，包含源提交、uv.lock 摘要、实际 Python 包版本、工具下载来源、工具版本与摘要、最终资产摘要；macOS 另含 Homebrew 信息。源码 tag 和这两份记录共同用于追溯。
+
+本地依赖解析、YAML/发布逻辑测试不能替代远程 Actions 双平台构建。第一批真实升级验收继续作为正式发布前门槛。
+
+### 故障日志
+
+GUI 使用 `~/Downloads/youtube_downloader.log`，CLI 使用 `--results-dir`（未指定则输出目录）下的同名文件。每个当前日志文件组为 2 MiB 文件加 3 份轮转备份，约 8 MiB；不自动清理旧版本带时间戳的历史日志。多个进程同时写同一路径不保证轮转原子性，需要隔离时为 CLI 指定不同的 results-dir。
+
+文件记录 DEBUG 级别的本地任务编号、平台、阶段及错误类别；GUI/控制台只显示 INFO 以上摘要。yt-dlp 请求头和响应正文不直接写出，适配器只提取阶段/类别。日志格式化时统一隐藏已知凭据字段、Cookie 路径和 URL，异常仅记录类型与栈位置，不包含原始异常正文、源代码行和局部变量。CLI 控制台沿用相同脱敏规则。
+
+文件打开、写入或轮转失败时日志降为尽力记录，不影响下载。GUI 提供“打开日志目录”；此入口打开当前日志所在目录，不导出诊断包。下载总览 CSV 继续保持既有业务字段与内容口径。
+
+### 核心逻辑拆分与兼容
+
+`downloader.py` 保留原有函数导出和 YoutubeDownloader 接口。Cookie 文件与来源 IO 委托给 cookies，工具与媒体校验委托给 media_probe；错误类和分类函数从 download_errors 同对象重导出。新模块不依赖 GUI，也不反向导入 downloader。下载编排仍控制格式、Cookie 两阶段、暂存恢复和结果输出；目录布局、阈值及错误文案保持现状。
+
+`tests/test_module_boundaries.py` 检查导入边界、打包模块清单、独立使用及兼容行为；原有 Cookie、工具探测和下载测试继续使用旧入口，防止只有新模块测试通过而调用方失效。
+
+打包后还会检查 Windows EXE/macOS 启动程序内 PYZ 归档包含 cookies、media_probe、download_errors，并将模块名写入 build-info；缺失任一模块则构建失败。
+
+### 批量执行核心
+
+GUI 的批量状态、格式回退、两阶段 Cookie、重试、暂停/取消和活动队列由 batch_runner 承担；worker 的 BatchDownloadWorker 保留 QThread/Signal 及原方法入口。普通 Python 可直接使用 BatchRunner，callbacks 使用原信号名称对应的可调用对象，不需要 Qt 或事件循环。单个 runner 同时只运行一个消费循环。
+
+GUI 和 CLI 共用 CompletionPool 的提交、完成、取消和线程池关闭，以及基础探测/worker 数配置。CLI 的 direct-item 入口保持 best+最低高度、显式 Cookie、10 秒限流重试；GUI 保持档位获取、两阶段 Cookie 和 4/8 秒退避。CLI 的文件发现、多来源输出、Clash 回调与控制台呈现继续留在客户端。现有两端续传验证强度差异保留；本次没有增加全局连接预算或持久化格式。
+
+总览写入失败会中止本批，保留媒体，关闭入队，向 Python 调用方抛原错误；GUI 接收失败汇总并停止后续文件组，不显示成功完成或 100%。并发记录失败不会重写为 UNKNOWN 下载失败。风控熔断会停止接收新任务，将已接收但未开始的任务记为跳过；取消等待队列不触发新下载，退避取消后不再重新获取信息。CLI Ctrl-C 返回 130。
+
+浏览器 Cookie 来源既限制初始 worker 数，也使用本批共享锁保护后来加入的浏览器任务；文件 Cookie 任务保留原并发配置。冻结归档检查包含 batch_runner 模块。tests/test_batch_runner.py 使用 FakeDownloader/事件同步验证以上行为，原 worker 和 CLI 回归继续保留。
+
+### 原生安装演练
+
+手动 build.yml 选择 `check_install=true` 可在两个 runner 上下载 v1.3.1 旧包，
+用当前真实产物执行 `scripts/check_install.py`：特殊路径替换、失败回滚后启动，
+Windows 另检验私有目录 ACL 与占用重试。tag 构建默认执行该检查。
+所有操作限于临时安装副本，不改本机已有安装。检查证明生成的安装脚本与真实
+安装包可配合工作，不替代发布后在线更新检查或真实站点下载验收。
+
+Windows 私有目录先在新建空目录执行 `icacls /reset`，再去除继承并授予当前 SID，
+避免 mkdtemp 的显式 OWNER/SYSTEM/Administrators ACE 残留。只处理新目录；
+[/reset 的语义见 Microsoft 文档](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls)。
