@@ -252,3 +252,11 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 第五批本机最终验证：347 passed；uv lock --check、git diff --check 通过。独立审查指出的问题均有失败复现与修复验证。准备推送独立分支并执行 create_draft=false 的 Windows/macOS 构建，核实纯核心进入 PYZ；尚未宣称远程验收通过。
 
 第五批最终验收：本机 347 passed；uv lock --check、git diff --check 通过。提交 5e84f51 的远程 run [41004178323](https://github.com/Jqsfree/youtube_down/actions/runs/41004178323) 成功：Windows/macOS 离线测试、固定工具安装、PyInstaller 打包、包含 batch_runner 的 PYZ 模块检查、内嵌工具验证及 artifact 上传均通过。Release job 按 create_draft=false 跳过。第五批实现与双平台构建验收完成；未合并 main、未创建草稿或发布，第一批真实升级演练仍为发布前待办。本次远程验证之后仅追加验收文档，未修改被验证的程序或构建逻辑。
+
+### v1.4.0 收尾
+
+用户授权收尾并确认使用 v1.4.0。已同步 VERSION、pyproject、锁文件、README 下载链接和 CHANGELOG；当前源代码本机 347 项回归通过。新增可选原生演练（tag 构建默认运行），使用已发布 v1.3.1 与当前真实包，仅操作临时副本，检查特殊路径、替换/复制失败回滚后进程存活、Windows 占用重试与当前用户 ACL。
+
+首次演练 run 41004976218 失败，未进入发布；原因为 macOS /var 与 /private/var 路径别名使进程识别失败，以及 Windows runner 的 PSModulePath 导致 Windows PowerShell 无法加载 Get-Acl。macOS 在 run [41005457493](https://github.com/Jqsfree/youtube_down/actions/runs/41005457493) 中，路径规范化后已实际通过 v1.3.1→v1.4.0 替换与失败回滚，Windows 仍待验证。独立审查提出的命令注入标记检查目录问题已修复并故障注入验证。Windows 实际 ACL 检查已纳入离线测试，避免只检查 icacls 参数。演练证明脚本替换与进程启动存活，不等价于人工 GUI 完整验收，也不覆盖新进程启动失败的自动健康回滚。
+
+Windows 后续真实测试发现 mkdtemp 目录带显式 OWNER/SYSTEM/Administrators ACE，原 inheritance:r 不会移除这些显式项。已在仍为空的新临时目录先 icacls /reset、再移除继承并授予当前 SID；只影响 make_private_directory 新建目录，不调整导入原件或现有安装。新增原生 ACL 检查先失败，本机 348 项通过，云端修复验证待结果。PowerShell 环境清理也有大小写变量名的失败复现与回归测试。

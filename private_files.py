@@ -23,6 +23,12 @@ def restrict_directory(directory: Path) -> None:
     sid = re.search(rb"S-1-5-(?:\d+-)+\d+", result.stdout)
     if sid is None:
         raise RuntimeError("无法确定当前用户权限，停止创建敏感临时文件")
+    # mkdtemp can create explicit OWNER/SYSTEM/Administrators entries. Reset
+    # this new, still-empty directory before removing inheritance and granting.
+    subprocess.run(
+        ["icacls", str(directory), "/reset"],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
+    )
     subprocess.run(
         ["icacls", str(directory), "/inheritance:r", "/grant:r",
          f"*{sid.group().decode('ascii')}:(OI)(CI)F"],

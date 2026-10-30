@@ -250,3 +250,7 @@ GUI 和 CLI 共用 CompletionPool 的提交、完成、取消和线程池关闭�
 Windows 另检验私有目录 ACL 与占用重试。tag 构建默认执行该检查。
 所有操作限于临时安装副本，不改本机已有安装。检查证明生成的安装脚本与真实
 安装包可配合工作，不替代发布后在线更新检查或真实站点下载验收。
+
+Windows 私有目录先在新建空目录执行 `icacls /reset`，再去除继承并授予当前 SID，
+避免 mkdtemp 的显式 OWNER/SYSTEM/Administrators ACE 残留。只处理新目录；
+[/reset 的语义见 Microsoft 文档](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls)。

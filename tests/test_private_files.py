@@ -27,7 +27,8 @@ def test_windows_acl_is_restricted_to_current_sid(tmp_path, monkeypatch):
         return SimpleNamespace(stdout=b'"user","S-1-5-21-111-222-333-1001"')
     monkeypatch.setattr(private_files.subprocess, "run", run)
     private_files.restrict_directory(tmp_path)
-    assert calls[1] == ["icacls", str(tmp_path), "/inheritance:r", "/grant:r",
+    assert calls[1] == ["icacls", str(tmp_path), "/reset"]
+    assert calls[2] == ["icacls", str(tmp_path), "/inheritance:r", "/grant:r",
                         "*S-1-5-21-111-222-333-1001:(OI)(CI)F"]
 
 
