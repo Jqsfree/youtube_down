@@ -76,18 +76,18 @@ def check_acl(directory: Path) -> None:
     if os.name != 'nt':
         assert directory.stat().st_mode & 0o777 == 0o700
         return
-    result = subprocess.check_output([
+    subprocess.run([
         'powershell.exe', '-NoProfile', '-Command',
         '$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; '
         '$acl=Get-Acl -LiteralPath $env:CHECK_DIR; '
+        'Write-Output $acl.Sddl; Write-Output $sid; '
         'foreach ($entry in $acl.Access) { '
         'if ($entry.IsInherited -or '
         '$entry.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid '
         '-or $entry.AccessControlType -ne "Allow") { '
         '$acl | Format-List Owner,AccessToString | Out-Host; exit 1 } }; '
         'if ($acl.Access.Count -eq 0) { exit 1 }; Write-Output "ACL verified"',
-    ], env=dict(os.environ, CHECK_DIR=str(directory)), text=True)
-    assert 'ACL verified' in result
+    ], env=dict(os.environ, CHECK_DIR=str(directory)), text=True, check=True)
 
 
 def exercise(old: Path, new: Path) -> None:
