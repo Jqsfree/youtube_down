@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- 按职责拆出 Cookie IO、工具/媒体验证、错误分类模块，保留 downloader/YoutubeDownloader 原入口；下载策略、输出布局和校验阈值保持兼容。
+
 - 复用日志模块增加 2 MiB/3 份备份轮转、凭据与 URL 脱敏及写入失败保护；GUI 新增“打开日志目录”，CLI 在结果目录保存日志。
 - yt-dlp 文件日志记录本地任务编号、平台、阶段和错误类别，不写原始请求头/响应正文；环境缺失规则覆盖 ffmpeg/ffprobe/deno，并优先识别可靠 HTTP 状态。
 

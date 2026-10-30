@@ -214,3 +214,13 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 第三批本机最终验证：311 passed，git diff --check 通过；独立审查发现的两项重要问题已通过回归测试修复。准备推送同一独立分支并执行 create_draft=false 的双平台构建；未创建发布、未合并 main。
 
 第三批最终验收：本机 311 passed；Qt offscreen 检查确认 1440×900 下载页的日志目录按钮可见且未被压缩截断。提交 51c307f 的远程 run [40999230652](https://github.com/Jqsfree/youtube_down/actions/runs/40999230652) 成功：Windows/macOS 离线测试、固定工具安装、PyInstaller 打包、内嵌工具验证和产物上传全部通过；Release 按 create_draft=false 跳过。日志脱敏/轮转/故障降级测试使用假凭据和临时文件，不是所有未知凭据格式的全量保证。第三批代码与构建验收完成；未合并 main、未创建草稿或发布，第一批真实升级演练继续保留为发布前待办，第四批未启动。
+
+### 第四批启动与验收标准
+
+本次基线 311 passed。按 cookies → media_probe → download_errors 顺序拆分；保留 downloader 及 YoutubeDownloader 原公开入口和错误类别重导出；新模块不得导入 PySide6/gui/worker/downloader；CSV、格式回退、Cookie 策略、校验阈值与错误文案保持不变；每次运行对应旧测试和新模块直接测试，再做全量回归与双平台打包。通过参数传递配置路径、ffprobe 执行器等已有边界，保留旧路径的配置与测试替换方式，不引入通用端口框架。
+
+阶段验证：Cookie 相关 34 passed；工具/媒体验证相关 29 passed；错误、日志与模块契约相关 30 passed（后续新增文件大小及打包清单用例单独纳入最终回归）。未修改下载策略或输出结构。
+
+第四批实现结果：cookies.py 负责副本/导出、文本解码/验证、浏览器探测、配置 IO；media_probe.py 负责工具解析/probe、文件大小、时长和高度验证；download_errors.py 持有错误类型和分类函数。downloader 保留状态/编排及原入口，错误类/函数同对象重导出，配置路径与旧 probe 替换方式保留。三个模块已加入 pyproject 模块清单。新进程独立导入测试确认没有加载 downloader/PySide6，静态导入边界检查通过。独立审查未发现阻断问题；自查补复现测试，修正工具查找 OSError 越过旧 probe 捕获边界的问题。未将已有业务错误修正混入重构。当前 downloader 1825 行（仅作规模记录，不是验收门槛）。
+
+第四批本机最终回归：324 passed（`QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests/ -q`），uv lock --check、git diff --check 通过。准备推送独立分支执行 create_draft=false 双平台构建，不合并 main、不创建发布。

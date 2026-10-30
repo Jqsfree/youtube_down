@@ -65,7 +65,10 @@ youtube_down/
 ├── gui.py                  # 主窗口（纯 UI）
 ├── theme.py                # 主题 / QSS / QSettings
 ├── worker.py               # BatchDownloadWorker、PlaylistExpandWorker 等
-├── downloader.py           # yt-dlp 封装、错误分类、校验、环境检测
+├── downloader.py           # 下载编排、CSV、环境检测与兼容入口
+├── cookies.py              # Cookie 副本、浏览器探测、配置和文件 IO
+├── media_probe.py          # 工具解析、ffprobe 与媒体校验
+├── download_errors.py      # 错误类别与分类函数
 ├── batch_io.py             # 输入发现、输出镜像、下载总览.csv
 ├── app_updater.py          # GitHub Release 检查 / 下载 / 自替换
 ├── yt_dlp_updater.py       # yt-dlp overlay 热更新
@@ -220,3 +223,9 @@ GUI 使用 `~/Downloads/youtube_downloader.log`，CLI 使用 `--results-dir`（�
 文件记录 DEBUG 级别的本地任务编号、平台、阶段及错误类别；GUI/控制台只显示 INFO 以上摘要。yt-dlp 请求头和响应正文不直接写出，适配器只提取阶段/类别。日志格式化时统一隐藏已知凭据字段、Cookie 路径和 URL，异常仅记录类型与栈位置，不包含原始异常正文、源代码行和局部变量。CLI 控制台沿用相同脱敏规则。
 
 文件打开、写入或轮转失败时日志降为尽力记录，不影响下载。GUI 提供“打开日志目录”；此入口打开当前日志所在目录，不导出诊断包。下载总览 CSV 继续保持既有业务字段与内容口径。
+
+### 核心逻辑拆分与兼容
+
+`downloader.py` 保留原有函数导出和 YoutubeDownloader 接口。Cookie 文件与来源 IO 委托给 cookies，工具与媒体校验委托给 media_probe；错误类和分类函数从 download_errors 同对象重导出。新模块不依赖 GUI，也不反向导入 downloader。下载编排仍控制格式、Cookie 两阶段、暂存恢复和结果输出；目录布局、阈值及错误文案保持现状。
+
+`tests/test_module_boundaries.py` 检查导入边界、打包模块清单、独立使用及兼容行为；原有 Cookie、工具探测和下载测试继续使用旧入口，防止只有新模块测试通过而调用方失效。

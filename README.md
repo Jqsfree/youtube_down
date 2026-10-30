@@ -162,3 +162,5 @@ PR 和 main 普通提交仅运行离线测试；真实 YouTube 冒烟独立每�
 ### 查找故障日志
 
 GUI 下载页点击“打开日志目录”；当前日志为 Downloads 下的 `youtube_downloader.log`。CLI 日志在结果目录（未指定时为输出目录）下。日志自动轮转，记录版本、任务阶段和错误类别，已知凭据字段、Cookie 路径与 URL 会被隐藏；旧版历史日志保留原样。
+
+核心逻辑保持 downloader/YoutubeDownloader 兼容入口；Cookie IO、媒体探测/校验和错误分类分别由 cookies、media_probe、download_errors 承担，均可脱离 GUI 使用。开发结构与兼容约束见 [BUILD.md](BUILD.md#核心逻辑拆分与兼容)。

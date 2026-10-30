@@ -43,7 +43,10 @@ platforms/ + downloader.py  ← Pure logic. Must NOT import PySide6.
   platforms/base.py         ← Platform enum, MediaInput, ABC
   platforms/{youtube,bilibili,tiktok}.py
   platforms/facade.py       ← routes by platform (YoutubeDownloader alias)
-  downloader.py             ← shared yt-dlp ops, validation, CSV, cookies
+  downloader.py             ← download orchestration, CSV, legacy facade
+  cookies.py                ← cookie copies, browser discovery, cookie file/config IO
+  media_probe.py            ← tool lookup, ffprobe, file/duration/height validation
+  download_errors.py        ← error categories and classification
   batch_io.py               ← input discovery, output mirroring, 下载总览.csv
   app_updater.py            ← GitHub Release check / download / self-replace
   yt_dlp_updater.py         ← yt-dlp overlay hot update (PyPI)
@@ -64,7 +67,7 @@ Browser access is opt-in (GUI reload action or explicit CLI option). Cookie file
 
 ## Error Classification
 
-`_CATEGORY_RULES` in `downloader.py` defines 8 priority-ordered error categories with keyword matching: `CANCELLED`, `ENVIRONMENT` (missing ffprobe), `BOT_VERIFICATION`, `AUTH_REQUIRED`, `PRIVATE_VIDEO`, `RATE_LIMIT`, `VIDEO_UNAVAILABLE`, `NETWORK_ERROR`. Each category specifies `retry_cookie` (bool). `classify_error()` returns an `ErrorCategory` dataclass. All results are written to the output root's `下载总览.csv` (`错误类型` column).
+`_CATEGORY_RULES` in `download_errors.py` (re-exported by `downloader.py`) defines 8 priority-ordered error categories with keyword matching: `CANCELLED`, `ENVIRONMENT` (missing ffprobe), `BOT_VERIFICATION`, `AUTH_REQUIRED`, `PRIVATE_VIDEO`, `RATE_LIMIT`, `VIDEO_UNAVAILABLE`, `NETWORK_ERROR`. Each category specifies `retry_cookie` (bool). `classify_error()` returns an `ErrorCategory` dataclass. All results are written to the output root's `下载总览.csv` (`错误类型` column).
 
 ## Download Validation
 
@@ -137,3 +140,7 @@ PR/main commits run `.github/workflows/ci.yml`: locked dependencies, generated-r
 ## Logging
 
 `logger_utils.AppLogger` owns redaction and rotating file handlers (2 MiB, 3 backups). GUI logs to Downloads/youtube_downloader.log; CLI logs under results-dir/output. `_EngineLogger` records local task IDs, platform, phases and error categories without raw engine headers/responses. Debug events are file-only. GUI/CLI messages use the same credential redaction policy; do not bypass it for new log sinks. Logging failures must not fail downloads. Existing overview CSV semantics remain unchanged.
+
+## Extracted logic compatibility
+
+Keep downloader function exports and YoutubeDownloader public methods as compatibility entry points. Cookie and media helpers are delegated to cookies.py and media_probe.py; ErrorCategory/classification exports refer to the same objects in download_errors.py. These modules must not import PySide6, gui, worker or downloader. Tool/config compatibility wrappers pass the existing configuration paths and probe functions; preserve missing-tool versus invalid-media outcomes and current size/duration/height tolerances. Register new runtime modules in pyproject.toml and verify both frozen builds.
