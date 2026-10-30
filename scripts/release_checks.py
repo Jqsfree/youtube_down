@@ -15,8 +15,8 @@ ASSETS = {'Windows': 'YouTubeDownloader-Windows.exe', 'macOS': 'YouTubeDownloade
 
 
 def validate_version(root: Path, tag: str = '') -> str:
-    version = (root / 'VERSION').read_text().strip()
-    project = tomllib.loads((root / 'pyproject.toml').read_text())['project']['version']
+    version = (root / 'VERSION').read_text(encoding="utf-8").strip()
+    project = tomllib.loads((root / 'pyproject.toml').read_text(encoding="utf-8"))['project']['version']
     if not re.fullmatch(r'\d+\.\d+\.\d+', version) or version != project:
         raise ValueError('VERSION 与 pyproject 版本不一致或格式错误')
     if tag and tag != f'v{version}':
@@ -51,7 +51,7 @@ def stage_assets(inputs: Path, destination: Path, version: str) -> None:
         if len(matches) != 1:
             raise ValueError(f'资产缺失或重复：{name}')
         asset = matches[0]
-        lines = (asset.parent / 'SHA256SUMS.txt').read_text().splitlines()
+        lines = (asset.parent / 'SHA256SUMS.txt').read_text(encoding="utf-8").splitlines()
         expected = [line.split() for line in lines]
         if len(expected) != 1 or len(expected[0]) != 2 or expected[0][1] != name:
             raise ValueError(f'校验清单不完整：{name}')
@@ -60,7 +60,7 @@ def stage_assets(inputs: Path, destination: Path, version: str) -> None:
         if digest != expected[0][0]:
             raise ValueError(f'资产摘要不符：{name}')
         info = asset.parent / f'build-info-{platform}.json'
-        data = json.loads(info.read_text())
+        data = json.loads(info.read_text(encoding="utf-8"))
         if data.get('asset_sha256') != digest:
             raise ValueError('构建记录资产摘要不符')
         if data['version'] != version or data['platform'] != platform:
@@ -91,7 +91,7 @@ def main() -> None:
     elif args.command == 'stage':
         stage_assets(root / 'release-assets', root / 'staged', version)
     else:
-        lines = (root / 'CHANGELOG.md').read_text().splitlines()
+        lines = (root / 'CHANGELOG.md').read_text(encoding="utf-8").splitlines()
         start = next(i for i, line in enumerate(lines) if line.startswith(f'## [{version}]'))
         end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith('## [')), len(lines))
         body = '\n'.join(lines[start:end]).strip()

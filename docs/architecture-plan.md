@@ -198,3 +198,5 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 - 尚未提交、推送、触发远程 Actions、创建真实草稿或发布。远程双平台构建、工具清单实际下载安装与草稿流程仍待验证；第一批真实升级待办继续保留。第二批本机检查结果见本节最终测试记录，第三批未启动。
 
 最终本机验证：297 passed（`QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests/ -q`）；actionlint 三条工作流检查和 git diff --check 通过。准备提交独立分支并手动触发 create_draft=false 的远程构建，不推 main、不创建 tag、不创建真实 Release。
+
+远程验证第 1 次：独立分支提交 d7f5490，手动 create_draft=false，run 40997491092。macOS 完整构建/清单工具安装/内嵌工具运行/上传均成功；Windows 在离线测试有 3 项因默认 cp1252 读取 UTF-8 文本失败，未进入工具安装。已补 legacy locale 复现测试并显式 UTF-8 读取，修复后本机 298 passed。准备推送修复并重新触发仅构建验证。

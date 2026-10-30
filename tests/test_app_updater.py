@@ -440,7 +440,7 @@ def test_macos_script_quotes_paths(tmp_path):
     payload = tmp_path / "new ' $(touch INJECTED).zip"
     target = tmp_path / 'app `touch INJECTED` 中.app'
     script = app_updater._write_macos_script(payload, target)
-    text = script.read_text()
+    text = script.read_text(encoding="utf-8")
     assert "NEW=" + shlex.quote(str(payload)) in text
     assert "TARGET=" + shlex.quote(str(target)) in text
     if os.name != "nt":
@@ -476,7 +476,7 @@ def test_macos_installer_executes_special_paths_safely(tmp_path, copy_fails):
                             env={**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"]},
                             capture_output=True)
     assert result.returncode == (1 if copy_fails else 0), result.stderr
-    assert (target / "marker").read_text() == ("old" if copy_fails else "new")
+    assert (target / "marker").read_text(encoding="utf-8") == ("old" if copy_fails else "new")
     assert not (tmp_path / "INJECTED").exists()
 
 

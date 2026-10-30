@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def workflow(name):
-    return yaml.load((ROOT / '.github/workflows' / name).read_text(), Loader=yaml.BaseLoader)
+    return yaml.load((ROOT / '.github/workflows' / name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
 def test_ordinary_commits_cannot_publish():
@@ -71,7 +71,7 @@ def test_release_stage_checks_both_payloads(tmp_path):
         (folder / 'SHA256SUMS.txt').write_text(f'{digest}  {name}\n')
         (folder / f'build-info-{platform}.json').write_text(json.dumps({'platform': platform, 'version': '1.3.1', 'asset_sha256': digest}))
     stage_assets(tmp_path / 'input', tmp_path / 'staged', '1.3.1')
-    assert len((tmp_path / 'staged/SHA256SUMS.txt').read_text().splitlines()) == 2
+    assert len((tmp_path / 'staged/SHA256SUMS.txt').read_text(encoding="utf-8").splitlines()) == 2
     (tmp_path / 'input/Windows/YouTubeDownloader-Windows.exe').write_bytes(b'tampered')
     with pytest.raises(ValueError, match='摘要'):
         stage_assets(tmp_path / 'input', tmp_path / 'bad', '1.3.1')
@@ -133,8 +133,20 @@ def test_macos_packaging_may_rewrite_binary_but_must_keep_version(tmp_path, monk
     monkeypatch.setattr(build_tools, 'output', version)
     specs = {'ffmpeg': {'version': '9.0.2'}, 'deno': {'version': '2.9.8'}}
     build_tools.verify('macOS', bundle, asset, specs)
-    data = json.loads((tmp_path / 'build-info-macOS.json').read_text())
+    data = json.loads((tmp_path / 'build-info-macOS.json').read_text(encoding="utf-8"))
     assert data['tools']['ffmpeg']['sha256'] != data['tools']['ffmpeg']['source_sha256']
     monkeypatch.setattr(build_tools, 'output', lambda c: 'deno 0.0.0' if Path(c[0]).name == 'deno' else version(c))
     with pytest.raises(ValueError, match='version'):
         build_tools.verify('macOS', bundle, asset, specs)
+
+
+def test_release_metadata_is_utf8_even_on_legacy_locale(tmp_path, monkeypatch):
+    from scripts.release_checks import validate_version
+    original_read = Path.read_text
+    def legacy_read(path, encoding=None, errors=None, **kwargs):
+        return original_read(path, encoding=encoding or 'cp1252', errors=errors, **kwargs)
+    (tmp_path / 'VERSION').write_text('1.3.1', encoding='utf-8')
+    (tmp_path / 'pyproject.toml').write_text('[project]\nversion="1.3.1"\ndescription="中文下载器"\n', encoding='utf-8')
+    monkeypatch.setattr(Path, 'read_text', legacy_read)
+    assert validate_version(tmp_path) == '1.3.1'
+    assert workflow('build.yml')['name'] == 'Build Multi-Platform'

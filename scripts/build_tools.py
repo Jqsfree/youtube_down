@@ -102,13 +102,13 @@ def verify(system: str, bundle: Path, asset: Path, specs: dict) -> None:
                                     specs['deno' if name == 'deno' else 'ffmpeg']['version'])
             tools[name] = {'sha256': digest(binary), 'source_sha256': digest(ROOT / filename), 'version': version}
     record = {
-        'version': (ROOT / 'VERSION').read_text().strip(), 'platform': system,
+        'version': (ROOT / 'VERSION').read_text(encoding="utf-8").strip(), 'platform': system,
         'commit': output(['git', 'rev-parse', 'HEAD']), 'uv_lock_sha256': digest(ROOT / 'uv.lock'),
         'tool_sources': specs, 'tools': tools, 'asset_sha256': digest(asset),
         'python_packages': {item.metadata['Name']: item.version for item in importlib.metadata.distributions()},
     }
     if system == 'macOS':
-        record['homebrew'] = json.loads((ROOT / 'brew-build-info.json').read_text())
+        record['homebrew'] = json.loads((ROOT / 'brew-build-info.json').read_text(encoding="utf-8"))
     (asset.parent / f'build-info-{system}.json').write_text(json.dumps(record, indent=2), encoding='utf-8')
 
 
@@ -119,7 +119,7 @@ if __name__ == '__main__':
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--asset', type=Path)
     args = parser.parse_args()
-    specs = json.loads((ROOT / 'scripts/build-tools.json').read_text())[args.platform]
+    specs = json.loads((ROOT / 'scripts/build-tools.json').read_text(encoding="utf-8"))[args.platform]
     if args.command == 'install':
         install(args.platform, specs)
     else:
