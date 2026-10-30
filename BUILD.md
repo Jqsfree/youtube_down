@@ -229,3 +229,5 @@ GUI 使用 `~/Downloads/youtube_downloader.log`，CLI 使用 `--results-dir`（�
 `downloader.py` 保留原有函数导出和 YoutubeDownloader 接口。Cookie 文件与来源 IO 委托给 cookies，工具与媒体校验委托给 media_probe；错误类和分类函数从 download_errors 同对象重导出。新模块不依赖 GUI，也不反向导入 downloader。下载编排仍控制格式、Cookie 两阶段、暂存恢复和结果输出；目录布局、阈值及错误文案保持现状。
 
 `tests/test_module_boundaries.py` 检查导入边界、打包模块清单、独立使用及兼容行为；原有 Cookie、工具探测和下载测试继续使用旧入口，防止只有新模块测试通过而调用方失效。
+
+打包后还会检查 Windows EXE/macOS 启动程序内 PYZ 归档包含 cookies、media_probe、download_errors，并将模块名写入 build-info；缺失任一模块则构建失败。

@@ -224,3 +224,7 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 第四批实现结果：cookies.py 负责副本/导出、文本解码/验证、浏览器探测、配置 IO；media_probe.py 负责工具解析/probe、文件大小、时长和高度验证；download_errors.py 持有错误类型和分类函数。downloader 保留状态/编排及原入口，错误类/函数同对象重导出，配置路径与旧 probe 替换方式保留。三个模块已加入 pyproject 模块清单。新进程独立导入测试确认没有加载 downloader/PySide6，静态导入边界检查通过。独立审查未发现阻断问题；自查补复现测试，修正工具查找 OSError 越过旧 probe 捕获边界的问题。未将已有业务错误修正混入重构。当前 downloader 1825 行（仅作规模记录，不是验收门槛）。
 
 第四批本机最终回归：324 passed（`QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests/ -q`），uv lock --check、git diff --check 通过。准备推送独立分支执行 create_draft=false 双平台构建，不合并 main、不创建发布。
+
+补充打包验收：构建验证脚本直接检查启动程序 PYZ 归档包含三个新模块，并记录到 build-info；不是只依赖 PyInstaller 返回成功。缺失模块的回归测试先失败再修复。
+
+补充 PYZ 包含性检查后最终本机 325 passed；此检查的单元测试使用模拟归档，不要求普通离线 CI 安装 PyInstaller，真实归档检查由 build 依赖组和双平台构建执行。

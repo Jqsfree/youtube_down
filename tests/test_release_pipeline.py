@@ -116,6 +116,7 @@ def test_tool_extraction_ignores_archive_paths(tmp_path):
 def test_macos_packaging_may_rewrite_binary_but_must_keep_version(tmp_path, monkeypatch):
     from scripts import build_tools
     monkeypatch.setattr(build_tools, 'ROOT', tmp_path)
+    monkeypatch.setattr(build_tools, 'verify_runtime_modules', lambda path: ['cookies', 'media_probe', 'download_errors'])
     (tmp_path / 'VERSION').write_text('1.3.1')
     (tmp_path / 'uv.lock').write_text('locked')
     (tmp_path / 'brew-build-info.json').write_text('{}')
@@ -150,3 +151,24 @@ def test_release_metadata_is_utf8_even_on_legacy_locale(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, 'read_text', legacy_read)
     assert validate_version(tmp_path) == '1.3.1'
     assert workflow('build.yml')['name'] == 'Build Multi-Platform'
+
+
+def test_frozen_archive_must_contain_extracted_modules(monkeypatch):
+    from scripts import build_tools
+    import sys
+    from types import ModuleType
+    modules = {'cookies': None, 'media_probe': None, 'download_errors': None}
+    class Archive:
+        toc = {'PYZ.pyz': None}
+        def __init__(self, path): pass
+        def open_embedded_archive(self, name):
+            return type('PYZ', (), {'toc': modules})()
+    for name in ('PyInstaller', 'PyInstaller.archive', 'PyInstaller.archive.readers'):
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    sys.modules['PyInstaller.archive.readers'].CArchiveReader = Archive
+    assert set(build_tools.verify_runtime_modules(Path('app.exe'))) == set(modules)
+    del modules['cookies']
+    with pytest.raises(ValueError, match='cookies'):
+        build_tools.verify_runtime_modules(Path('app.exe'))

@@ -73,7 +73,24 @@ def install(system: str, specs: dict) -> None:
         check_version(name, version, expected)
 
 
+def verify_runtime_modules(executable: Path) -> list[str]:
+    """Inspect PYZ so a successful build cannot hide a missing extracted module."""
+    from PyInstaller.archive.readers import CArchiveReader
+    archive = CArchiveReader(str(executable))
+    names = [name for name in archive.toc if name.endswith('PYZ.pyz')]
+    if len(names) != 1:
+        raise ValueError('missing or ambiguous embedded PYZ archive')
+    modules = archive.open_embedded_archive(names[0]).toc
+    required = ('cookies', 'media_probe', 'download_errors')
+    missing = set(required) - modules.keys()
+    if missing:
+        raise ValueError(f'missing bundled runtime modules: {sorted(missing)}')
+    return list(required)
+
+
 def verify(system: str, bundle: Path, asset: Path, specs: dict) -> None:
+    executable = bundle if system == "Windows" else bundle / "Contents" / "MacOS" / bundle.stem
+    runtime_modules = verify_runtime_modules(executable)
     tools = {}
     if system == 'macOS':
         subprocess.run(['codesign', '--verify', '--deep', '--strict', str(bundle)], check=True)
@@ -105,6 +122,7 @@ def verify(system: str, bundle: Path, asset: Path, specs: dict) -> None:
         'version': (ROOT / 'VERSION').read_text(encoding="utf-8").strip(), 'platform': system,
         'commit': output(['git', 'rev-parse', 'HEAD']), 'uv_lock_sha256': digest(ROOT / 'uv.lock'),
         'tool_sources': specs, 'tools': tools, 'asset_sha256': digest(asset),
+        'runtime_modules': runtime_modules,
         'python_packages': {item.metadata['Name']: item.version for item in importlib.metadata.distributions()},
     }
     if system == 'macOS':
