@@ -252,3 +252,20 @@ def test_no_cookie_failed_rotation_still_backs_off_and_stops(tmp_path, monkeypat
     assert download_cli.main([]) == 1
     assert len(downloads) == download_cli.BOT_STREAK_LIMIT
     assert len(backoffs) == download_cli.BOT_STREAK_LIMIT
+
+
+def test_keyboard_interrupt_returns_cancel_status_not_success(tmp_path, monkeypatch, capsys):
+    import download_cli
+    args=download_cli.parse_args(['unused','-o',str(tmp_path),'--workers','1'])
+    args.proxy_check_url=''
+    monkeypatch.setattr(download_cli,'parse_args',lambda argv:args)
+    job=download_cli.Job('https://example.com/a.mp4','paste',1,tmp_path)
+    monkeypatch.setattr(download_cli,'_iter_sources',lambda *a:([job],[]))
+    monkeypatch.setattr(download_cli,'collect_completed_files',lambda *a,**k:{})
+    class InterruptedPool:
+        def __init__(self,*a,**k):pass
+        def __enter__(self):raise KeyboardInterrupt
+        def __exit__(self,*a):pass
+    monkeypatch.setattr(download_cli,'CompletionPool',InterruptedPool)
+    assert download_cli.main([])==130
+    assert '完成 success=' not in capsys.readouterr().out

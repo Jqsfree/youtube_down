@@ -38,6 +38,7 @@ py-modules = [
     "private_files",
     "theme",
     "worker",
+    "batch_runner",
     "yt_dlp_updater",
 ]
 packages = ["platforms"]

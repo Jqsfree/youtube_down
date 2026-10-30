@@ -157,7 +157,7 @@ def test_frozen_archive_must_contain_extracted_modules(monkeypatch):
     from scripts import build_tools
     import sys
     from types import ModuleType
-    modules = {'cookies': None, 'media_probe': None, 'download_errors': None}
+    modules = {'cookies': None, 'media_probe': None, 'download_errors': None, 'batch_runner': None}
     class Archive:
         toc = {'PYZ.pyz': None}
         def __init__(self, path): pass

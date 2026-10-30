@@ -65,6 +65,7 @@ youtube_down/
 ├── gui.py                  # 主窗口（纯 UI）
 ├── theme.py                # 主题 / QSS / QSettings
 ├── worker.py               # BatchDownloadWorker、PlaylistExpandWorker 等
+├── batch_runner.py         # 无 Qt 批量执行、活动队列与并发完成处理
 ├── downloader.py           # 下载编排、CSV、环境检测与兼容入口
 ├── cookies.py              # Cookie 副本、浏览器探测、配置和文件 IO
 ├── media_probe.py          # 工具解析、ffprobe 与媒体校验
@@ -231,3 +232,13 @@ GUI 使用 `~/Downloads/youtube_downloader.log`，CLI 使用 `--results-dir`（�
 `tests/test_module_boundaries.py` 检查导入边界、打包模块清单、独立使用及兼容行为；原有 Cookie、工具探测和下载测试继续使用旧入口，防止只有新模块测试通过而调用方失效。
 
 打包后还会检查 Windows EXE/macOS 启动程序内 PYZ 归档包含 cookies、media_probe、download_errors，并将模块名写入 build-info；缺失任一模块则构建失败。
+
+### 批量执行核心
+
+GUI 的批量状态、格式回退、两阶段 Cookie、重试、暂停/取消和活动队列由 batch_runner 承担；worker 的 BatchDownloadWorker 保留 QThread/Signal 及原方法入口。普通 Python 可直接使用 BatchRunner，callbacks 使用原信号名称对应的可调用对象，不需要 Qt 或事件循环。单个 runner 同时只运行一个消费循环。
+
+GUI 和 CLI 共用 CompletionPool 的提交、完成、取消和线程池关闭，以及基础探测/worker 数配置。CLI 的 direct-item 入口保持 best+最低高度、显式 Cookie、10 秒限流重试；GUI 保持档位获取、两阶段 Cookie 和 4/8 秒退避。CLI 的文件发现、多来源输出、Clash 回调与控制台呈现继续留在客户端。现有两端续传验证强度差异保留；本次没有增加全局连接预算或持久化格式。
+
+总览写入失败会中止本批，保留媒体，关闭入队，向 Python 调用方抛原错误；GUI 接收失败汇总并停止后续文件组，不显示成功完成或 100%。并发记录失败不会重写为 UNKNOWN 下载失败。风控熔断会停止接收新任务，将已接收但未开始的任务记为跳过；取消等待队列不触发新下载，退避取消后不再重新获取信息。CLI Ctrl-C 返回 130。
+
+浏览器 Cookie 来源既限制初始 worker 数，也使用本批共享锁保护后来加入的浏览器任务；文件 Cookie 任务保留原并发配置。冻结归档检查包含 batch_runner 模块。tests/test_batch_runner.py 使用 FakeDownloader/事件同步验证以上行为，原 worker 和 CLI 回归继续保留。

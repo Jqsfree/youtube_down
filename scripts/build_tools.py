@@ -81,7 +81,7 @@ def verify_runtime_modules(executable: Path) -> list[str]:
     if len(names) != 1:
         raise ValueError('missing or ambiguous embedded PYZ archive')
     modules = archive.open_embedded_archive(names[0]).toc
-    required = ('cookies', 'media_probe', 'download_errors')
+    required = ('cookies', 'media_probe', 'download_errors', 'batch_runner')
     missing = set(required) - modules.keys()
     if missing:
         raise ValueError(f'missing bundled runtime modules: {sorted(missing)}')

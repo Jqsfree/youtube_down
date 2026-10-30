@@ -1760,7 +1760,20 @@ class MainWindow(QMainWindow):
     def _on_batch_all_finished(
         self, success: int, fail: int, skipped: int, overview_path: str
     ) -> None:
-        self._batch_progress_bar.setValue(100)
+        fatal_error = getattr(self._worker, "_fatal_error", "") if self._worker else ""
+        if fatal_error:
+            self._csv_queue.clear()
+            self._queue_results.clear()
+            self._csv_ids = []
+            self._csv_label.setText("")
+            for row in range(self._table.rowCount()):
+                status = self._table.item(row, 3)
+                if status is not None and status.text() in ("排队中", "等待中"):
+                    status.setText("未执行")
+            self._status_label.setText(fatal_error)
+            self._log(fatal_error)
+            self._set_downloading_ui(False)
+            return
         self._batch_errors.clear()
 
         if self._cancelled:
@@ -1772,6 +1785,7 @@ class MainWindow(QMainWindow):
             self._set_downloading_ui(False)
             return
 
+        self._batch_progress_bar.setValue(100)
         self._status_label.setText(f"批量完成：成功 {success}，失败 {fail}")
 
         if self._csv_queue:

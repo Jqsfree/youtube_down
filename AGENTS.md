@@ -37,7 +37,9 @@ python scripts/make_icon.py
 ```
 gui.py + theme.py     ← Pure UI / QSS. Must NOT import yt_dlp.
     ↓ calls
-worker.py             ← QThread subclasses, Qt Signals connect both sides.
+worker.py             ← QThread/Signal adapters.
+    ↓ calls
+batch_runner.py       ← Qt-free batch policies, live queue, shared completion pool.
     ↓ calls
 platforms/ + downloader.py  ← Pure logic. Must NOT import PySide6.
   platforms/base.py         ← Platform enum, MediaInput, ABC
@@ -144,3 +146,9 @@ PR/main commits run `.github/workflows/ci.yml`: locked dependencies, generated-r
 ## Extracted logic compatibility
 
 Keep downloader function exports and YoutubeDownloader public methods as compatibility entry points. Cookie and media helpers are delegated to cookies.py and media_probe.py; ErrorCategory/classification exports refer to the same objects in download_errors.py. These modules must not import PySide6, gui, worker or downloader. Tool/config compatibility wrappers pass the existing configuration paths and probe functions; preserve missing-tool versus invalid-media outcomes and current size/duration/height tolerances. Register new runtime modules in pyproject.toml and verify both frozen builds.
+
+## Batch execution core
+
+`batch_runner.BatchRunner` is the standalone Python runner. `BatchRunnerCore` has no constructor so the QThread adapter can inherit its business methods without duplicate QObject initialization; worker.py initializes it explicitly and maps callbacks to existing signals. CLI uses the same CompletionPool and direct-item core entry, keeping its existing best/explicit-cookie/10s retry/Clash policy distinct from GUI format resolution/two-stage-cookie/4-8s retry. Preserve existing result schemas.
+
+A result-write failure stops admission and propagates the original error; GUI ends in failure without 100% progress or starting another source group. Preserve downloaded files. Bot cutoff must drain and record accepted unstarted items before clearing the queue. Browser-only jobs are serialized even when added after pool creation. CLI KeyboardInterrupt returns 130. Register batch_runner in packaging and check it in frozen PYZ archives.

@@ -44,6 +44,7 @@ from downloader import (
     AUDIO_EXTS,
     BOT_STREAK_LIMIT,
     BRUTAL_YDL_OPTS,
+    BRUTAL_MAX_WORKERS,
     NORMAL_YDL_OPTS,
     VIDEO_EXTS,
     YoutubeDownloader,
@@ -57,6 +58,8 @@ from downloader import (
 )
 from private_files import private_directory
 from logger_utils import AppLogger, redact
+import batch_runner as batch_ops
+from batch_runner import CompletionPool, parallel_workers
 from pacing import AdaptivePacer
 
 def _print(*args, **kwargs) -> None:
@@ -120,22 +123,7 @@ _SKIP_NODE_CONTAINS = (
 
 
 def _probe_short_side(path: Path) -> int | None:
-    """ffprobe 视频短边；无法解析视频轨时返回 None。"""
-    ok, out = _run_probe(
-        ["-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
-        timeout=10,
-    )
-    if not ok:
-        return None
-    try:
-        parts = [p.strip() for p in out.strip().split(",") if p.strip()]
-        dims = [int(p) for p in parts[:2]]
-        if len(dims) >= 2:
-            return min(dims)
-        return dims[0] if dims else None
-    except ValueError:
-        return None
+    return batch_ops._probe_short_side(path, probe=_run_probe)
 
 
 def collect_completed_ids(*dirs: Path, min_height: int = 0) -> set[str]:
@@ -341,11 +329,7 @@ def _ui_overrides(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _is_generic_source(source: str) -> bool:
-    """直链没有分辨率元数据，不能按清晰度档位筛选或校验。"""
-    try:
-        return YoutubeDownloader.parse_input(source).platform == "generic"
-    except Exception:
-        return False
+    return batch_ops.is_generic_source(source)
 
 
 def _download_one(
@@ -366,53 +350,10 @@ def _download_one(
         cookiefile, use_pot=use_pot, fragment_workers=fragment_workers, brutal=brutal,
         extra_overrides=extra_overrides,
     )
-    effective_min = 0 if _is_generic_source(video_id) else min_height
-    last_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            path = dl.download(
-                video_id=video_id,
-                format_id="best",
-                output_dir=output_dir,
-                filename_stem=stem,
-                use_cookies=True,
-                needs_audio_merge=True,
-                min_height=effective_min,
-                expected_height=effective_min if effective_min > 0 else None,
-                strict_quality=True,
-                brutal=brutal,
-                audio_only=audio_only,
-                audio_format=audio_format,
-            )
-            return {
-                "video_id": video_id,
-                "status": "success",
-                "error_category": "SUCCESS",
-                "error_message": "",
-                "cookie_used": "true",
-                "output_dir": str(output_dir),
-                "title": "",
-                "path": str(path),
-            }
-        except Exception as exc:
-            last_exc = exc
-            cat = classify_error(exc)
-            msg = clean_error(exc)
-            if "低于最低要求" in msg or ("低于" in msg and str(effective_min) in msg):
-                return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
-            if "requested format is not available" in msg.lower():
-                return _result(video_id, output_dir, "skipped", "SKIPPED", msg)
-            if cat.code == "RATE_LIMIT" and attempt == 0:
-                time.sleep(10)
-                continue
-            return _result(
-                video_id, output_dir,
-                "failed" if cat.code != "SKIPPED" else "skipped",
-                cat.code, msg,
-            )
-    assert last_exc is not None
-    cat = classify_error(last_exc)
-    return _result(video_id, output_dir, "failed", cat.code, clean_error(last_exc))
+    return batch_ops.download_direct_item(
+        dl, video_id, output_dir, min_height, brutal=brutal, stem=stem,
+        audio_only=audio_only, audio_format=audio_format,
+    )
 
 
 def _result(
@@ -422,16 +363,7 @@ def _result(
     category: str,
     msg: str,
 ) -> dict[str, str]:
-    return {
-        "video_id": video_id,
-        "status": status,
-        "error_category": category,
-        "error_message": msg,
-        "cookie_used": "true",
-        "output_dir": str(output_dir),
-        "title": "",
-        "path": "",
-    }
+    return batch_ops.direct_result(video_id, output_dir, status, category, msg)
 
 
 @dataclass
@@ -699,10 +631,10 @@ def _run(args: argparse.Namespace) -> int:
         _print(f"代理不可用: {args.proxy}（请检查端口，或去掉 --proxy 直连）", file=sys.stderr)
         return 2
     if args.workers is None:
-        args.workers = 8 if args.brutal else 1
+        args.workers = BRUTAL_MAX_WORKERS if args.brutal else 1
     ui_overrides = _ui_overrides(args)
     if args.fragment_workers is None:
-        args.fragment_workers = 8 if args.brutal else int(
+        args.fragment_workers = int(BRUTAL_YDL_OPTS["concurrent_fragment_downloads"]) if args.brutal else int(
             NORMAL_YDL_OPTS["concurrent_fragment_downloads"]
         )
     output_dir = args.output_dir.expanduser().resolve()
@@ -817,7 +749,7 @@ def _run(args: argparse.Namespace) -> int:
 
     pacer = AdaptivePacer(args.sleep_min, args.sleep_max)
     ok = fail = 0
-    workers = max(1, args.workers)
+    workers = parallel_workers(args.workers)
     pending_iter = iter(pending)
     total = len(pending)
     done_n = 0
@@ -872,17 +804,16 @@ def _run(args: argparse.Namespace) -> int:
             job = next(pending_iter)
         except StopIteration:
             return
-        fut = pool.submit(_download_job, job)
-        inflight[fut] = job
+        pool.submit(job, _download_job, job)
 
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            inflight: dict = {}
+        with CompletionPool(workers, pool_factory=ThreadPoolExecutor, completed=as_completed) as pool:
+            inflight = pool.inflight
             for _ in range(workers):
                 _submit(pool, inflight)
             while inflight:
-                fut = next(as_completed(inflight))
-                job = inflight.pop(fut)
+                fut = next(pool.completed())
+                job = pool.pop(fut)
                 src = job.src
                 done_n += 1
                 downloads_since_cookie_refresh += 1
@@ -970,9 +901,7 @@ def _run(args: argparse.Namespace) -> int:
                         "请换住宅节点、更新 cookies.txt，过几分钟后重跑同一命令续传。",
                         flush=True,
                     )
-                    for leftover in inflight:
-                        leftover.cancel()
-                    inflight.clear()
+                    pool.cancel_pending()
                     break
 
                 _maybe_refresh_cookies()
@@ -980,6 +909,7 @@ def _run(args: argparse.Namespace) -> int:
                 _submit(pool, inflight)
     except KeyboardInterrupt:
         _print("已中断，重跑同一命令可续传", flush=True)
+        return 130
 
     _print(f"完成 success={ok} failed={fail} skipped={skip_n} 总览={overview.path}", flush=True)
     return 0 if fail == 0 else 1

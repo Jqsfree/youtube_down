@@ -73,7 +73,7 @@ def test_file_size_threshold_is_unchanged(tmp_path):
 def test_extracted_modules_are_in_package_manifest():
     import tomllib
     names = tomllib.loads((ROOT / 'pyproject.toml').read_text(encoding='utf-8'))['tool']['setuptools']['py-modules']
-    assert {'cookies', 'media_probe', 'download_errors'} <= set(names)
+    assert {'cookies', 'media_probe', 'download_errors', 'batch_runner'} <= set(names)
 
 
 def test_legacy_probe_lookup_failure_remains_unavailable(monkeypatch):
