@@ -21,6 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app_updater
 
 
+def native_env(**updates: str) -> dict[str, str]:
+    # Do not feed PowerShell 7 module directories to Windows PowerShell 5.1.
+    env = dict(os.environ, **updates)
+    if os.name == 'nt':
+        env.pop('PSModulePath', None)
+    return env
+
+
 def digest(path: Path) -> str:
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -28,7 +36,7 @@ def digest(path: Path) -> str:
 
 def processes(executable: Path) -> list[int]:
     if os.name == 'nt':
-        env = dict(os.environ, CHECK_EXE=str(executable))
+        env = native_env(CHECK_EXE=str(executable))
         result = subprocess.check_output([
             'powershell.exe', '-NoProfile', '-Command',
             'Get-CimInstance Win32_Process | Where-Object { '
@@ -87,7 +95,7 @@ def check_acl(directory: Path) -> None:
         '-or $entry.AccessControlType -ne "Allow") { '
         '$acl | Format-List Owner,AccessToString | Out-Host; exit 1 } }; '
         'if ($acl.Access.Count -eq 0) { exit 1 }; Write-Output "ACL verified"',
-    ], env=dict(os.environ, CHECK_DIR=str(directory)), text=True, check=True)
+    ], env=native_env(CHECK_DIR=str(directory)), text=True, check=True)
 
 
 def exercise(old: Path, new: Path) -> None:
@@ -131,7 +139,7 @@ def exercise(old: Path, new: Path) -> None:
             script = (app_updater._write_windows_script(payload, target) if os.name == 'nt'
                       else app_updater._write_macos_script(payload, target))
             handle = None
-            env = dict(os.environ, QT_QPA_PLATFORM='offscreen')
+            env = native_env(QT_QPA_PLATFORM='offscreen')
             if case == 'rollback':
                 if os.name == 'nt':
                     payload.unlink()  # Fails after old target has been moved.
