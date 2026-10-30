@@ -1,6 +1,6 @@
 # youtube_down 渐进改进方案
 
-日期：2026-10-30。基线：当前工作区 v1.3.1。状态：第四批代码与双平台构建验收通过；第一批真实升级验证仍为发布前待办。
+日期：2026-10-30。基线：当前工作区 v1.3.1。状态：第五批代码与双平台构建验收通过；第一批真实升级验证仍为发布前待办。
 
 ## 1. 架构判断与目标
 
@@ -250,3 +250,5 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 补齐有效 Cookie 来源和锁库验收：逐来源解析实际使用的文件/浏览器，不因其他平台已有文件而放过当前平台浏览器；锁内等待者遇到全局记录失败不再启动新操作。并发克隆的浏览器锁库标记回传本批 downloader，后续默认浏览器尝试不重复读取。对应新增用例均先失败后修复，显式文件/来源覆盖继续沿用已有 downloader 规则。
 
 第五批本机最终验证：347 passed；uv lock --check、git diff --check 通过。独立审查指出的问题均有失败复现与修复验证。准备推送独立分支并执行 create_draft=false 的 Windows/macOS 构建，核实纯核心进入 PYZ；尚未宣称远程验收通过。
+
+第五批最终验收：本机 347 passed；uv lock --check、git diff --check 通过。提交 5e84f51 的远程 run [41004178323](https://github.com/Jqsfree/youtube_down/actions/runs/41004178323) 成功：Windows/macOS 离线测试、固定工具安装、PyInstaller 打包、包含 batch_runner 的 PYZ 模块检查、内嵌工具验证及 artifact 上传均通过。Release job 按 create_draft=false 跳过。第五批实现与双平台构建验收完成；未合并 main、未创建草稿或发布，第一批真实升级演练仍为发布前待办。本次远程验证之后仅追加验收文档，未修改被验证的程序或构建逻辑。
