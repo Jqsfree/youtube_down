@@ -61,7 +61,7 @@ from downloader import (
     looks_like_playlist,
     proxy_reachable,
 )
-from logger_utils import AppLogger
+from logger_utils import AppLogger, redact
 from platforms.base import Platform
 from theme import (
     PRESETS,
@@ -107,9 +107,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self._downloader = YoutubeDownloader()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._log_path = Path.home() / "Downloads" / f"youtube_downloader_{ts}.log"
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_path = Path.home() / "Downloads" / "youtube_downloader.log"
         AppLogger.attach_file(self._log_path)
         self._worker: BatchDownloadWorker | None = None
         self._validate_cookie_worker: ValidateCookieWorker | None = None
@@ -176,7 +174,7 @@ class MainWindow(QMainWindow):
             f"{i.name}={i.version}" if i.version else i.name for i in env_items
         )
         print(f"[env] {versions}")
-        AppLogger.get_logger().info("应用启动")
+        AppLogger.start_session("GUI")
         for i in env_items:
             icon = "✗" if i.status == "error" else ("⚠" if i.status == "warning" else "✓")
             extra = f" {i.message}" if i.message else ""
@@ -613,6 +611,8 @@ class MainWindow(QMainWindow):
         self._history_btn = QPushButton("历史")
         self._history_btn.setToolTip("查看当前输出目录的下载总览")
         self._open_dir_btn = QPushButton("打开目录")
+        self._open_log_dir_btn = QPushButton("打开日志目录")
+        self._open_log_dir_btn.clicked.connect(self._on_open_log_dir)
         self._log_toggle_btn = QPushButton("收起日志")
         action_row.addWidget(self._download_btn)
         action_row.addWidget(self._pause_btn)
@@ -620,6 +620,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self._history_btn)
         action_row.addWidget(self._open_dir_btn)
         action_row.addStretch(1)
+        action_row.addWidget(self._open_log_dir_btn)
         action_row.addWidget(self._log_toggle_btn)
         progress_layout.addLayout(action_row)
         layout.addWidget(progress_card)
@@ -1809,6 +1810,10 @@ class MainWindow(QMainWindow):
         self._csv_label.setText("")
         self._set_downloading_ui(False)
 
+    def _on_open_log_dir(self) -> None:
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._log_path.parent))):
+            QMessageBox.warning(self, "无法打开", "日志目录暂时不可用。")
+
     def _on_open_dir(self) -> None:
         path = Path(self._output_input.text()).expanduser()
         path.mkdir(parents=True, exist_ok=True)
@@ -1944,12 +1949,11 @@ class MainWindow(QMainWindow):
     def _append_log_line(self, text: str) -> None:
         if not hasattr(self, "_log_view"):
             return
-        self._log_view.appendPlainText(text)
+        self._log_view.appendPlainText(redact(text))
         self._log_view.ensureCursorVisible()
 
     def _log(self, text: str) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        self._append_log_line(f"[{ts}] {text}")
+        AppLogger.get_logger().info("%s", text)
 
     # ------------------------------------------------------------------
     # Env wizard (kept from previous GUI)

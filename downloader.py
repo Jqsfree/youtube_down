@@ -295,20 +295,42 @@ def _configure_js_runtimes(opts: dict[str, Any]) -> None:
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-class _QuietLogger:
-    """禁止 yt-dlp 向 stderr 输出任何日志。"""
+class _EngineLogger:
+    """Record engine phases/categories, never raw headers, responses or credentials."""
+
+    def __init__(self, platform: str = "unknown", stage: str = "engine") -> None:
+        self.platform = platform
+        self.stage = stage
+        self.task = next(AppLogger._task_ids)
+        self.event("start")
+
+    def event(self, stage: str, category: str = "", error: str = "") -> None:
+        AppLogger.get_logger().debug(
+            "task=%s platform=%s stage=%s.%s category=%s exception=%s",
+            self.task, self.platform, self.stage, stage, category, error,
+        )
 
     def debug(self, msg: str) -> None:
-        pass
+        phase = "debug"
+        for phrase, label in (("downloading webpage", "webpage"), ("m3u8", "manifest"),
+                              ("mpd", "manifest"), ("merging formats", "merge"),
+                              ("destination", "download"), ("fragment", "fragment")):
+            if phrase in str(msg).lower():
+                phase = label
+                break
+        self.event(phase)
 
     def info(self, msg: str) -> None:
-        pass
+        self.event("info")
 
     def warning(self, msg: str) -> None:
-        pass
+        self.event("warning", classify_error(Exception(str(msg))).code)
 
     def error(self, msg: str) -> None:
-        pass
+        self.event("error", classify_error(Exception(str(msg))).code)
+
+    def failure(self, exc: Exception) -> None:
+        self.event("failed", classify_error(exc).code, type(exc).__name__)
 
 
 # ------------------------------------------------------------------
@@ -425,6 +447,9 @@ _CATEGORY_RULES: list[tuple[str, bool, list[str]]] = [
     ("CANCELLED",          False, ["下载已取消", "cancel"]),
     ("ENVIRONMENT",        False, [
         "ffprobe 不可用",
+        "ffmpeg not found", "ffprobe not found", "deno not found",
+        "ffmpeg and ffprobe not found", "ffmpeg is not installed", "ffprobe is not installed",
+        "deno is not installed", "no supported javascript runtime",
         "no such file or directory",
         "filenotfounderror",
     ]),
@@ -597,7 +622,23 @@ def classify_error(exc: Exception) -> ErrorCategory:
         ErrorCategory（code 为 SUCCESS / AUTH_REQUIRED / BOT_VERIFICATION /
         RATE_LIMIT / VIDEO_UNAVAILABLE / PRIVATE_VIDEO / NETWORK_ERROR / CANCELLED / UNKNOWN）。
     """
+    # Use only known exception contracts; an opaque wrapper need not repeat HTTP text.
+    from urllib.error import HTTPError
+    from yt_dlp.networking.exceptions import HTTPError as EngineHTTPError
     msg = str(exc).lower()
+    if any(word in msg for word in _CATEGORY_RULES[0][2]):
+        return ErrorCategory("CANCELLED", False, str(exc))
+    cause = exc
+    if isinstance(exc, yt_dlp.utils.DownloadError):
+        info = getattr(exc, "exc_info", None)
+        if isinstance(info, tuple) and len(info) >= 2 and isinstance(info[1], Exception):
+            cause = info[1]
+    status = (cause.code if isinstance(cause, HTTPError) else
+              cause.status if isinstance(cause, EngineHTTPError) else None)
+    if status == 429:
+        return ErrorCategory("RATE_LIMIT", False, str(exc))
+    if status in (404, 410):
+        return ErrorCategory("VIDEO_UNAVAILABLE", False, str(exc))
 
     for code, retry, keywords in _CATEGORY_RULES:
         for kw in keywords:
@@ -931,7 +972,8 @@ class YoutubeDownloader:
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
-            "logger": _QuietLogger(),
+            "logger": _EngineLogger(media.platform if media else "unknown",
+                                    "extract" if for_extraction else "download"),
             # 网络韧性 / 节奏：与 NORMAL_YDL_OPTS 对齐（download 路径还会再合并一次）
             "extractor_retries": NORMAL_YDL_OPTS["extractor_retries"],
             "retries": NORMAL_YDL_OPTS["retries"],
@@ -1046,6 +1088,7 @@ class YoutubeDownloader:
         attempts = [True, False] if use_browser else [use_cookies]
         with self._yt_dlp_lock:
             for attempt in attempts:
+                opts: dict[str, Any] = {}
                 try:
                     opts = self._make_opts(
                         use_cookies=attempt,
@@ -1062,12 +1105,16 @@ class YoutubeDownloader:
                             info.setdefault("_media_id", media.media_id)
                             if attempt != use_cookies:  # 浏览器 Cookie 回退成功 → 标记
                                 self._browser_cookie_broken = True
+                            if isinstance(opts.get("logger"), _EngineLogger):
+                                opts["logger"].event("done", "SUCCESS")
                             return info
                         if info:
                             last_err = yt_dlp.utils.DownloadError(
                                 f"{media.label} 返回了视频信息但格式列表为空"
                             )
                 except Exception as exc:
+                    if isinstance(opts.get("logger"), _EngineLogger):
+                        opts["logger"].failure(exc)
                     if "copy chrome cookie" in str(exc).lower():
                         self._browser_cookie_broken = True  # 锁库，后续跳过浏览器 Cookie
                     last_err = exc
@@ -1420,7 +1467,13 @@ class YoutubeDownloader:
                         ) from exc
 
                 ok = True
+                if isinstance(opts.get("logger"), _EngineLogger):
+                    opts["logger"].event("done", "SUCCESS")
                 return path
+        except Exception as exc:
+            if isinstance(opts.get("logger"), _EngineLogger):
+                opts["logger"].failure(exc)
+            raise
         finally:
             if filename_stem:
                 _finish_stashed_files(protected, ok)

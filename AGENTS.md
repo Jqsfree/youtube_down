@@ -133,3 +133,7 @@ Tests use `YoutubeDownloader.__new__()` to create instances without `__init__` (
 ## CI/CD
 
 PR/main commits run `.github/workflows/ci.yml`: locked dependencies, generated-requirements consistency and offline tests. Network smoke is isolated in `smoke.yml` (daily/manual). `build.yml` runs for `v*` tags or manual builds: validate tag/VERSION/pyproject, locked tests/build, pinned tools, verify embedded tools, upload artifacts and build-info. Only the release job has write permission; tags create a new draft release, manual builds create no release unless `create_draft` is explicitly selected with an existing matching tag. Existing releases/drafts are never overwritten. Actual cross-platform upgrade checks are required before a maintainer publishes a draft. See BUILD.md for dependency/tool updates and release recovery.
+
+## Logging
+
+`logger_utils.AppLogger` owns redaction and rotating file handlers (2 MiB, 3 backups). GUI logs to Downloads/youtube_downloader.log; CLI logs under results-dir/output. `_EngineLogger` records local task IDs, platform, phases and error categories without raw engine headers/responses. Debug events are file-only. GUI/CLI messages use the same credential redaction policy; do not bypass it for new log sinks. Logging failures must not fail downloads. Existing overview CSV semantics remain unchanged.

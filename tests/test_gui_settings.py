@@ -103,3 +103,15 @@ def test_finished_batch_clears_queue_ids_but_keeps_rows(tmp_path, monkeypatch) -
     assert window._csv_ids == []
     assert not window._download_btn.isEnabled()
     assert window._table.rowCount() == 1  # 失败行保留，可右键重试
+
+
+def test_open_log_directory_uses_actual_log_path(tmp_path, monkeypatch):
+    from pathlib import Path
+    import gui
+    window = _window(tmp_path, monkeypatch)
+    target = tmp_path / "logs" / "app.log"
+    window._log_path = target
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()) or True)
+    window._open_log_dir_btn.click()
+    assert [Path(value) for value in opened] == [target.parent]

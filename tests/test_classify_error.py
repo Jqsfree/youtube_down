@@ -69,3 +69,25 @@ def test_normal_ydl_opts_never_zero_sleep() -> None:
     assert NORMAL_YDL_OPTS["concurrent_fragment_downloads"] == 12
     assert NORMAL_YDL_OPTS["sleep_interval"] == 1
     assert NORMAL_YDL_OPTS["max_sleep_interval"] == 3
+
+
+def test_missing_tools_outrank_generic_not_found():
+    for message in ['ffmpeg not found', 'ffprobe not found', 'deno not found', 'ffmpeg and ffprobe not found', 'No supported JavaScript runtime could be found']:
+        result = classify_error(Exception(message))
+        assert result.code == 'ENVIRONMENT', message
+        assert not result.retry_cookie
+
+
+def test_http_status_is_used_before_message_fallback():
+    from urllib.error import HTTPError
+    assert classify_error(HTTPError('https://example.com', 429, 'opaque', {}, None)).code == 'RATE_LIMIT'
+    assert classify_error(HTTPError('https://example.com', 404, 'opaque', {}, None)).code == 'VIDEO_UNAVAILABLE'
+
+
+def test_wrapped_engine_http_status_does_not_depend_on_outer_message():
+    from types import SimpleNamespace
+    from yt_dlp.networking.exceptions import HTTPError
+    from yt_dlp.utils import DownloadError
+    cause = HTTPError(SimpleNamespace(status=429, reason='opaque', close=lambda: None))
+    error = DownloadError('opaque engine failure', exc_info=(type(cause), cause, None))
+    assert classify_error(error).code == 'RATE_LIMIT'

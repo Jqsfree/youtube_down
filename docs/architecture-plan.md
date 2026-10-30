@@ -204,3 +204,11 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 第二批最终验证：提交 3b6d5b2，run [40998035345](https://github.com/Jqsfree/youtube_down/actions/runs/40998035345) 成功。Windows 与 macOS 均实际通过锁定依赖安装、离线测试、清单工具安装、PyInstaller 打包、内嵌工具启动与版本/摘要检查、校验清单生成及 artifact 上传；Release job 因 create_draft=false 按预期跳过。本机最终 298 passed，actionlint 和 git diff --check 通过。第二批实现与双平台构建验收完成；没有创建真实 Release/草稿，没有合并 main。正式草稿创建逻辑已由离线测试覆盖，但尚未以真实版本 tag 执行；第一批真实升级演练也仍待完成。第三批尚未启动。
 
 分支：architecture-batch-1（已推送）。第二批远程运行测试的是 3b6d5b2；随后仅追加本文验证记录，未修改被验证的程序或流水线。
+
+### 第三批启动与验收标准
+
+用户要求开始第三批。基线本次 298 passed。验收：复用 AppLogger，当前日志固定文件轮转（2 MiB × 当前文件及 3 份备份，单文件组约 8 MiB；历史日志不批量删除）；GUI/文件/CLI 控制台统一脱敏；日志打开/写入/轮转失败不影响下载；yt-dlp 只写阶段/类别等摘要，不写原始请求头/响应正文；本地任务编号关联阶段；补环境错误与可靠 HTTP 状态分类；GUI 打开实际日志目录；完整离线回归和双平台构建通过。真实升级待办不在本批冒充已验证。
+
+第三批实现：复用 logger_utils 的统一脱敏 Formatter 和安全轮转 handler，DEBUG 文件日志、INFO GUI/控制台分级；日志切换失败卸下旧文件 handler，避免串日志。GUI 固定日志文件名、日志目录按钮，CLI 结果目录文件与控制台同一脱敏规则；版本、局部任务编号/平台/阶段/类别均可追溯。引擎只记录固定阶段标签与类别，原始异常仅保留类型和栈位置，业务 CSV 口径不改。环境规则覆盖 ffmpeg/ffprobe/deno；HTTP 429/404/410 优先读取 urllib/yt-dlp 异常结构和 DownloadError.exc_info，403 不直接认定风控。独立审查的选项构建异常被日志覆盖、日志切换失败串日志问题，均有失败复现测试并已修复。多进程共享同一路径的轮转不保证原子性，BUILD 已说明；旧版历史日志不批量清理。
+
+第三批本机最终验证：311 passed，git diff --check 通过；独立审查发现的两项重要问题已通过回归测试修复。准备推送同一独立分支并执行 create_draft=false 的双平台构建；未创建发布、未合并 main。
