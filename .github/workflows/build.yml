@@ -92,6 +92,16 @@ jobs:
         run: uv run --no-sync python -m pytest tests/ -q
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Verify native private directory permissions
+        if: inputs.check_install || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          uv run --no-sync python - <<'PYCODE'
+          from scripts.check_install import check_acl
+          from private_files import private_directory
+          with private_directory("ytdown-native-acl-") as directory:
+              check_acl(directory)
+          PYCODE
       # Tools must be installed after resolution tests so local binaries cannot shadow fixtures.
       - name: Install pinned external tools
         run: uv run --no-sync python scripts/build_tools.py install --platform ${{ matrix.tools_platform }}

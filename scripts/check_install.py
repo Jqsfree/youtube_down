@@ -60,7 +60,13 @@ def stop(executable: Path) -> None:
 def assert_started(executable: Path) -> None:
     deadline = time.monotonic() + 60
     while not processes(executable):
-        assert time.monotonic() < deadline, 'installed application did not start'
+        if time.monotonic() >= deadline:
+            if os.name != 'nt':
+                listing = subprocess.check_output(['ps', '-axo', 'pid=,comm='], text=True)
+                print('Expected executable:', str(executable), flush=True)
+                print('Application process candidates:', '\n'.join(
+                    line for line in listing.splitlines() if 'YouTube' in line), flush=True)
+            raise AssertionError('installed application did not start')
         time.sleep(1)
     time.sleep(3)
     assert processes(executable), 'installed application exited during startup'
@@ -77,7 +83,8 @@ def check_acl(directory: Path) -> None:
         'foreach ($entry in $acl.Access) { '
         'if ($entry.IsInherited -or '
         '$entry.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid '
-        '-or $entry.AccessControlType -ne "Allow") { exit 1 } }; '
+        '-or $entry.AccessControlType -ne "Allow") { '
+        '$acl | Format-List Owner,AccessToString | Out-Host; exit 1 } }; '
         'if ($acl.Access.Count -eq 0) { exit 1 }; Write-Output "ACL verified"',
     ], env=dict(os.environ, CHECK_DIR=str(directory)), text=True)
     assert 'ACL verified' in result
@@ -88,7 +95,7 @@ def exercise(old: Path, new: Path) -> None:
     old, new = old.resolve(), new.resolve()
     assert old.is_file() and new.is_file()
     with tempfile.TemporaryDirectory(prefix='ytdown-native-check-') as folder:
-        root = Path(folder)
+        root = Path(folder).resolve()
         special = root / "中文 空格 [a] ' & $(touch INJECTED)"
         special.mkdir()
         neighbour = special / 'neighbour.txt'
