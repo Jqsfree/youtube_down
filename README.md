@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | [Windows x64 EXE](https://github.com/Jqsfree/youtube_down/releases/download/v1.4.0/YouTubeDownloader-Windows.exe) | Windows x64 | v1.4.0 正式包，内含 ffmpeg/ffprobe/deno |
 | [macOS ZIP](https://github.com/Jqsfree/youtube_down/releases/download/v1.4.0/YouTubeDownloader-macOS.zip) | Apple Silicon | v1.4.0 正式包，内含 ffmpeg/ffprobe/deno |
-| 源码运行 | Python 3.12+，Windows/macOS/Linux | 需要自行准备运行依赖及 ffmpeg/ffprobe；Linux 未提供正式安装包 |
+| 源码运行 | Python 3.12+，Windows/macOS；Linux 可尝试 | 需自行准备运行依赖及 ffmpeg/ffprobe；Linux 尚无正式安装包或本仓库原生交付验收 |
 
 完整发布资产与摘要见 [Releases](https://github.com/Jqsfree/youtube_down/releases)；校验文件为 [SHA256SUMS.txt](https://github.com/Jqsfree/youtube_down/releases/download/v1.4.0/SHA256SUMS.txt)。当前不提供 Intel Mac、Windows ARM 或 Linux 的对应正式安装包。macOS 包未经 Apple Developer ID 公证，首次打开可能需要通过系统安全设置手动允许。
 
