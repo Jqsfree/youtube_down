@@ -1,6 +1,6 @@
 # v1.5.0 发布放行清单
 
-状态：**待验收**，版本源码准备于 2026-11-05。此文档是发布操作记录，不表示正式发布。
+状态：**已生成 Draft，但真实下载验收未通过；禁止公开发布**。2026-11-05，v1.5.0 标签为 `26c6e7a4dfeccab7599dc3ac0892c63d232ad24c`；后续修复转入 v1.5.1，不覆盖原有 tag/资产。
 
 ## 范围与版本一致性
 
@@ -8,6 +8,13 @@
 - 版本来源：`VERSION`、`pyproject.toml`、`uv.lock` 的项目版本均为 1.5.0；`CHANGELOG.md` 存在 `## [1.5.0]`。
 - 依赖及工具版本保持锁定，未因本次改版升级外部 yt-dlp、PyInstaller 或 ffmpeg。
 - 只有新的 `v1.5.0` tag 指向完成审核的提交后，tag 构建工作流才会生成双平台资产与 **Draft Release**；草稿不应被描述为已经发布。
+
+## 已执行证据（2026-11-05）
+
+- [主分支 CI](https://github.com/Jqsfree/youtube_down/actions/runs/41981395497)：Windows/macOS 离线测试通过。
+- [v1.5.0 构建工作流](https://github.com/Jqsfree/youtube_down/actions/runs/41981645668)：Windows/macOS 包、工具验证、原生安装替换/回滚通过；创建 5 个资产的 Draft Release。
+- [实际 YouTube E2E](https://github.com/Jqsfree/youtube_down/actions/runs/41982042086)：**Windows 未通过**，非 UTF-8 控制台中文输出触发 UnicodeEncodeError，并导致临时日志句柄占用；**macOS 未通过**，公网 runner 遭遇 bot/限流，未成功写入媒体。两项均不得标记通过。
+- 该 Draft 不作为最新正式安装包，正式发布仍为 v1.4.0。按项目策略，修复转入 v1.5.1。
 
 ## 放行检查
 
