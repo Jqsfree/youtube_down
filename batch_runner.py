@@ -164,6 +164,11 @@ def parallel_workers(requested: int, browser_only: bool = False) -> int:
     return 1 if browser_only else max(1, requested)
 
 
+def is_bot_or_rate_failure(row: dict[str, str]) -> bool:
+    """Keep GUI and CLI bot/rate cutoff classification aligned."""
+    return (row.get("error_category") or "") in {"BOT_VERIFICATION", "RATE_LIMIT"}
+
+
 class CompletionPool:
     """Own bounded execution and completion metadata for both entry points."""
     def __init__(self, max_workers: int, pool_factory=None, completed=None):
