@@ -1468,7 +1468,15 @@ class MainWindow(QMainWindow):
         self._log(f"暴力下载={'开' if brutal else '关'}")
         if not self._csv_queue and self._csv_ids:
             self._csv_queue = [("batch", list(self._csv_ids), None, {})]
-        self._overview = OverviewStore(output_dir)
+        try:
+            self._overview = OverviewStore(output_dir)
+        except (OSError, ValueError) as exc:
+            self._log(f"无法读取下载总览: {exc}")
+            QMessageBox.critical(
+                self, "下载总览不可用",
+                f"无法读取历史下载总览，已停止本次下载以保护原文件：\\n{exc}",
+            )
+            return
         self._start_queue(AUTO_FORMAT_ID, output_dir, min_height, strict_quality, brutal)
 
     def _start_queue(
