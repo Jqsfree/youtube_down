@@ -21,6 +21,9 @@ class FakeEngine:
     def get_info(self, source, **_kwargs):
         return {"title": source, "_platform": "generic", "formats": []}
 
+    def list_formats(self, **_kwargs):
+        return []
+
     def download(self, **kwargs):
         path = kwargs["output_dir"] / "test.mp4"
         path.write_bytes(b"valid fake placeholder")
