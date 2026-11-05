@@ -23,6 +23,6 @@ jobs:
           set -euo pipefail
           CURRENT="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
           test "$CURRENT" = "$RELEASE_SHA" || { echo "main has changed, refusing to run E2E for stale release"; exit 1; }
-          gh workflow run real-download.yml --ref main \
+          gh workflow run real-download.yml -R Jqsfree/youtube_down --ref main \
             -f "video_url=https://www.youtube.com/watch?v=O8G5Mkzhe4s"
           echo "E2E dispatched using a public NASA Goddard video; report actual result, not this dispatch success."
