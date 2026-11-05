@@ -1843,12 +1843,16 @@ class MainWindow(QMainWindow):
 
     def _show_history(self) -> None:
         """只读展示当前输出目录的 下载总览.csv。"""
-        rows = sorted(
-            OverviewStore(Path(self._output_input.text()).expanduser()).rows(),
-            key=lambda r: (
-                r["来源文件"], int(r["行号"]) if r["行号"].isdigit() else 0,
-            ),
-        )
+        try:
+            rows = sorted(
+                OverviewStore(Path(self._output_input.text()).expanduser()).rows(),
+                key=lambda r: (
+                    r["来源文件"], int(r["行号"]) if r["行号"].isdigit() else 0,
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "下载历史不可用", f"历史总览无法读取，原文件未修改：\\n{exc}")
+            return
         if not rows:
             QMessageBox.information(self, "下载历史", "当前输出目录还没有下载记录。")
             return
