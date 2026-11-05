@@ -4,7 +4,11 @@
 
 ## [Unreleased]
 
-### 下载体验与恢复（main，尚未发布）
+## [1.5.0] - 2026-11-05
+
+> 发布准备记录：此版本构建和原生安装验收以 GitHub Actions 和对应 Release 草稿为准；在草稿正式发布前，不视为已交付安装包。
+
+### 下载体验与恢复
 
 - CLI 新增 `--dry-run` JSON 下载计划，展示新下载与已有媒体复用，预览不创建输出目录或 Cookie 快照；播放列表展开可能联网。
 - CLI 续传媒体复用检查要求 ffprobe 返回有效正时长、正确音视频流与最低分辨率，防止只凭文件名/视频尺寸复用损坏文件；此项为轻量媒体探测，不是逐帧校验。
@@ -12,13 +16,13 @@
 ### 文档（2026-11-05）
 
 - 重构 README 为安装/快速开始/版本边界的用户入口；新增使用手册、故障排查、开发验收、架构与 Markdown 规范；修正 BUILD/AGENTS 与当前实现不一致的说明。
-- 明确区分 main 源码、正式 v1.4.0 安装包、离线回归、联网元数据测试、真实视频 E2E 和原生安装验收。
+- 明确区分源码与已发布安装包、离线回归、联网元数据测试、真实视频 E2E 和原生安装验收。
 
-### main 源码改进（2026-11-05；尚未打包发布）
+### 稳定性与工程修复
 
 - 修复总览损坏可能覆盖历史记录的问题；GUI/CLI 在总览不可读取时停止并提供可见错误（PR #6、#7）。
 - 修复 CLI 风控熔断时运行中/未开始任务的结果记录；显式定义 GUI/CLI 策略差异，增加 Qt 线程信号与独立真实下载验收入口（PR #7）。
-- 修复 Windows 子进程探测黑窗和 PyInstaller onefile 自更新重启环境；仍需对新安装包做原生验收（PR #5）。
+- 修复 Windows 子进程探测黑窗和 PyInstaller onefile 自更新重启环境；本次发布仍以原生安装验收为放行条件（PR #5）。
 
 
 ## [1.4.0] - 2026-10-30
@@ -129,3 +133,5 @@
 [1.3.0]: https://github.com/Jqsfree/youtube_down/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Jqsfree/youtube_down/compare/v1.1.6...v1.2.0
 [1.1.6]: https://github.com/Jqsfree/youtube_down/releases/tag/v1.1.6
+
+[1.5.0]: https://github.com/Jqsfree/youtube_down/compare/v1.4.0...v1.5.0

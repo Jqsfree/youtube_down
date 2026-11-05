@@ -35,12 +35,24 @@ def test_changelog_has_current_version_section() -> None:
     assert f"## [{_version()}]" in text, f"CHANGELOG.md 缺少 {_version()} 条目"
 
 
-def test_readme_links_point_at_current_version() -> None:
+def test_readme_links_point_to_one_not_future_release() -> None:
+    """The source version can lead the latest *published* install package.
+
+    Pointing install links at a not-yet-built release is a broken download.
+    During release preparation the README must explicitly disclose this gap.
+    """
     text = (ROOT / "README.md").read_text(encoding="utf-8")
     tags = set(re.findall(r"/releases/(?:tag|download)/v(\d+\.\d+\.\d+)", text))
-    assert tags, "README 里没有下载链接"
-    stale = {t for t in tags if t != _version()}
-    assert not stale, f"README 下载链接指向旧版本: {sorted(stale)}"
+    assert len(tags) == 1, f"README 下载链接版本不唯一: {sorted(tags)}"
+    linked = tags.pop()
+    current = _version()
+    parts = lambda value: tuple(int(p) for p in value.split("."))
+    assert parts(linked) <= parts(current), f"README 包版本不能超前源码: {linked} > {current}"
+    if linked != current:
+        assert f"v{linked}" in text and "最新**已发布安装包**" in text
+        assert f"**v{current}**" in text and "尚未" in text, (
+            "源码版本超前于发布包时，README 必须明确披露未发布状态"
+        )
 
 
 @pytest.mark.parametrize("name", ["YouTubeDownloader-Windows.exe", "YouTubeDownloader-macOS.zip"])
