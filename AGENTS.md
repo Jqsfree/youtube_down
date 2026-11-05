@@ -158,7 +158,7 @@ A result-write failure stops admission and propagates the original error; GUI en
 ## Documentation and release evidence
 
 - Apply [docs/documentation-style.md](docs/documentation-style.md). Each Markdown file has one owner/purpose; link rather than copy shared defaults and commands.
-- Distinguish main source, open PR, draft Release and published binaries. The latest published package is v1.4.0 as checked on 2026-11-05; newer main fixes are not yet inside it.
+- Distinguish main source, open PR, draft Release and published binaries. Read GitHub Releases and VERSION independently before claiming a binary release. A new VERSION or tag alone does not prove published assets or native acceptance.
 - On changes to CLI flags, GUI behavior, queue/results, Cookie security or packaging, update the relevant user/developer guide and CHANGELOG [Unreleased].
 - Never call offline CI a real video download acceptance. For live downloads use the manual `.github/workflows/real-download.yml` and report its actual run ID and outcomes. Windows auto-update requires native installation exercise.
 - Review doc links, code-fence platforms, commands, security disclosure and version status before merging documentation PRs.
