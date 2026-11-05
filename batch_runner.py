@@ -166,7 +166,10 @@ def parallel_workers(requested: int, browser_only: bool = False) -> int:
 
 def is_bot_or_rate_failure(row: dict[str, str]) -> bool:
     """Keep GUI and CLI bot/rate cutoff classification aligned."""
-    return (row.get("error_category") or "") in {"BOT_VERIFICATION", "RATE_LIMIT"}
+    if (row.get("error_category") or "") in {"BOT_VERIFICATION", "RATE_LIMIT"}:
+        return True
+    message = (row.get("error_message") or "").lower()
+    return "not a bot" in message or "captcha" in message
 
 
 class CompletionPool:
@@ -805,11 +808,7 @@ class BatchRunnerCore:
 
     @staticmethod
     def _is_bot_or_rate(row: dict[str, str]) -> bool:
-        cat = row.get("error_category") or ""
-        if cat in {"BOT_VERIFICATION", "RATE_LIMIT"}:
-            return True
-        err = (row.get("error_message") or "").lower()
-        return "not a bot" in err or "captcha" in err
+        return is_bot_or_rate_failure(row)
 
     def _run_sequential(
         self,
