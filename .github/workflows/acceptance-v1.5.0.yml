@@ -1,0 +1,28 @@
+name: v1.5.0 live download acceptance dispatch (one-time)
+on:
+  push:
+    branches:
+      - release-cut/v1.5.0-20261105
+    paths:
+      - .github/workflows/acceptance-v1.5.0.yml
+permissions:
+  contents: read
+  actions: write
+jobs:
+  dispatch:
+    if: github.repository == 'Jqsfree/youtube_down'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: 26c6e7a4dfeccab7599dc3ac0892c63d232ad24c
+    steps:
+      - name: Require unchanged release source and dispatch Windows/macOS E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$CURRENT" = "$RELEASE_SHA" || { echo "main has changed, refusing to run E2E for stale release"; exit 1; }
+          gh workflow run real-download.yml --ref main \
+            -f "video_url=https://www.youtube.com/watch?v=O8G5Mkzhe4s"
+          echo "E2E dispatched using a public NASA Goddard video; report actual result, not this dispatch success."
