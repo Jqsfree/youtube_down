@@ -56,6 +56,7 @@ from downloader import (
     looks_like_playlist,
     proxy_reachable,
 )
+from media_probe import valid_resume_media
 from private_files import private_directory
 from logger_utils import AppLogger, redact
 import batch_runner as batch_ops
@@ -146,20 +147,10 @@ def collect_completed_files(
         for path in folder.iterdir():
             if path.suffix.lower() not in exts or path.stat().st_size <= 1024:
                 continue
-            if audio_only:
-                ok, out = _run_probe(
-                    ["-v", "quiet", "-show_entries", "format=duration",
-                     "-of", "csv=p=0", str(path)],
-                    timeout=10,
-                )
-                if not ok or not out.strip():
-                    continue
-            else:
-                short = _probe_short_side(path)
-                if short is None:
-                    continue
-                if min_height > 0 and short < min_height:
-                    continue
+            if not valid_resume_media(
+                path, audio_only=audio_only, min_height=min_height,
+            ):
+                continue
             done.setdefault(path.stem, path)
             done.setdefault(media_id_from_stem(path.stem), path)
     return done
@@ -459,6 +450,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="输出根目录（镜像输入层级，并写入 下载总览.csv）",
     )
     parser.add_argument(
+        "--dry-run", action="store_true",
+        help="只预览任务/现有文件，不下载、不写总览或读取 Cookie（播放列表展开可能联网）",
+    )
+    parser.add_argument(
         "--input-root",
         type=Path,
         default=None,
@@ -616,8 +611,81 @@ def _resolve_cookiefile(
     return dest
 
 
+def preview_plan(args: argparse.Namespace) -> int:
+    """Non-mutating plan: reuse input parsing and existing-media validation.
+
+    URL playlists may still require extraction to discover entries.
+    No output directories, cookie snapshots, download logs or overview writes.
+    """
+    output_dir = args.output_dir.expanduser().resolve()
+    try:
+        jobs, duplicates = _iter_sources(args, output_dir)
+        overview = OverviewStore(output_dir)
+    except (OSError, ValueError) as exc:
+        _print(f"预览失败，原文件未修改: {clean_error(exc)}", file=sys.stderr)
+        return 2
+    if not jobs and not duplicates:
+        _print("没有可下载的视频", file=sys.stderr)
+        return 2
+
+    existing_cache: dict[tuple[Path, int], dict[str, Path]] = {}
+
+    def existing(folder: Path, floor: int) -> dict[str, Path]:
+        key = (folder, floor)
+        if key not in existing_cache:
+            existing_cache[key] = collect_completed_files(
+                folder, min_height=floor, audio_only=args.audio,
+            )
+        return existing_cache[key]
+
+    planned = []
+    for job in jobs:
+        found = None
+        if not args.no_skip_existing:
+            floor = 0 if _is_generic_source(job.src) else args.min_height
+            found = existing(job.out_dir, floor).get(job.media_id) or existing(
+                output_dir, floor,
+            ).get(job.media_id)
+        planned.append({
+            "source": job.source,
+            "row_no": job.row_no,
+            "media_id": job.media_id,
+            "output_dir": str(job.out_dir),
+            "action": "reuse" if found else "download",
+            "existing_file": str(found) if found else "",
+            "previous_status": overview.status_of(job.source, job.media_id),
+        })
+    for job in duplicates:
+        planned.append({
+            "source": job.source,
+            "row_no": job.row_no,
+            "media_id": job.media_id,
+            "output_dir": str(job.out_dir),
+            "action": "duplicate",
+            "existing_file": "",
+            "previous_status": overview.status_of(job.source, job.media_id),
+        })
+    summary = {
+        "total": len(planned),
+        "download": sum(p["action"] == "download" for p in planned),
+        "reuse": sum(p["action"] == "reuse" for p in planned),
+        "duplicates": len(duplicates),
+        "jobs": planned,
+    }
+    # Structured CLI output is intentionally not passed as one blob to redact():
+    # that logger policy suppresses whole JSON objects. Redact user paths one field
+    # at a time so that the plan stays parseable without leaking credentials.
+    for entry in summary["jobs"]:
+        for key in ("source", "media_id", "output_dir", "existing_file", "previous_status"):
+            entry[key] = redact(str(entry[key]))
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.dry_run:
+        return preview_plan(args)
     log_root = (args.results_dir or args.output_dir).expanduser().resolve()
     AppLogger.attach_file(log_root / "youtube_downloader.log")
     AppLogger.start_session("CLI")

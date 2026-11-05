@@ -1,5 +1,7 @@
 """Tool lookup, ffprobe execution and media verification; no UI dependencies."""
 from __future__ import annotations
+import json
+import math
 import os
 import sys
 import shutil
@@ -78,6 +80,53 @@ def run_probe(args: list[str], timeout: float = 30, executable: str | None = Non
     except (OSError, subprocess.TimeoutExpired):
         return False, ""
     return True, result.stdout or ""
+
+
+def valid_resume_media(
+    path: Path,
+    *,
+    audio_only: bool = False,
+    min_height: int = 0,
+    probe: Callable | None = None,
+) -> bool:
+    """Single-probe validation for reusing a previously downloaded file.
+
+    A filename and resolution alone cannot establish successful completion.
+    Require a positive finite container duration and the requested stream.
+    This remains a lightweight check, not a full decode of every media frame.
+    """
+    probe = probe or run_probe
+    try:
+        if not path.is_file() or path.stat().st_size <= 1024:
+            return False
+        ok, output = probe(
+            [
+                "-v", "error", "-show_entries",
+                "format=duration:stream=codec_type,width,height",
+                "-of", "json", str(path),
+            ],
+            timeout=10,
+        )
+        if not ok:
+            return False
+        info = json.loads(output)
+        duration = float(info.get("format", {}).get("duration", 0))
+        if not math.isfinite(duration) or duration <= 0:
+            return False
+        streams = info.get("streams") or []
+        required = "audio" if audio_only else "video"
+        for stream in streams:
+            if not isinstance(stream, dict) or stream.get("codec_type") != required:
+                continue
+            if audio_only:
+                return True
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            if width > 0 and height > 0 and min(width, height) >= min_height:
+                return True
+    except (OSError, ValueError, TypeError, OverflowError, AttributeError, KeyError):
+        return False
+    return False
 
 
 def has_video_stream(path: Path, probe: Callable | None = None) -> bool:

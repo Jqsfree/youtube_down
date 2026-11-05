@@ -19,6 +19,17 @@
 
 可用选项及可下载清晰度取决于视频与平台；`浏览器指纹（实验）` 仅影响信息提取。
 
+## CLI 下载前预览（main 新功能）
+
+对批量输入先生成计划，核对待下载、复用已有文件和重复来源，再开始真实下载：
+
+~~~bash
+uv run --no-sync python -m download_cli --dry-run -o ./out ./inputs/
+uv run --no-sync python -m download_cli -o ./out ./inputs/
+~~~
+
+`--dry-run` 输出 JSON，包括每条任务的 `source`、`media_id`、`action`（`download` / `reuse` / `duplicate`）、输出路径和历史状态；它不会创建输出目录、更新总览、下载媒体或读取 Cookie。**播放列表/频道 URL 的展开可能联网**，预览并非绝对离线；本地已有媒体的检查可能运行 ffprobe。预览的 `reuse` 只表示现有文件通过轻量探测，不是完整帧解码或内容哈希认证。大批量任务先用小样本验证输出布局。
+
 ## CLI 常用命令
 
 所有示例均从仓库根目录执行。使用有权下载的媒体 URL，不要直接把示例 ID 当成稳定的网络验收素材。
