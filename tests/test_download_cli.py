@@ -299,6 +299,17 @@ def test_cli_bot_cutoff_records_running_and_unstarted_jobs(tmp_path, monkeypatch
 
     monkeypatch.setattr(download_cli, "AdaptivePacer", NoWaitPacer)
     running_started = threading.Event()
+    allow_running_to_finish = threading.Event()
+    original_cancel_pending = download_cli.CompletionPool.cancel_pending
+
+    def release_running_then_cancel(self):
+        # Force the running job to complete only after the cutoff is observed.
+        allow_running_to_finish.set()
+        return original_cancel_pending(self)
+
+    monkeypatch.setattr(
+        download_cli.CompletionPool, "cancel_pending", release_running_then_cancel,
+    )
     called = []
 
     def fake_download(source, output_dir, *a, **kw):
@@ -310,6 +321,7 @@ def test_cli_bot_cutoff_records_running_and_unstarted_jobs(tmp_path, monkeypatch
                 "error_message": "not a bot", "path": "",
             }
         running_started.set()
+        assert allow_running_to_finish.wait(3)
         return {
             "status": "success", "error_category": "SUCCESS",
             "error_message": "", "path": str(tmp_path / "running.mp4"),
