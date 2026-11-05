@@ -1,4 +1,6 @@
-# YouTube Downloader — 构建与架构笔记
+# 构建、依赖与发布
+
+> 本文件仅维护**构建和发布工艺**；当前架构/策略以 [docs/architecture.md](docs/architecture.md) 为准，开发测试以 [docs/development.md](docs/development.md) 为准。正式安装包 v1.4.0 不包含 2026-11-05 合入 main 的后续修复；不得混淆源码与 Release。
 
 ## 技术栈
 
@@ -8,17 +10,20 @@
 | 下载核心 | yt-dlp | 活跃维护，YouTube/Bilibili/TikTok 适配快 |
 | 音视频合并 | ffmpeg | yt-dlp 直接调用；ffprobe 用于下载后校验 |
 | 后台线程 | QThread | 信号/槽更新 GUI |
-| 打包 | PyInstaller | 单文件分发 |
+| 打包 | PyInstaller | Windows onefile；macOS onedir/.app |
 | CI/CD | GitHub Actions | Windows + macOS 构建并发布 Release |
 
 ## 分层
 
 ```
-gui.py + theme.py       ← 纯 UI / QSS，不 import yt_dlp
-    ↓
-worker.py               ← QThread，Qt Signal 连接两端
-    ↓
-platforms/ + downloader.py + batch_io.py   ← 纯逻辑，不 import PySide6
+gui.py / theme.py                 download_cli.py
+    ↓                                  ↓
+worker.py (QThread/Signals)            │
+    ↓                                  │
+    └──────── batch_runner.py ─────────┘
+                     ↓
+downloader.py / platforms/* / batch_io.py
+   ↳ cookies.py / media_probe.py / download_errors.py
 ```
 
 `downloader.py` 与平台插件可被 CLI / Web 复用；单元测试不需要显示服务器。
@@ -26,12 +31,12 @@ platforms/ + downloader.py + batch_io.py   ← 纯逻辑，不 import PySide6
 ## 两阶段 Cookie 策略
 
 ```
-Stage 1: 无 Cookie 下载 —— 99% 公开视频直接成功
+Stage 1: 先不使用 Cookie；可下载性由平台与视频决定
 Stage 2: 仅对 BOT_VERIFICATION / AUTH_REQUIRED / PRIVATE_VIDEO
          用浏览器 Cookie 重试
 ```
 
-若浏览器 Cookie 读取失败（如「copy chrome cookie」错误），本次会话跳过后续所有 Cookie 尝试。
+若浏览器 Cookie 读取失败（如「copy chrome cookie」错误），程序会标记浏览器 Cookie 来源异常，避免同会话重复无效读取；显式 Cookie 文件与浏览器 Cookie 的处理有区别。参见 [使用手册](docs/usage.md)。
 
 ## 活动下载队列
 
@@ -83,7 +88,8 @@ youtube_down/
 ├── assets/                 # 图标（svg 源 + png/ico/icns 产物）
 ├── scripts/                # 诊断、压力测试与图标生成脚本
 ├── tests/                  # 单元测试
-├── smoke_test.py           # CI 冒烟测试
+├── smoke_test.py           # 联网元数据冒烟（get_info）
+├── scripts/real_download_smoke.py  # 手动真实下载 E2E
 └── .github/workflows/build.yml
 ```
 
@@ -185,7 +191,8 @@ exe 仍被占用导致脚本替换失败。
 ### CI 与草稿发布
 
 - `ci.yml`：PR、main 普通提交和手动触发，仅运行离线测试与版本/依赖同步检查。安装依赖需要访问包源，“离线”指测试不请求真实站点。
-- `smoke.yml`：每日 UTC 03:17 或手动触发，独立运行现有 YouTube 联网冒烟；不创建发布。
+- `smoke.yml`：每日 UTC 03:17 或手动触发，仅测试 YouTube `get_info`；不创建发布。
+- `real-download.yml`：**手动触发**真实下载、媒体时长、总览与续传验收；与普通 CI 分离，须提供获授权公开短视频 URL。
 - `build.yml`：推送 `vX.Y.Z` tag 后构建双平台产物并创建草稿；手动运行默认只构建。手动创建草稿必须填写已存在的 tag 并显式勾选 `create_draft`。
 - tag、VERSION、pyproject 必须一致；手动传入 tag 时 checkout 该 tag，提交必须与 tag 指向一致。普通检查/构建只读，只有 release job 有 contents:write。
 - 发布前重新校验两平台安装包摘要及构建记录，生成合并清单。已有相同 tag 的正式发布或草稿均拒绝覆盖；中断或失败后使用新补丁版本恢复，不修改历史资产。
@@ -254,3 +261,9 @@ Windows 另检验私有目录 ACL 与占用重试。tag 构建默认执行该检
 Windows 私有目录先在新建空目录执行 `icacls /reset`，再去除继承并授予当前 SID，
 避免 mkdtemp 的显式 OWNER/SYSTEM/Administrators ACE 残留。只处理新目录；
 [/reset 的语义见 Microsoft 文档](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls)。
+
+## 文档与维护入口
+
+- [用户快速开始](README.md) · [使用说明](docs/usage.md) · [故障排查](docs/troubleshooting.md)
+- [开发与分层测试](docs/development.md) · [当前架构](docs/architecture.md) · [Agent 规则](AGENTS.md)
+- [文档编写规范](docs/documentation-style.md) · [历史工程实施记录](docs/architecture-plan.md)
