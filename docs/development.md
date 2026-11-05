@@ -6,7 +6,7 @@
 
 - Python 3.12+、[uv](https://docs.astral.sh/uv/)、Git；需要本机可以运行的 ffmpeg、ffprobe。部分 YouTube 场景还需要 deno。
 - Windows/macOS 生产安装包包含媒体工具；源码环境与打包环境不能互相替代验收。
-- Ubuntu/Linux 可源码运行，但当前无正式 Linux 发布资产。
+- Ubuntu/Linux 可尝试源码运行，但当前无正式 Linux 发布资产，也未建立 Linux 交付验收。
 
 ~~~bash
 git clone https://github.com/Jqsfree/youtube_down.git
