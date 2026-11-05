@@ -1,0 +1,26 @@
+name: Verify v1.5.1 live download in GitHub runners (one-time)
+on:
+  push:
+    branches:
+      - release-cut/v1.5.1-20261105
+    paths:
+      - .github/workflows/live-v1.5.1.yml
+permissions:
+  contents: read
+  actions: write
+jobs:
+  dispatch:
+    if: github.repository == 'Jqsfree/youtube_down'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify main and dispatch public short video test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')" = "482edd9c030895261e6fe83c487524da393d08a8"
+          gh workflow run real-download.yml -R Jqsfree/youtube_down --ref main \
+            -f "video_url=https://www.youtube.com/watch?v=O8G5Mkzhe4s"
+          echo "Dispatched live E2E. Check both jobs; dispatch success is not download success."
