@@ -5,6 +5,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -37,6 +38,19 @@ _GUI_SLEEP_MAX = 4.0
 DownloaderFacade = YoutubeDownloader
 
 AUTO_FORMAT_ID = "auto"
+
+
+@dataclass(frozen=True)
+class DownloadPolicy:
+    """Explicitly document intentional GUI/CLI behavior differences."""
+    name: str
+    cookie_mode: str
+    format_mode: str
+    rate_backoff_seconds: tuple[int, ...]
+
+
+GUI_POLICY = DownloadPolicy("gui", "two_stage", "resolution", (4, 8))
+CLI_POLICY = DownloadPolicy("cli", "explicit_only", "best", (10,))
 
 
 def _media_stem(source: str) -> str:
@@ -533,8 +547,7 @@ class BatchRunnerCore:
         except Exception as exc:
             cat = classify_error(exc)
             if cat.code == "RATE_LIMIT":
-                for attempt in range(2):
-                    wait = 2 ** (attempt + 2)
+                for wait in GUI_POLICY.rate_backoff_seconds:
                     self._notify("status_changed", f"限流，{wait}s 后重试...")
                     time.sleep(wait)
                     if self._is_cancelled():
@@ -1305,8 +1318,8 @@ def download_direct_item(
                 return direct_result(video_id, output_dir, "skipped", "SKIPPED", msg)
             if "requested format is not available" in msg.lower():
                 return direct_result(video_id, output_dir, "skipped", "SKIPPED", msg)
-            if cat.code == "RATE_LIMIT" and attempt == 0:
-                time.sleep(10)
+            if cat.code == "RATE_LIMIT" and attempt < len(CLI_POLICY.rate_backoff_seconds):
+                time.sleep(CLI_POLICY.rate_backoff_seconds[attempt])
                 continue
             return direct_result(
                 video_id, output_dir,
