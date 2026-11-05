@@ -18,6 +18,9 @@ _RESOURCE_DIRS: dict[str, list[str]] = {
 
 FFPROBE_UNAVAILABLE = "ffprobe 不可用：请安装 ffmpeg/ffprobe 或放入 resources/ffmpeg/"
 
+# windowed 打包的程序每次 spawn 控制台子进程都会弹出一个黑窗；ffprobe 每次下载要跑多次
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".flv")
 
 AUDIO_EXTS = (".m4a", ".mp3", ".opus", ".flac", ".wav")
@@ -70,6 +73,7 @@ def run_probe(args: list[str], timeout: float = 30, executable: str | None = Non
             capture_output=True,
             text=True,
             timeout=timeout,
+            creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False, ""
