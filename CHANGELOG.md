@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-11-05
+
+> v1.5.1 已形成独立 Draft，但真实 Windows E2E 发现 `pacing.py` 直接 `print()` 时仍可能触发 CP1252 UnicodeEncodeError。不得修改既有 v1.5.1 标签或安装包。
+
+- CLI 入口统一配置 stdout/stderr 的不可表示字符回退行为，覆盖 `pacing.py` 等公共模块的直接输出，避免仅修复 CLI 自己的 `_print`。
+- 新增 Windows CP1252 环境下风控退避消息及 stderr 的离线回归，证明共享模块输出不会导致下载任务异常中断。
+- 真实 YouTube 下载仍受 GitHub runner 的 bot/限流影响；未获取真实成功媒体和续传证据前不公开发布。
+
+
 ## [1.5.1] - 2026-11-05
 
 > v1.5.0 草稿在真实联网验收中暴露 Windows CP1252 CLI 输出异常；不得覆盖 v1.5.0 原标签或草稿。本补丁候选需重新构建验收。
@@ -147,3 +156,4 @@
 
 [1.5.0]: https://github.com/Jqsfree/youtube_down/compare/v1.4.0...v1.5.0
 [1.5.1]: https://github.com/Jqsfree/youtube_down/compare/v1.5.0...v1.5.1
+[1.5.2]: https://github.com/Jqsfree/youtube_down/compare/v1.5.1...v1.5.2
