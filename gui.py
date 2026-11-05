@@ -1468,7 +1468,15 @@ class MainWindow(QMainWindow):
         self._log(f"暴力下载={'开' if brutal else '关'}")
         if not self._csv_queue and self._csv_ids:
             self._csv_queue = [("batch", list(self._csv_ids), None, {})]
-        self._overview = OverviewStore(output_dir)
+        try:
+            self._overview = OverviewStore(output_dir)
+        except (OSError, ValueError) as exc:
+            self._log(f"无法读取下载总览: {exc}")
+            QMessageBox.critical(
+                self, "下载总览不可用",
+                f"无法读取历史下载总览，已停止本次下载以保护原文件：\\n{exc}",
+            )
+            return
         self._start_queue(AUTO_FORMAT_ID, output_dir, min_height, strict_quality, brutal)
 
     def _start_queue(
@@ -1835,12 +1843,16 @@ class MainWindow(QMainWindow):
 
     def _show_history(self) -> None:
         """只读展示当前输出目录的 下载总览.csv。"""
-        rows = sorted(
-            OverviewStore(Path(self._output_input.text()).expanduser()).rows(),
-            key=lambda r: (
-                r["来源文件"], int(r["行号"]) if r["行号"].isdigit() else 0,
-            ),
-        )
+        try:
+            rows = sorted(
+                OverviewStore(Path(self._output_input.text()).expanduser()).rows(),
+                key=lambda r: (
+                    r["来源文件"], int(r["行号"]) if r["行号"].isdigit() else 0,
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "下载历史不可用", f"历史总览无法读取，原文件未修改：\\n{exc}")
+            return
         if not rows:
             QMessageBox.information(self, "下载历史", "当前输出目录还没有下载记录。")
             return

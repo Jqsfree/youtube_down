@@ -269,3 +269,92 @@ def test_keyboard_interrupt_returns_cancel_status_not_success(tmp_path, monkeypa
     monkeypatch.setattr(download_cli,'CompletionPool',InterruptedPool)
     assert download_cli.main([])==130
     assert '完成 success=' not in capsys.readouterr().out
+
+
+def test_cli_bot_cutoff_records_running_and_unstarted_jobs(tmp_path, monkeypatch):
+    """Cutoff must not silently lose outcomes from running or waiting jobs."""
+    import threading
+    import download_cli
+    from batch_io import OverviewStore
+
+    args = download_cli.parse_args([
+        "unused", "-o", str(tmp_path), "--workers", "2",
+        "--no-auto-recover", "--proxy-check-url", "",
+    ])
+    monkeypatch.setattr(download_cli, "parse_args", lambda argv: args)
+    jobs = [
+        download_cli.Job(f"https://example.com/{name}.mp4", "paste", i, tmp_path)
+        for i, name in enumerate(("bot", "running", "notstarted"), start=1)
+    ]
+    monkeypatch.setattr(download_cli, "_iter_sources", lambda *a: (jobs, []))
+    monkeypatch.setattr(download_cli, "collect_completed_files", lambda *a, **k: {})
+    monkeypatch.setattr(download_cli, "BOT_STREAK_LIMIT", 1)
+
+    class NoWaitPacer:
+        def __init__(self, *a): pass
+        def on_success(self): pass
+        def on_skip(self): pass
+        def on_bot_or_rate_limit(self): pass
+        def wait(self): pass
+
+    monkeypatch.setattr(download_cli, "AdaptivePacer", NoWaitPacer)
+    running_started = threading.Event()
+    allow_running_to_finish = threading.Event()
+    original_cancel_pending = download_cli.CompletionPool.cancel_pending
+
+    def release_running_then_cancel(self):
+        # Force the running job to complete only after the cutoff is observed.
+        allow_running_to_finish.set()
+        return original_cancel_pending(self)
+
+    monkeypatch.setattr(
+        download_cli.CompletionPool, "cancel_pending", release_running_then_cancel,
+    )
+    called = []
+
+    def fake_download(source, output_dir, *a, **kw):
+        called.append(source)
+        if source.endswith("/bot.mp4"):
+            assert running_started.wait(3)
+            return {
+                "status": "failed", "error_category": "BOT_VERIFICATION",
+                "error_message": "not a bot", "path": "",
+            }
+        running_started.set()
+        assert allow_running_to_finish.wait(3)
+        return {
+            "status": "success", "error_category": "SUCCESS",
+            "error_message": "", "path": str(tmp_path / "running.mp4"),
+        }
+
+    monkeypatch.setattr(download_cli, "_download_one", fake_download)
+    assert download_cli.main([]) == 1
+    rows = {row["video_id"]: row for row in OverviewStore(tmp_path).rows()}
+    assert len(rows) == 3
+    assert rows[jobs[0].media_id]["状态"] == "失败"
+    assert rows[jobs[1].media_id]["状态"] == "成功"
+    assert rows[jobs[2].media_id]["状态"] == "跳过"
+    assert len(called) == 2
+
+
+def test_cli_refuses_damaged_overview_before_download(tmp_path, monkeypatch):
+    import download_cli
+    from batch_io import OVERVIEW_NAME
+
+    original = b"bad,data\\nvalue\\n"
+    (tmp_path / OVERVIEW_NAME).write_bytes(original)
+    args = download_cli.parse_args([
+        "unused", "-o", str(tmp_path), "--proxy-check-url", "",
+    ])
+    monkeypatch.setattr(download_cli, "parse_args", lambda argv: args)
+    monkeypatch.setattr(
+        download_cli, "_iter_sources",
+        lambda *a: ([download_cli.Job(
+            "https://example.com/a.mp4", "paste", 1, tmp_path,
+        )], []),
+    )
+    monkeypatch.setattr(download_cli, "_download_one", lambda *a, **k: (
+        (_ for _ in ()).throw(AssertionError("download must not start"))
+    ))
+    assert download_cli.main([]) == 2
+    assert (tmp_path / OVERVIEW_NAME).read_bytes() == original

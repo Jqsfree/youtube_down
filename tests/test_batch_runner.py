@@ -338,3 +338,15 @@ def test_browser_lock_failure_in_clone_is_remembered_for_batch(tmp_path,monkeypa
     r._process_one_video_brutal(1,'bbbbbbbbbbb',2)
     assert browser_reads==[True]
     assert dl._browser_cookie_broken
+
+
+def test_frontend_policies_are_explicit_and_preserve_retry_contract():
+    from batch_runner import CLI_POLICY, GUI_POLICY
+    assert GUI_POLICY.name == "gui"
+    assert GUI_POLICY.cookie_mode == "two_stage"
+    assert GUI_POLICY.format_mode == "resolution"
+    assert GUI_POLICY.rate_backoff_seconds == (4, 8)
+    assert CLI_POLICY.name == "cli"
+    assert CLI_POLICY.cookie_mode == "explicit_only"
+    assert CLI_POLICY.format_mode == "best"
+    assert CLI_POLICY.rate_backoff_seconds == (10,)

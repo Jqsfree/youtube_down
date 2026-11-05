@@ -1,0 +1,37 @@
+name: Real download acceptance (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Public short test video URL (no credentials)"
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  real-download:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+          - os: macos-latest
+            platform: macOS
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.12.8'
+      - run: uv sync --locked
+      - run: uv run --no-sync python scripts/build_tools.py install --platform ${{ matrix.platform }}
+      - name: Download, verify and resume
+        env:
+          TEST_VIDEO_URL: ${{ inputs.video_url }}
+        run: uv run --no-sync python -m scripts.real_download_smoke --url "$TEST_VIDEO_URL"
+        shell: bash

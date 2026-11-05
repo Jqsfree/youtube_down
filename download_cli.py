@@ -664,7 +664,11 @@ def _run(args: argparse.Namespace) -> int:
         _print("没有可下载的视频", file=sys.stderr)
         return 2
 
-    overview = OverviewStore(output_dir)
+    try:
+        overview = OverviewStore(output_dir)
+    except (OSError, ValueError) as exc:
+        _print(f"无法读取下载总览，停止下载以保护历史文件: {exc}", file=sys.stderr)
+        return 2
     skip_n = 0
     for dup in duplicates:
         # 总览键为 (来源, video_id)，重复行无法单独成行；只计数并提示
@@ -825,11 +829,8 @@ def _run(args: argparse.Namespace) -> int:
                         job.out_dir, "failed", "UNKNOWN", clean_error(exc),
                     )
                 status = result["status"]
-                err = (result.get("error_message") or "").lower()
-                is_bot = (
-                    "not a bot" in err
-                    or result.get("error_category") == "BOT_VERIFICATION"
-                )
+                is_bot_or_rate = batch_ops.is_bot_or_rate_failure(result)
+                is_bot = is_bot_or_rate and result.get("error_category") != "RATE_LIMIT"
                 is_rate = result.get("error_category") == "RATE_LIMIT"
 
                 if status == "success":
@@ -901,7 +902,35 @@ def _run(args: argparse.Namespace) -> int:
                         "请换住宅节点、更新 cookies.txt，过几分钟后重跑同一命令续传。",
                         flush=True,
                     )
-                    pool.cancel_pending()
+                    # Wait for already-running jobs and record their real outcomes.
+                    # Only truly unstarted jobs receive a skipped/cutoff result.
+                    outstanding = list(pool.inflight.items())
+                    cancelled = pool.cancel_pending()
+                    remaining = list(pending_iter)
+                    for future, unfinished in outstanding:
+                        if unfinished in cancelled:
+                            continue
+                        try:
+                            outcome = future.result()
+                        except Exception as exc:
+                            outcome = _result(
+                                unfinished.media_id, unfinished.out_dir,
+                                "failed", "UNKNOWN", clean_error(exc),
+                            )
+                        _record(unfinished, outcome)
+                        done_n += 1
+                        if outcome["status"] == "success":
+                            ok += 1
+                        elif outcome["status"] == "skipped":
+                            skip_n += 1
+                        else:
+                            fail += 1
+                    for unfinished in cancelled + remaining:
+                        _record(unfinished, _result(
+                            unfinished.media_id, unfinished.out_dir, "skipped",
+                            "BOT_VERIFICATION", "风控熔断：未开始，重跑可继续",
+                        ))
+                        skip_n += 1
                     break
 
                 _maybe_refresh_cookies()
