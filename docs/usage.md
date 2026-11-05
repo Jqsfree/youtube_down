@@ -5,7 +5,7 @@
 ## 选择运行方式
 
 - 普通用户：下载 [Releases](https://github.com/Jqsfree/youtube_down/releases) 中与系统架构相符的正式安装包，启动 GUI。
-- 开发者或 Ubuntu 用户：Python 3.12+，从仓库根目录运行 `uv sync --locked`，准备 `ffmpeg`、`ffprobe`；使用 `uv run --no-sync python main.py` 打开 GUI，或用 `uv run --no-sync python -m download_cli -h` 查看 CLI 帮助。
+- 开发者或 Ubuntu 用户（Linux 源码运行尚未进行正式交付验收）：Python 3.12+，从仓库根目录运行 `uv sync --locked`，准备 `ffmpeg`、`ffprobe`；使用 `uv run --no-sync python main.py` 打开 GUI，或用 `uv run --no-sync python -m download_cli -h` 查看 CLI 帮助。
 - Windows 源码环境可运行 `powershell -ExecutionPolicy Bypass -File scripts\setup_dev.ps1` 准备媒体工具。正式安装包已内嵌 ffmpeg/ffprobe/deno。
 
 ## GUI 操作流程
