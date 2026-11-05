@@ -56,6 +56,7 @@ from downloader import (
     looks_like_playlist,
     proxy_reachable,
 )
+from media_probe import valid_resume_media
 from private_files import private_directory
 from logger_utils import AppLogger, redact
 import batch_runner as batch_ops
@@ -146,20 +147,10 @@ def collect_completed_files(
         for path in folder.iterdir():
             if path.suffix.lower() not in exts or path.stat().st_size <= 1024:
                 continue
-            if audio_only:
-                ok, out = _run_probe(
-                    ["-v", "quiet", "-show_entries", "format=duration",
-                     "-of", "csv=p=0", str(path)],
-                    timeout=10,
-                )
-                if not ok or not out.strip():
-                    continue
-            else:
-                short = _probe_short_side(path)
-                if short is None:
-                    continue
-                if min_height > 0 and short < min_height:
-                    continue
+            if not valid_resume_media(
+                path, audio_only=audio_only, min_height=min_height,
+            ):
+                continue
             done.setdefault(path.stem, path)
             done.setdefault(media_id_from_stem(path.stem), path)
     return done
