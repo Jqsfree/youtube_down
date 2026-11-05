@@ -1,0 +1,55 @@
+name: Cut v1.5.1 patch tag and dispatch draft build (one-time)
+on:
+  push:
+    branches:
+      - release-cut/v1.5.1-20261105
+    paths:
+      - .github/workflows/cut-v1.5.1.yml
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: cut-v1.5.1
+  cancel-in-progress: false
+jobs:
+  cut:
+    if: github.repository == 'Jqsfree/youtube_down'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: 482edd9c030895261e6fe83c487524da393d08a8
+      RELEASE_TAG: v1.5.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 482edd9c030895261e6fe83c487524da393d08a8
+          persist-credentials: false
+      - name: Verify exact source and green main CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$CURRENT" = "$RELEASE_SHA" || { echo 'Main changed. Not cutting release.' >&2; exit 1; }
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          python scripts/release_checks.py version --tag "$RELEASE_TAG"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/41983008970" --jq '.head_sha')" = "$RELEASE_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/41983008970" --jq '.conclusion')" = success
+      - name: Create immutable patch tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Tag already exists. Never replacing it.' >&2
+            exit 1
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA" >/dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')" = "$RELEASE_SHA"
+      - name: Dispatch verified Windows and macOS draft builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run build.yml -R Jqsfree/youtube_down --ref main \
+            -f "tag=$RELEASE_TAG" -f "check_install=true" -f "create_draft=true"
+          echo "$RELEASE_TAG source tagged; draft build requested (no automatic public publication)."
