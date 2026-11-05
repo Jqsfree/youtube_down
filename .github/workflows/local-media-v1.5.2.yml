@@ -1,4 +1,4 @@
-name: Local media test for v1.5.2
+name: Local media test for v1.5.2 (video and audio)
 on:
   push:
     branches:
