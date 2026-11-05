@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-11-05
+
+> v1.5.0 草稿在真实联网验收中暴露 Windows CP1252 CLI 输出异常；不得覆盖 v1.5.0 原标签或草稿。本补丁候选需重新构建验收。
+
+- 修复 Windows 非 UTF-8 控制台输出中文时的 `UnicodeEncodeError`：CLI 保留脱敏策略，对不可表示字符回退为反斜杠转义。
+- 结构化 `--dry-run` JSON 改为 ASCII-safe 输出，确保 Windows 旧控制台仍可读取和解析。
+- CLI 完成或发生异常时释放文件日志句柄，避免临时输出目录在 Windows 删除时发生文件占用。
+- 添加 Windows 兼容编码、日志生命周期及预览 JSON 的离线回归测试。
+- 限制：GitHub 公共 runner 可能因 YouTube bot/rate 风控无法完成联网下载验收；此时不能宣称真实下载已经通过。
+
+
 ## [1.5.0] - 2026-11-05
 
 > 发布准备记录：此版本构建和原生安装验收以 GitHub Actions 和对应 Release 草稿为准；在草稿正式发布前，不视为已交付安装包。
@@ -135,3 +146,4 @@
 [1.1.6]: https://github.com/Jqsfree/youtube_down/releases/tag/v1.1.6
 
 [1.5.0]: https://github.com/Jqsfree/youtube_down/compare/v1.4.0...v1.5.0
+[1.5.1]: https://github.com/Jqsfree/youtube_down/compare/v1.5.0...v1.5.1
