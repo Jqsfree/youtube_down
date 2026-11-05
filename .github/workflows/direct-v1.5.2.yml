@@ -1,0 +1,26 @@
+name: v1.5.2 public direct-MP4 smoke dispatch (one-time)
+on:
+  push:
+    branches:
+      - release-cut/v1.5.2-20261105
+    paths:
+      - .github/workflows/direct-v1.5.2.yml
+permissions:
+  contents: read
+  actions: write
+jobs:
+  dispatch:
+    if: github.repository == 'Jqsfree/youtube_down'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify main source SHA and dispatch direct-media transfer test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')" = "61a1f3f5811e62d4a7b228693f38b19e50dda542"
+          gh workflow run real-download.yml -R Jqsfree/youtube_down --ref main \
+            -f "video_url=https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4"
+          echo "Testing generic direct MP4 transfer, ffprobe, result persistence and resume. NOT a YouTube-specific acceptance."
