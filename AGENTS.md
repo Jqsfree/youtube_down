@@ -3,6 +3,11 @@
 Single source of truth for agent guidance in this repository. `CLAUDE.md` only
 points here — keep project docs in this file, not in per-agent copies.
 
+User-facing guidance belongs in [README](README.md), [usage](docs/usage.md) and
+[troubleshooting](docs/troubleshooting.md). Architecture is in [docs/architecture.md](docs/architecture.md);
+build/release details in [BUILD.md](BUILD.md); test commands in [docs/development.md](docs/development.md).
+Do not copy these guides into AGENTS.md.
+
 ## Commands
 
 ```bash
@@ -18,13 +23,10 @@ python -m pytest tests/ -v
 # Run a single test file
 python -m pytest tests/test_format_selection.py -v
 
-# Build Windows EXE (local, Linux — validation only)
-uv sync --locked --group build
-uv run --no-sync pyinstaller --onefile --windowed --name "YouTubeDownloader" \
-  --icon assets/icon.ico --add-data "assets:assets" --add-data "VERSION:." \
-  --hidden-import PySide6.QtCore --hidden-import PySide6.QtWidgets \
-  --hidden-import yt_dlp --hidden-import yt_dlp.extractor --hidden-import yt_dlp.downloader \
-  main.py
+# Build and release verification
+# Use .github/workflows/build.yml on native Windows/macOS runners.
+# BUILD.md documents local platform-specific packaging commands.
+# Do not treat a Linux PyInstaller run as a verified Windows executable.
 
 # Regenerate icon assets (png / ico / icns)
 python scripts/make_icon.py
@@ -60,7 +62,7 @@ Theme: `theme.py` (Light/Dark/Nord + accent) via `QSettings`; applied in `main.p
 
 ## Two-Stage Cookie Strategy (batch download)
 
-1. **Stage 1**: Download without cookies — works for 99% of public videos.
+1. **Stage 1**: Download without cookies — do not claim a success rate without measurement.
 2. **Stage 2**: Retry with browser cookies — only for 3 error types: `BOT_VERIFICATION`, `AUTH_REQUIRED`, `PRIVATE_VIDEO`.
 
 If a "copy chrome cookie" error occurs, `_cookie_broken` is set to `True` and all subsequent cookie attempts are skipped for the session.
@@ -152,3 +154,11 @@ Keep downloader function exports and YoutubeDownloader public methods as compati
 `batch_runner.BatchRunner` is the standalone Python runner. `BatchRunnerCore` has no constructor so the QThread adapter can inherit its business methods without duplicate QObject initialization; worker.py initializes it explicitly and maps callbacks to existing signals. CLI uses the same CompletionPool and direct-item core entry, keeping its existing best/explicit-cookie/10s retry/Clash policy distinct from GUI format resolution/two-stage-cookie/4-8s retry. Preserve existing result schemas.
 
 A result-write failure stops admission and propagates the original error; GUI ends in failure without 100% progress or starting another source group. Preserve downloaded files. Bot cutoff must drain and record accepted unstarted items before clearing the queue. Browser-only jobs are serialized even when added after pool creation. CLI KeyboardInterrupt returns 130. Register batch_runner in packaging and check it in frozen PYZ archives.
+
+## Documentation and release evidence
+
+- Apply [docs/documentation-style.md](docs/documentation-style.md). Each Markdown file has one owner/purpose; link rather than copy shared defaults and commands.
+- Distinguish main source, open PR, draft Release and published binaries. The latest published package is v1.4.0 as checked on 2026-11-05; newer main fixes are not yet inside it.
+- On changes to CLI flags, GUI behavior, queue/results, Cookie security or packaging, update the relevant user/developer guide and CHANGELOG [Unreleased].
+- Never call offline CI a real video download acceptance. For live downloads use the manual `.github/workflows/real-download.yml` and report its actual run ID and outcomes. Windows auto-update requires native installation exercise.
+- Review doc links, code-fence platforms, commands, security disclosure and version status before merging documentation PRs.
