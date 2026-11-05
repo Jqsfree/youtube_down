@@ -672,7 +672,13 @@ def preview_plan(args: argparse.Namespace) -> int:
         "duplicates": len(duplicates),
         "jobs": planned,
     }
-    _print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    # Structured CLI output is intentionally not passed as one blob to redact():
+    # that logger policy suppresses whole JSON objects. Redact user paths one field
+    # at a time so that the plan stays parseable without leaking credentials.
+    for entry in summary["jobs"]:
+        for key in ("source", "media_id", "output_dir", "existing_file", "previous_status"):
+            entry[key] = redact(str(entry[key]))
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return 0
 
 
