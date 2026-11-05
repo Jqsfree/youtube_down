@@ -63,6 +63,22 @@ import batch_runner as batch_ops
 from batch_runner import CompletionPool, parallel_workers
 from pacing import AdaptivePacer
 
+def _configure_cli_output_encoding() -> None:
+    """Prevent legacy Windows consoles from aborting on Unicode status text.
+
+    Keep the user's chosen encoding, but render unsupported characters as
+    backslash escapes. This covers output from shared policy modules as well
+    as the CLI's own redacted formatter.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        configure = getattr(stream, "reconfigure", None)
+        if callable(configure):
+            try:
+                configure(errors="backslashreplace")
+            except (OSError, ValueError, TypeError):
+                pass
+
+
 def _print(*args, **kwargs) -> None:
     """Redact CLI output and handle non-UTF-8 Windows consoles gracefully."""
     separator = kwargs.pop("sep", " ")
@@ -693,6 +709,7 @@ def preview_plan(args: argparse.Namespace) -> int:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    _configure_cli_output_encoding()
     args = parse_args(argv)
     if args.dry_run:
         return preview_plan(args)
