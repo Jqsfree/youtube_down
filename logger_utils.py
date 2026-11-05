@@ -122,6 +122,12 @@ class AppLogger:
         logger.addHandler(handler)
         return True
 
+    @classmethod
+    def close_file(cls) -> None:
+        """Close file-backed logs without dropping console/GUI log handlers."""
+        if cls._instance is not None:
+            cls._detach_files(cls._instance)
+
     @staticmethod
     def _detach_files(logger: logging.Logger) -> None:
         for old in list(logger.handlers):
