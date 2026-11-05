@@ -423,3 +423,41 @@ def test_preview_refuses_bad_history_without_overwriting(tmp_path, capsys):
         "--proxy-check-url", "",
     ]) == 2
     assert (out / OVERVIEW_NAME).read_bytes() == original
+
+
+def test_cli_closes_log_when_run_raises(tmp_path, monkeypatch):
+    import logging
+    import pytest
+    import download_cli
+    from logger_utils import AppLogger
+
+    def boom(_args):
+        raise RuntimeError("network failure")
+
+    monkeypatch.setattr(download_cli, "_run", boom)
+    try:
+        with pytest.raises(RuntimeError, match="network failure"):
+            download_cli.main(["-o", str(tmp_path), "AAA111aaaaa"])
+        assert not any(
+            isinstance(handler, logging.FileHandler)
+            for handler in AppLogger.get_logger().handlers
+        )
+        (tmp_path / "youtube_downloader.log").unlink()
+    finally:
+        AppLogger.clear_handlers()
+
+
+def test_cli_dry_run_json_on_cp1252_stdout(tmp_path, monkeypatch):
+    import io
+    import json
+    import sys
+    import download_cli
+
+    target = io.BytesIO()
+    stream = io.TextIOWrapper(target, encoding="cp1252", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert download_cli.main([
+        "--dry-run", "-o", str(tmp_path / "out"), "AAA111aaaaa",
+    ]) == 0
+    parsed = json.loads(target.getvalue().decode("cp1252"))
+    assert parsed["download"] == 1
