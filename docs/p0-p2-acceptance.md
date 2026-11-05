@@ -1,6 +1,16 @@
 # P0–P2 可靠性与验收记录
 
-日期：2026-11-05。基线：v1.4.0，PR #6 已合并；PR #5 为独立 Windows 修复。
+日期：2026-11-05。基线：正式发布 v1.4.0；main 已合并 [PR #5](https://github.com/Jqsfree/youtube_down/pull/5)、[PR #6](https://github.com/Jqsfree/youtube_down/pull/6)、[PR #7](https://github.com/Jqsfree/youtube_down/pull/7)，main SHA `37c16e87212a6d319898f9e981c778f4f139ab06`。这些代码**尚未进入 v1.4.0 已发布安装包**。
+
+## 已核实的状态
+
+| 事项 | 状态 | 证据与限制 |
+| --- | --- | --- |
+| Windows/macOS 离线回归 | 已通过 | [main Actions #41970320392](https://github.com/Jqsfree/youtube_down/actions/runs/41970320392)：macOS 359 passed；Windows 357 passed、2 skipped |
+| 历史 CSV 保护与 CLI 风控结果 | 已合并；离线通过 | PR #6/#7；未声称覆盖每一种文件系统损坏 |
+| Windows 更新重启/隐藏子进程窗口 | 已合并；离线通过 | PR #5；**2026-11-05 新修复的原生安装验证未执行** |
+| 实际下载视频、校验与续传 | 验收入口已实现；未形成运行证据 | `.github/workflows/real-download.yml` 需手动提供公开短视频 URL 运行 |
+
 
 ## 架构决定（ADR）
 
@@ -12,7 +22,7 @@
 
 - PR #6：已有 `下载总览.csv` 损坏/乱码/列结构异常时停止写入；保留老版必要列兼容。
 - GUI 在下载和历史查看时提示用户，不改动损坏的原文件；CLI 返回错误码。
-- PR #5：Windows 更新重启/黑窗修复仍需原生安装演练；CI 通过不等于 Windows 用户机器验收。
+- PR #5：Windows 更新重启/黑窗修复已合并 main；新修复仍需原生安装演练；CI 通过不等于 Windows 用户机器验收。
 - 验收：双平台离线测试通过，Windows 安装替换、失败回滚、占用重试及真实更新启动验证。
 
 ## P1：任务终态与端到端下载
