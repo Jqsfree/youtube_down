@@ -1,6 +1,6 @@
 # v1.5.1 修复候选与发布验收
 
-状态：**待验收**，2026-11-05。上一个 v1.5.0 仅有 Release 草稿，真实 YouTube E2E 未通过，因此不覆盖原标签与资产；本候选以独立版本发布。
+状态：**双平台构建与原生升级通过，Draft 已创建；真实 E2E 未通过，禁止正式发布**。2026-11-05，v1.5.0 与 v1.5.1 均保留原始标签及草稿，后续修复移至 v1.5.2。
 
 ## 为什么需要新的补丁版本
 
@@ -16,6 +16,13 @@
 - CLI 结束/异常时及时关闭日志文件句柄，防止 Windows 临时目录无法删除。
 - 补充离线测试覆盖 cp1252、stdout JSON、正常/异常后的文件句柄释放。
 - `VERSION`、`pyproject.toml`、`uv.lock` 锁文件根包版本同步为 1.5.1；不升级依赖。
+
+## 已执行证据
+
+- [v1.5.1 主分支 CI #41983008970](https://github.com/Jqsfree/youtube_down/actions/runs/41983008970)：Windows/macOS 全量离线测试通过。
+- [v1.5.1 构建 #41983200216](https://github.com/Jqsfree/youtube_down/actions/runs/41983200216)：Windows/macOS 内嵌工具检查、真实安装升级/回滚通过，创建两个安装包及三个验证附件的 Draft。
+- [v1.5.1 真实 E2E #41983592257](https://github.com/Jqsfree/youtube_down/actions/runs/41983592257)：Windows 已不再因 CLI 自身的 `_print` 或临时日志占用失败，但 `pacing.py` 的直接 `print` 又触发 CP1252 UnicodeEncodeError；macOS 仍受站点 bot/限流影响。两平台均未取得下载和续传成功证据。
+- 因版本号对应的二进制不可覆盖，修复改为 v1.5.2 新候选。该文档保留历史证据。
 
 ## 发布门槛
 

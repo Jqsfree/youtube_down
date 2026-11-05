@@ -461,3 +461,42 @@ def test_cli_dry_run_json_on_cp1252_stdout(tmp_path, monkeypatch):
     ]) == 0
     parsed = json.loads(target.getvalue().decode("cp1252"))
     assert parsed["download"] == 1
+
+
+def test_cli_pacer_bot_message_survives_windows_cp1252(tmp_path, monkeypatch):
+    """Real network E2E revealed a print() outside _print in pacing.py."""
+    import io
+    import sys
+    import download_cli
+    from pacing import AdaptivePacer
+
+    output_bytes = io.BytesIO()
+    errors_bytes = io.BytesIO()
+    stdout = io.TextIOWrapper(output_bytes, encoding="cp1252", errors="strict", write_through=True)
+    stderr = io.TextIOWrapper(errors_bytes, encoding="cp1252", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    def fake_run(_args):
+        AdaptivePacer(2, 4, bot_pause_sec=0).on_bot_or_rate_limit()
+        print("下载失败", file=sys.stderr, flush=True)
+        return 1
+
+    monkeypatch.setattr(download_cli, "_run", fake_run)
+    assert download_cli.main(["-o", str(tmp_path), "AAA111aaaaa"]) == 1
+    assert r"\u89e6\u53d1" in output_bytes.getvalue().decode("cp1252")
+    assert r"\u4e0b\u8f7d" in errors_bytes.getvalue().decode("cp1252")
+
+
+def test_cli_stdio_config_is_safe_with_capture_stream(monkeypatch):
+    import io
+    import sys
+    import download_cli
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    download_cli._configure_cli_output_encoding()
+    download_cli._print("正常中文")
+    assert stdout.getvalue().strip() == "正常中文"
