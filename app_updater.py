@@ -365,6 +365,17 @@ def download_update(release: Release, dest_dir: Path,
 # 安装 / 重启
 # ----------------------------------------------------------------------
 
+def _detached_env() -> dict[str, str]:
+    """onefile 重启用的干净环境。
+
+    新进程若继承 ``_PYI_*`` / ``_MEI*``，会把自己当成旧进程的子进程，复用已被
+    删除的 _MEI 解包目录而启动失败。新版 PyInstaller 用该变量强制重新解包。
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("_PYI", "_MEI"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def _spawn_detached(script: Path, args: list[str] | None = None) -> None:
     if sys.platform.startswith("win"):
         creation = 0
@@ -375,12 +386,17 @@ def _spawn_detached(script: Path, args: list[str] | None = None) -> None:
              "Bypass", "-File", str(script)] + list(args or []),
             creationflags=creation,
             close_fds=True,
+            env=_detached_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         return
     subprocess.Popen(  # noqa: S603 - 固定脚本
         ["/bin/sh", str(script)] + list(args or []),
         start_new_session=True,
         close_fds=True,
+        env=_detached_env(),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -422,6 +438,9 @@ try {
     if ($moved) {
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
         Move-Item -LiteralPath $old -Destination $target
+    }
+    # 替换失败也要把旧版拉起来；主程序此时已经退出，否则用户面前什么都没有
+    if (Test-Path -LiteralPath $target) {
         $start = New-Object System.Diagnostics.ProcessStartInfo
         $start.FileName = $target
         $start.UseShellExecute = $false

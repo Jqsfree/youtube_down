@@ -257,6 +257,25 @@ def test_spawn_detached_is_not_called_without_permission(
     assert called == []
 
 
+def test_spawn_detached_clears_pyinstaller_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """新进程必须重新解包；否则会复用旧进程已删除的 _MEI 目录而启动失败。"""
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", str(tmp_path))
+    monkeypatch.setenv("_MEIPASS2", str(tmp_path))
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_updater.subprocess, "Popen", lambda *a, **k: seen.update(k) or object(),
+    )
+    script = tmp_path / "install.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    app_updater._spawn_detached(script)
+    env = seen["env"]
+    assert "_PYI_APPLICATION_HOME_DIR" not in env
+    assert "_MEIPASS2" not in env
+    assert env["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+
+
 def test_cleanup_old_on_source_tree_is_noop() -> None:
     app_updater.cleanup_old()  # 未打包 → 直接返回，不抛错
 

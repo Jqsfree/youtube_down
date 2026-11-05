@@ -319,7 +319,8 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
     if ffmpeg_path:
         try:
             r = subprocess.run(
-                [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5
+                [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5,
+                creationflags=probe_ops.NO_WINDOW,
             )
             ver_line = r.stdout.split("\n")[0] if r.stdout else "?"
             items.append(EnvItem("ffmpeg", "ok", ver_line, "", fatal=True))
@@ -354,7 +355,8 @@ def check_environment() -> tuple[bool, list[EnvItem]]:
     if deno_path:
         try:
             r = subprocess.run(
-                [deno_path, "--version"], capture_output=True, text=True, timeout=5
+                [deno_path, "--version"], capture_output=True, text=True, timeout=5,
+                creationflags=probe_ops.NO_WINDOW,
             )
             ver_line = r.stdout.split("\n")[0] if r.stdout else "?"
             items.append(EnvItem("deno", "ok", ver_line, ""))
