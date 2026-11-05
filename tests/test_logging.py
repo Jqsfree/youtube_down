@@ -120,3 +120,28 @@ def test_option_build_error_preserves_original_cause(monkeypatch):
         downloader.get_info('dQw4w9WgXcQ', use_cookies=False)
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert classify_error(caught.value).code == 'ENVIRONMENT'
+
+
+def test_print_survives_legacy_cp1252_console(monkeypatch):
+    import io
+    import sys
+    import download_cli
+
+    target = io.BytesIO()
+    stream = io.TextIOWrapper(target, encoding="cp1252", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", stream)
+    download_cli._print("总计", "1", flush=True)
+    output = target.getvalue().decode("cp1252")
+    assert r"\u603b\u8ba1" in output
+    assert "1" in output
+
+
+def test_close_file_releases_log_without_dropping_other_handlers(tmp_path):
+    import logging
+    AppLogger.attach_file(tmp_path / "download.log")
+    logger = AppLogger.get_logger()
+    assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+    AppLogger.close_file()
+    assert not any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+    assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+    (tmp_path / "download.log").unlink()
