@@ -1,0 +1,59 @@
+name: Cut v1.5.0 tag and dispatch draft build (one-time)
+on:
+  push:
+    branches:
+      - release-cut/v1.5.0-20261105
+    paths:
+      - .github/workflows/cut-v1.5.0.yml
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: cut-v1.5.0
+  cancel-in-progress: false
+jobs:
+  cut:
+    if: github.repository == 'Jqsfree/youtube_down'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: 26c6e7a4dfeccab7599dc3ac0892c63d232ad24c
+      RELEASE_TAG: v1.5.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 26c6e7a4dfeccab7599dc3ac0892c63d232ad24c
+          persist-credentials: false
+      - name: Require exact main HEAD and consistent version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$CURRENT" = "$RELEASE_SHA" || { echo "Main changed; refusing to cut release" >&2; exit 1; }
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          python scripts/release_checks.py version --tag "$RELEASE_TAG"
+          test "$(git status --porcelain | wc -l)" -eq 0
+          echo "Main commit and v1.5.0 metadata verified"
+      - name: Create v1.5.0 tag once (never overwrite)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release tag exists. Refusing to overwrite." >&2
+            exit 1
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA" >/dev/null
+          TAG_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          test "$TAG_SHA" = "$RELEASE_SHA"
+          echo "Tag $RELEASE_TAG points to $RELEASE_SHA"
+      - name: Explicitly dispatch existing native-build workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A tag created with GITHUB_TOKEN does not trigger push-tag workflows.
+          # workflow_dispatch is explicitly exempt from that recursion guard.
+          gh workflow run build.yml --ref main \
+            -f "tag=$RELEASE_TAG" -f "check_install=true" -f "create_draft=true"
+          echo "Requested draft build for $RELEASE_TAG; manual release publication remains required."
