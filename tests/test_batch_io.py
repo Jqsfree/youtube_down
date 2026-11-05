@@ -1,4 +1,5 @@
 import csv
+import pytest
 import threading
 from pathlib import Path
 
@@ -164,3 +165,48 @@ def test_overview_concurrent_upserts(tmp_path: Path) -> None:
 
     assert len(OverviewStore(tmp_path).rows()) == 40
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_existing_overview_with_invalid_utf8_is_not_overwritten(tmp_path: Path) -> None:
+    path = tmp_path / OVERVIEW_NAME
+    original = b"\xff\xfe\xffinvalid csv"
+    path.write_bytes(original)
+    with pytest.raises(ValueError, match="无法完整读取下载总览"):
+        OverviewStore(tmp_path)
+    assert path.read_bytes() == original
+
+
+def test_overview_damaged_after_initial_load_blocks_writes(tmp_path: Path) -> None:
+    store = OverviewStore(tmp_path)
+    store.upsert(source="a", row_no=1, media_id="old", status="failed")
+    path = tmp_path / OVERVIEW_NAME
+    corrupt = b"not-an-overview\nrecord\n"
+    path.write_bytes(corrupt)
+    with pytest.raises(ValueError, match="表头缺失"):
+        store.upsert(source="b", row_no=2, media_id="new", status="failed")
+    assert path.read_bytes() == corrupt
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_overview_rejects_truncated_or_extra_columns(tmp_path: Path) -> None:
+    path = tmp_path / OVERVIEW_NAME
+    for corrupt in (
+        "来源文件,video_id\na\n",
+        "来源文件,video_id\na,id,extra\n",
+        '来源文件,video_id\n"a,id\n',
+    ):
+        path.write_text(corrupt, encoding="utf-8")
+        with pytest.raises(ValueError):
+            OverviewStore(tmp_path)
+        assert path.read_text(encoding="utf-8") == corrupt
+
+
+def test_overview_legacy_minimal_columns_remain_compatible(tmp_path: Path) -> None:
+    path = tmp_path / OVERVIEW_NAME
+    path.write_text("来源文件,video_id\na,old\n", encoding="utf-8")
+    store = OverviewStore(tmp_path)
+    assert len(store.rows()) == 1
+    store.upsert(source="b", row_no=2, media_id="new", status="failed")
+    assert {(row["来源文件"], row["video_id"]) for row in OverviewStore(tmp_path).rows()} == {
+        ("a", "old"), ("b", "new"),
+    }

@@ -183,17 +183,29 @@ class OverviewStore:
 
     @staticmethod
     def _read_rows(path: Path) -> dict[tuple[str, str], dict[str, str]]:
+        """Never mistake a damaged existing overview for an empty one.
+
+        Preserve compatibility with legacy overviews missing optional columns.
+        Invalid contents must stop the next write instead of erasing history.
+        """
         rows: dict[tuple[str, str], dict[str, str]] = {}
-        if not path.is_file():
+        if not path.exists():
             return rows
+        if not path.is_file():
+            raise ValueError(f"下载总览路径不是文件: {path.name}")
         try:
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                for row in csv.DictReader(f):
+                reader = csv.DictReader(f, strict=True)
+                if not reader.fieldnames or not {"来源文件", "video_id"} <= set(reader.fieldnames):
+                    raise ValueError(f"下载总览表头缺失或无效: {path.name}")
+                for line_no, row in enumerate(reader, start=2):
+                    if None in row or row.get("来源文件") is None or row.get("video_id") is None:
+                        raise ValueError(f"下载总览第 {line_no} 行列数异常: {path.name}")
                     key = (row.get("来源文件", ""), row.get("video_id", ""))
                     if key[1]:
                         rows[key] = {k: row.get(k, "") or "" for k in OVERVIEW_FIELDS}
-        except (OSError, csv.Error, UnicodeDecodeError):
-            return {}
+        except (OSError, csv.Error, UnicodeDecodeError) as exc:
+            raise ValueError(f"无法完整读取下载总览: {path.name}") from exc
         return rows
 
     def upsert(
