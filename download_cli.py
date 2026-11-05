@@ -64,9 +64,19 @@ from batch_runner import CompletionPool, parallel_workers
 from pacing import AdaptivePacer
 
 def _print(*args, **kwargs) -> None:
-    """Keep CLI output formatting while applying the shared credential policy."""
+    """Redact CLI output and handle non-UTF-8 Windows consoles gracefully."""
     separator = kwargs.pop("sep", " ")
-    print(redact(separator.join(str(value) for value in args)), **kwargs)
+    message = redact(separator.join(str(value) for value in args))
+    stream = kwargs.get("file") or sys.stdout
+    charset = getattr(stream, "encoding", None)
+    if charset:
+        try:
+            message.encode(charset)
+        except UnicodeEncodeError:
+            # Backslash escapes keep legacy consoles operational without
+            # weakening the shared credential-redaction policy.
+            message = message.encode(charset, errors="backslashreplace").decode(charset)
+    print(message, **kwargs)
 
 
 # 兼容旧测试名：正常模式与 NORMAL_YDL_OPTS 对齐（视频间间隔交给 AdaptivePacer）
@@ -678,7 +688,7 @@ def preview_plan(args: argparse.Namespace) -> int:
     for entry in summary["jobs"]:
         for key in ("source", "media_id", "output_dir", "existing_file", "previous_status"):
             entry[key] = redact(str(entry[key]))
-    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    print(json.dumps(summary, ensure_ascii=True, indent=2), flush=True)
     return 0
 
 
@@ -689,9 +699,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     log_root = (args.results_dir or args.output_dir).expanduser().resolve()
     AppLogger.attach_file(log_root / "youtube_downloader.log")
     AppLogger.start_session("CLI")
-    with private_directory("ytdown-cookie-cli-") as directory:
-        args._cookie_temp_dir = Path(directory)
-        return _run(args)
+    try:
+        with private_directory("ytdown-cookie-cli-") as directory:
+            args._cookie_temp_dir = Path(directory)
+            return _run(args)
+    finally:
+        # Windows cannot remove an E2E temporary output directory while the
+        # rotating file handler still owns youtube_downloader.log.
+        AppLogger.close_file()
 
 
 def _run(args: argparse.Namespace) -> int:
