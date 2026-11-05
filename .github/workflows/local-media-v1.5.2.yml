@@ -1,4 +1,4 @@
-name: v1.5.2 local HTTP media E2E (isolated)
+name: Local media test for v1.5.2
 on:
   push:
     branches:
@@ -8,71 +8,32 @@ on:
 permissions:
   contents: read
 jobs:
-  local-media:
+  test:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            platform: Windows
-          - os: macos-latest
-            platform: macOS
+        os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v1.5.2
+          ref: release-cut/v1.5.2-20261105
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@v7
         with:
           version: '0.12.8'
-      - name: Install locked dependencies and media tools
+      - run: uv sync --locked
+      - name: Install platform tools
+        shell: bash
         run: |
-          uv sync --locked
-          uv run --no-sync python scripts/build_tools.py install --platform ${{ matrix.platform }}
-      - name: Generate video, serve over localhost, download and resume
+          if [ "$RUNNER_OS" = Windows ]; then PLATFORM=Windows; else PLATFORM=macOS; fi
+          uv run --no-sync python scripts/build_tools.py install --platform "$PLATFORM"
+      - name: Transfer test from localhost HTTP
         shell: bash
         env:
           NO_PROXY: 127.0.0.1,localhost
-          no_proxy: 127.0.0.1,localhost
           QT_QPA_PLATFORM: offscreen
-        run: |
-          uv run --no-sync python - <<'PY'
-          from functools import partial
-          from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-          from pathlib import Path
-          from tempfile import TemporaryDirectory
-          import subprocess
-          import threading
-          from media_probe import find_tool, NO_WINDOW
-          from scripts.real_download_smoke import verify
-
-          with TemporaryDirectory(prefix="ytdown-local-e2e-") as root_name:
-              root = Path(root_name)
-              serving = root / "serving"
-              serving.mkdir()
-              clip = serving / "test.mp4"
-              subprocess.run([
-                  find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error",
-                  "-f", "lavfi", "-i", "color=c=black:s=320x240:r=24",
-                  "-t", "2", "-c:v", "mpeg4", "-q:v", "4",
-                  "-y", str(clip),
-              ], check=True, creationflags=NO_WINDOW, timeout=30)
-              assert clip.stat().st_size > 1024
-
-              handler = partial(SimpleHTTPRequestHandler, directory=str(serving))
-              server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-              thread = threading.Thread(target=server.serve_forever, daemon=True)
-              thread.start()
-              try:
-                  url = f"http://127.0.0.1:{server.server_port}/test.mp4"
-                  verify(url, root / "output")
-                  print("PASS: local HTTP transfer, ffprobe, CSV, resume")
-              finally:
-                  server.shutdown()
-                  server.server_close()
-                  thread.join(timeout=5)
-          PY
+        run: uv run --no-sync python -m scripts.local_media_release_check
