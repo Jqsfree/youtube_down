@@ -24,7 +24,11 @@ def test_collect_completed_ids_requires_valid_media(tmp_path: Path, monkeypatch)
     (out / "lowres00000.mp4").write_bytes(b"x" * 2048)
     (out / "tiny.mp4").write_bytes(b"no")
     sides = {"AAA111aaaaa.mp4": 720, "garbage0000.mp4": None, "lowres00000.mp4": 576}
-    monkeypatch.setattr(download_cli, "_probe_short_side", lambda p: sides.get(p.name))
+    monkeypatch.setattr(
+        download_cli, "valid_resume_media",
+        lambda p, **kw: sides.get(p.name) is not None
+        and sides[p.name] >= kw["min_height"],
+    )
 
     done = collect_completed_ids(out, min_height=720)
 
@@ -35,7 +39,7 @@ def test_collect_completed_ids_recognizes_row_prefixed_names(tmp_path: Path, mon
     import download_cli
 
     (tmp_path / "0003_AbZ9o3oWYjo.mp4").write_bytes(b"x" * 2048)
-    monkeypatch.setattr(download_cli, "_probe_short_side", lambda p: 1080)
+    monkeypatch.setattr(download_cli, "valid_resume_media", lambda p, **kw: True)
 
     done = collect_completed_ids(tmp_path, min_height=720)
 
@@ -358,3 +362,64 @@ def test_cli_refuses_damaged_overview_before_download(tmp_path, monkeypatch):
     ))
     assert download_cli.main([]) == 2
     assert (tmp_path / OVERVIEW_NAME).read_bytes() == original
+
+
+def test_preview_does_not_create_output_log_or_cookie_snapshot(tmp_path, monkeypatch, capsys):
+    import json
+    import download_cli
+    output = tmp_path / "unused" / "out"
+    created = []
+
+    monkeypatch.setattr(download_cli, "dump_browser_cookies",
+                        lambda *a, **kw: created.append("cookies"))
+    monkeypatch.setattr(download_cli, "check_exit_ip",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("network check")))
+    code = download_cli.main([
+        "--dry-run", "-o", str(output), "--cookies-from-browser", "chrome",
+        "--proxy-check-url", "http://127.0.0.1:7897",
+        "https://youtu.be/dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ",
+    ])
+    assert code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["total"] == 1  # pasted text parser already deduplicates
+    assert result["download"] == 1
+    assert result["reuse"] == 0
+    assert not output.exists()
+    assert not created
+
+
+def test_preview_classifies_valid_existing_and_corrupt_media(tmp_path, monkeypatch, capsys):
+    import json
+    import download_cli
+    from batch_io import OVERVIEW_NAME
+    out = tmp_path / "output"
+    paste = out / "paste"
+    paste.mkdir(parents=True)
+    (paste / "AAA111aaaaa.mp4").write_bytes(b"x" * 2048)
+    (paste / "BBB222bbbbb.mp4").write_bytes(b"x" * 2048)
+    monkeypatch.setattr(download_cli, "valid_resume_media",
+                        lambda path, **kw: path.name.startswith("AAA"))
+    result = download_cli.main([
+        "--dry-run", "-o", str(out), "AAA111aaaaa", "BBB222bbbbb",
+        "--proxy-check-url", "",
+    ])
+    assert result == 0
+    data = json.loads(capsys.readouterr().out)
+    assert {x["media_id"]: x["action"] for x in data["jobs"]} == {
+        "AAA111aaaaa": "reuse", "BBB222bbbbb": "download",
+    }
+    assert not (out / OVERVIEW_NAME).exists()
+
+
+def test_preview_refuses_bad_history_without_overwriting(tmp_path, capsys):
+    import download_cli
+    from batch_io import OVERVIEW_NAME
+    original = b"this,is,not,a,valid,overview"
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / OVERVIEW_NAME).write_bytes(original)
+    assert download_cli.main([
+        "--dry-run", "-o", str(out), "AAA111aaaaa",
+        "--proxy-check-url", "",
+    ]) == 2
+    assert (out / OVERVIEW_NAME).read_bytes() == original
