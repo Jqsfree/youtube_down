@@ -25,7 +25,9 @@ def main() -> None:
             [
                 find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error",
                 "-f", "lavfi", "-i", "color=c=black:s=320x240:r=24",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
                 "-t", "2", "-c:v", "mpeg4", "-q:v", "4",
+                "-c:a", "aac", "-b:a", "96k", "-shortest",
                 "-y", str(clip),
             ],
             check=True, creationflags=NO_WINDOW, timeout=30,
